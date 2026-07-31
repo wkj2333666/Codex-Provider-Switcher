@@ -123,9 +123,19 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 
 func dialUpstream(ctx context.Context, request *http.Request, socket string) (*websocket.Conn, *http.Response, error) {
 	headers := request.Header.Clone()
+	for _, name := range headerTokens(request.Header.Values("Connection")) {
+		headers.Del(name)
+	}
 	for _, name := range []string{
 		"Connection",
 		"Host",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Proxy-Connection",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
 		"Upgrade",
 		"Sec-WebSocket-Key",
 		"Sec-WebSocket-Version",
@@ -159,17 +169,43 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider 
 	bridgeContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	results := make(chan error, 2)
+	type pumpResult struct {
+		err         error
+		destination *websocket.Conn
+	}
+	results := make(chan pumpResult, 2)
 	go func() {
-		results <- pump(bridgeContext, upstream, downstream, func(payload []byte) ([]byte, error) {
+		err := pump(bridgeContext, upstream, downstream, func(payload []byte) ([]byte, error) {
 			return rewrite.Line(payload, provider)
 		})
+		results <- pumpResult{destination: upstream, err: err}
 	}()
 	go func() {
-		results <- pump(bridgeContext, downstream, upstream, nil)
+		err := pump(bridgeContext, downstream, upstream, nil)
+		results <- pumpResult{destination: downstream, err: err}
 	}()
 
 	first := <-results
+	if status := websocket.CloseStatus(first.err); status != -1 {
+		var closeError websocket.CloseError
+		reason := ""
+		if errors.As(first.err, &closeError) {
+			reason = closeError.Reason
+		}
+		if status == websocket.StatusNoStatusRcvd {
+			status = websocket.StatusNormalClosure
+		}
+		_ = first.destination.Close(status, reason)
+		cancel()
+		_ = downstream.CloseNow()
+		_ = upstream.CloseNow()
+		select {
+		case <-results:
+		case <-time.After(time.Second):
+		}
+		return nil
+	}
+
 	cancel()
 	_ = downstream.CloseNow()
 	_ = upstream.CloseNow()
@@ -181,11 +217,7 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider 
 	if ctx.Err() != nil {
 		return nil
 	}
-	status := websocket.CloseStatus(first)
-	if status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
-		return nil
-	}
-	if first != nil {
+	if first.err != nil {
 		return errors.New("WebSocket message forwarding failed")
 	}
 	return nil
