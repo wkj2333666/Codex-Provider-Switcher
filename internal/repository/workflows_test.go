@@ -89,6 +89,38 @@ func TestReleaseTagValidation(t *testing.T) {
 	}
 }
 
+func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
+	root := repositoryRoot(t)
+	read := func(name string) string {
+		content, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(content)
+	}
+	readme := read("README.md")
+	architecture := read("docs/architecture.md")
+	combined := readme + "\n" + architecture
+
+	for _, required := range []string{
+		"WebSocket", "ln -s", "CODEX_PROVIDER_SWITCHER_PROVIDER",
+		"AcceptEnv", "v0.1.0", "Uninstall", "64 MiB",
+	} {
+		if !strings.Contains(combined, required) {
+			t.Errorf("documentation missing %q", required)
+		}
+	}
+	for _, obsolete := range []string{
+		"runs the official stdio proxy",
+		"Server output is copied byte-for-byte",
+		"Configure each Desktop Remote SSH entry point to launch the switcher as its stdio proxy",
+	} {
+		if strings.Contains(combined, obsolete) {
+			t.Errorf("documentation retains obsolete claim %q", obsolete)
+		}
+	}
+}
+
 func readWorkflow(t *testing.T, name string) string {
 	t.Helper()
 	root := repositoryRoot(t)
