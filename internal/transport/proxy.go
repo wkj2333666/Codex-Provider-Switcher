@@ -169,6 +169,7 @@ func dialUpstream(ctx context.Context, request *http.Request, socket string) (*w
 	return websocket.Dial(ctx, "ws://localhost"+path, &websocket.DialOptions{
 		HTTPClient:      client,
 		HTTPHeader:      headers,
+		Host:            request.Host,
 		Subprotocols:    headerTokens(request.Header.Values("Sec-WebSocket-Protocol")),
 		CompressionMode: websocket.CompressionDisabled,
 	})
