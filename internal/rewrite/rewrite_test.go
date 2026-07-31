@@ -3,7 +3,6 @@ package rewrite
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 )
@@ -115,81 +114,8 @@ func TestLineRejectsInvalidMessages(t *testing.T) {
 	}
 }
 
-func TestStreamSupportsLargeMessagesAndMissingFinalNewline(t *testing.T) {
-	t.Parallel()
-
-	large := strings.Repeat("x", 128*1024)
-	input := `{"method":"custom/do","params":{"prompt":"` + large + `"}}` + "\n" +
-		`{"id":2,"method":"thread/resume","params":{"threadId":"abc"}}`
-	var output bytes.Buffer
-	if err := Stream(&output, strings.NewReader(input), "provider-a"); err != nil {
-		t.Fatalf("Stream() error = %v", err)
-	}
-
-	lines := strings.Split(output.String(), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("output line count = %d, want 2", len(lines))
-	}
-	if lines[0] != strings.Split(input, "\n")[0] {
-		t.Error("large unknown message was not passed through byte-for-byte")
-	}
-	var resumed map[string]any
-	if err := json.Unmarshal([]byte(lines[1]), &resumed); err != nil {
-		t.Fatal(err)
-	}
-	params := resumed["params"].(map[string]any)
-	if params["modelProvider"] != "provider-a" || params["threadId"] != "abc" {
-		t.Errorf("rewritten params = %#v", params)
-	}
-}
-
-func TestStreamReportsLineWithoutLeakingBody(t *testing.T) {
-	t.Parallel()
-
-	var output bytes.Buffer
-	err := Stream(&output, strings.NewReader("{\"method\":\"custom/do\"}\nnot-json-secret\n"), "provider-a")
-	if err == nil {
-		t.Fatal("Stream() error = nil, want failure")
-	}
-	if !strings.Contains(err.Error(), "line 2") {
-		t.Errorf("error = %q, want line number", err)
-	}
-	if strings.Contains(err.Error(), "not-json-secret") {
-		t.Errorf("error leaked input body: %v", err)
-	}
-}
-
-func TestStreamDoesNotForwardPartialDataFromReadError(t *testing.T) {
-	t.Parallel()
-
-	readErr := errors.New("test read failure")
-	reader := &dataErrorReader{data: []byte(`{"method":"custom/do"}`), err: readErr}
-	var output bytes.Buffer
-	err := Stream(&output, reader, "provider-a")
-	if !errors.Is(err, readErr) {
-		t.Fatalf("Stream() error = %v, want wrapped read failure", err)
-	}
-	if output.Len() != 0 {
-		t.Fatalf("Stream() forwarded uncertain partial frame: %q", output.String())
-	}
-}
-
 func valuesEqual(got, want any) bool {
 	gotJSON, _ := json.Marshal(got)
 	wantJSON, _ := json.Marshal(want)
 	return bytes.Equal(gotJSON, wantJSON)
-}
-
-type dataErrorReader struct {
-	data []byte
-	err  error
-}
-
-func (reader *dataErrorReader) Read(destination []byte) (int, error) {
-	if len(reader.data) == 0 {
-		return 0, reader.err
-	}
-	n := copy(destination, reader.data)
-	reader.data = reader.data[n:]
-	return n, reader.err
 }

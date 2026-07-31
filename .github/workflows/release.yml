@@ -29,6 +29,11 @@ jobs:
         shell: bash
         run: bash scripts/validate-release-tag.sh "$GITHUB_REF_NAME"
 
+      - name: Verify module files
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
       - name: Check formatting
         shell: bash
         run: |

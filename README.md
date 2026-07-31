@@ -1,20 +1,22 @@
 # Codex Provider Switcher
 
-Codex Provider Switcher is a small, provider-agnostic JSON-RPC proxy for Codex
-Desktop Remote SSH connections. Separate SSH entry points can select different
-model providers while sharing one Codex app-server daemon, one `CODEX_HOME`, and
-one task database.
+> **v0.1.0 is broken for Desktop Remote SSH.** It parsed the stdin of
+> `codex app-server proxy` as JSONL, but that stream contains an HTTP Upgrade
+> and WebSocket frames. Do not install or use v0.1.0. Use v0.2.0 or newer.
+
+Codex Provider Switcher is a provider-agnostic WebSocket proxy for Codex
+Desktop Remote SSH. Separate SSH entry points can select different model
+providers while sharing one Codex app-server daemon, one `CODEX_HOME`, and one
+task database.
 
 This is an independent community project. It is not an OpenAI product.
 
-## Why
+## How It Works
 
-Separate `CODEX_HOME` directories also create separate task stores. Sharing the
-same SQLite files between multiple app-server daemons creates competing writers
-and is not a supported way to merge those stores.
-
-The switcher instead runs the official stdio proxy and changes only the
-provider-routing fields in client requests:
+Desktop sends an HTTP WebSocket Upgrade and masked WebSocket frames through the
+remote `codex app-server proxy --sock ...` process. The switcher installs as a
+transparent executable named `codex`, intercepts only that command, and opens a
+new WebSocket directly to the app-server Unix socket:
 
 ```text
 Desktop A -> switcher(provider-a) --+
@@ -22,103 +24,120 @@ Desktop A -> switcher(provider-a) --+
 Desktop B -> switcher(provider-b) --+
 ```
 
-It executes exactly:
-
-```text
-codex app-server proxy --sock <socket>
-```
+All other `codex` commands are delegated unchanged to the real Codex
+executable. The switcher does not start a second daemon or access SQLite.
 
 ## Requirements
 
 - Linux or macOS on amd64 or arm64
 - Codex CLI with app-server protocol v2 provider overrides (tested against
   Codex CLI 0.146.0)
-- One already-running app-server on a Unix domain socket
+- One app-server Unix socket managed by Codex Desktop or an existing daemon
 - Every selected provider configured in the daemon's effective Codex config
+- A remote login shell whose PATH can put the wrapper before the real Codex
 
-Native Windows is not supported because the switcher validates and uses a Unix
-domain socket.
+Native Windows is not supported because the runtime transport uses Unix domain
+sockets.
 
-## Install
+## Install For Stock Desktop
 
-Download the archive for your operating system and architecture from GitHub
-Releases, verify it against the adjacent `.sha256` file, then place the binary
-on the remote host's `PATH`.
+Download the archive for the remote operating system and architecture from
+GitHub Releases and verify the adjacent `.sha256` file. The following setup
+keeps the real Codex installation untouched.
 
-To build from source:
+First record the absolute real Codex path before changing PATH:
 
 ```bash
-go build -trimpath -o codex-provider-switcher ./cmd/codex-provider-switcher
-./codex-provider-switcher --version
+REAL_CODEX="$(command -v codex)"
+test -n "$REAL_CODEX"
+case "$REAL_CODEX" in /*) ;; *) echo "Codex path must be absolute" >&2; exit 1;; esac
 ```
 
-## Usage
+Install the switcher and create a separate transparent wrapper directory:
+
+```bash
+mkdir -p "$HOME/.local/lib/codex-provider-switcher/bin"
+install -m 0755 codex-provider-switcher \
+  "$HOME/.local/lib/codex-provider-switcher/codex-provider-switcher"
+ln -s ../codex-provider-switcher \
+  "$HOME/.local/lib/codex-provider-switcher/bin/codex"
+```
+
+Add these values to the remote login-shell profile used by Desktop, replacing
+the example real path with the value printed by `command -v codex` above:
+
+```bash
+export CODEX_PROVIDER_SWITCHER_CODEX="/absolute/path/to/real/codex"
+export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
+```
+
+Verify both paths in a fresh login shell:
+
+```bash
+command -v codex
+codex --version
+"$HOME/.local/lib/codex-provider-switcher/codex-provider-switcher" --version
+```
+
+`command -v codex` must show the wrapper symlink. `codex --version` must still
+show the real Codex version because non-proxy commands are delegated.
+
+### Select A Provider Per SSH Alias
+
+OpenSSH can attach the provider identity to each local alias:
+
+```sshconfig
+Host codex-provider-a
+    HostName server.example.com
+    User developer
+    SetEnv CODEX_PROVIDER_SWITCHER_PROVIDER=provider-a
+
+Host codex-provider-b
+    HostName server.example.com
+    User developer
+    SetEnv CODEX_PROVIDER_SWITCHER_PROVIDER=provider-b
+```
+
+The remote SSH server must permit that variable, for example in
+`sshd_config`:
 
 ```text
-Usage: codex-provider-switcher [options]
-
-Options:
-  --provider <id>  Provider to inject into task requests
-  --socket <path>  Shared app-server Unix socket
-  --codex <path>   Codex executable or command name; defaults to codex
-  --version        Print the switcher version and exit
-  --help           Print help and exit
+AcceptEnv CODEX_PROVIDER_SWITCHER_PROVIDER
 ```
 
-Equivalent environment variables are:
+Reload the SSH daemon after validating its configuration. If server policy
+does not allow `AcceptEnv`, use separate remote accounts or an equivalent
+server-side environment wrapper. Desktop does not expose a custom proxy-command
+setting, so simply documenting a different command is not sufficient.
+
+The wrapper fails closed when the provider is missing. It never delegates a
+malformed `app-server proxy` invocation to the real CLI.
+
+## Direct Proxy Mode
+
+Direct mode is available for tests and integrations that can choose the
+command themselves:
+
+```bash
+codex-provider-switcher proxy \
+  --provider provider-a \
+  --socket "$HOME/.local/state/codex/app-server.sock"
+```
+
+Direct proxy environment equivalents are:
 
 ```text
 CODEX_PROVIDER_SWITCHER_PROVIDER
 CODEX_PROVIDER_SWITCHER_SOCKET
-CODEX_PROVIDER_SWITCHER_CODEX
 ```
 
-Flags take precedence over environment variables. Provider IDs accept ASCII
-letters, digits, `.`, `_`, and `-`. Both provider and socket are required; the
-process fails before starting Codex if either is missing or invalid.
+Flags take precedence over environment values. Provider IDs accept ASCII
+letters, digits, `.`, `_`, and `-`.
 
-### Shared daemon
+`CODEX_PROVIDER_SWITCHER_CODEX` is wrapper-only. It identifies the absolute
+real Codex executable used when delegating non-proxy commands.
 
-Use one absolute socket path for every connection. If your Codex setup does not
-already manage the daemon, a foreground example is:
-
-```bash
-mkdir -p "$HOME/.local/state/codex"
-codex app-server --listen "unix://$HOME/.local/state/codex/app-server.sock"
-```
-
-Codex also provides `codex app-server daemon bootstrap` and `daemon start` for
-managed SSH-driven use. Daemon setup remains the user's responsibility; this
-project never starts or supervises it.
-
-### Provider entry points
-
-Configure each Desktop Remote SSH entry point to launch the switcher as its
-stdio proxy. For example, the two remote commands are:
-
-```bash
-codex-provider-switcher \
-  --provider provider-a \
-  --socket "$HOME/.local/state/codex/app-server.sock"
-
-codex-provider-switcher \
-  --provider provider-b \
-  --socket "$HOME/.local/state/codex/app-server.sock"
-```
-
-Environment-based entries are equivalent:
-
-```bash
-CODEX_PROVIDER_SWITCHER_PROVIDER=provider-a \
-CODEX_PROVIDER_SWITCHER_SOCKET="$HOME/.local/state/codex/app-server.sock" \
-exec codex-provider-switcher
-```
-
-Use the same `CODEX_HOME` and socket for every entry. Provider credentials stay
-in Codex auth storage, provider environment variables, or another
-Codex-supported source; they are never handled by the switcher.
-
-## Routing behavior
+## Routing Behavior
 
 | Client method | Enforced field |
 | --- | --- |
@@ -128,13 +147,19 @@ Codex-supported source; they are never handled by the switcher.
 | `thread/list` | `params.modelProviders = []` |
 
 An existing client value is overwritten. Missing or null `params` becomes an
-object. A target request with non-object `params` terminates the connection
-instead of risking fallback to the wrong provider.
+object. A target request with non-object `params` closes the connection instead
+of risking fallback to the wrong provider.
 
-Other valid client messages pass through unchanged. Server output is copied
-byte-for-byte and never parsed. Messages larger than 64 KiB are supported.
+Only downstream WebSocket text messages are candidates for JSON-RPC parsing.
+Unknown valid text messages pass through byte-for-byte. Binary messages and all
+server messages pass through without parsing. The WebSocket implementation
+handles masking, all payload length encodings, fragmentation, ping/pong, close,
+and partial I/O.
 
-## Task semantics
+`permessage-deflate` is disabled on both WebSocket connections. The message
+limit is 64 MiB.
+
+## Task Semantics
 
 A task can be used sequentially through different providers:
 
@@ -147,34 +172,47 @@ Different tasks can be active through different providers at the same time.
 Operating the same loaded task concurrently through different providers is not
 supported because provider selection belongs to the loaded thread runtime.
 
-## Security boundaries
+## Security Boundaries
 
-The switcher does not:
+- API keys and provider credentials remain in Codex configuration or the
+  daemon environment.
+- End-to-end handshake headers are forwarded but never logged. Hop-by-hop and
+  generated WebSocket headers are removed before the upstream handshake.
+- Diagnostics do not include JSON bodies, prompts, header values, environment
+  values, or candidate executable paths.
+- Delegation uses an argument vector and `exec`; no shell evaluates arguments.
+- Symlink and hard-link identity checks prevent recursive wrapper execution.
 
-- read or write Codex SQLite databases;
-- start a second app-server daemon;
-- inspect API keys, prompts, responses, or authentication traffic;
-- edit shell, SSH, Codex, or service configuration;
-- invoke a shell to start Codex.
+## Uninstall
 
-Diagnostics contain error categories, target method names, line numbers, and
-process status. They do not contain request bodies or environment values.
-
-See [docs/architecture.md](docs/architecture.md) for the component and lifecycle
-details.
-
-## Development
+Remove the two profile exports added during installation, start a fresh login
+shell, and remove the isolated wrapper directory:
 
 ```bash
-gofmt -w cmd internal
+rm -rf "$HOME/.local/lib/codex-provider-switcher"
+unset CODEX_PROVIDER_SWITCHER_CODEX CODEX_PROVIDER_SWITCHER_PROVIDER
+hash -r 2>/dev/null || true
+command -v codex
+codex --version
+```
+
+The real Codex binary was never overwritten, so it should become the first
+`codex` in PATH again.
+
+## Build And Test
+
+```bash
+go build -trimpath -o codex-provider-switcher ./cmd/codex-provider-switcher
 go test ./...
 go test -race ./...
 go vet ./...
 ```
 
-CI also cross-builds Linux and macOS binaries for amd64 and arm64. A `v*` tag
-triggers the release workflow, which publishes four versioned archives and
-their SHA-256 checksum files.
+CI cross-builds Linux and macOS binaries for amd64 and arm64. A `v*` tag runs
+the release workflow and publishes four archives plus SHA-256 files.
+
+See [docs/architecture.md](docs/architecture.md) for transport and lifecycle
+details.
 
 ## License
 
