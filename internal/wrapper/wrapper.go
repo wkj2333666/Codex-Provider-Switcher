@@ -11,6 +11,12 @@ import (
 
 const codexEnvironment = "CODEX_PROVIDER_SWITCHER_CODEX"
 
+const (
+	socketEnvironment         = "CODEX_PROVIDER_SWITCHER_SOCKET"
+	codexHomeEnvironment      = "CODEX_HOME"
+	controlSocketRelativePath = "app-server-control/app-server-control.sock"
+)
+
 // Action describes whether an invocation is delegated or proxied.
 type Action uint8
 
@@ -21,21 +27,78 @@ const (
 
 // Classify intercepts every app-server proxy invocation. Invalid proxy
 // arguments return Proxy with an error so callers cannot fall back to Codex.
-func Classify(args []string) (Action, []string, error) {
-	if len(args) < 2 || args[0] != "app-server" || args[1] != "proxy" {
+func Classify(args []string, getenv func(string) string) (Action, []string, error) {
+	index := 0
+	for index < len(args) {
+		next, consumed, err := consumeCommonOption(args, index, true)
+		if err != nil {
+			if looksLikeProxy(args[index:]) {
+				return Proxy, nil, err
+			}
+			return Delegate, nil, nil
+		}
+		if !consumed {
+			break
+		}
+		index = next
+	}
+	if index >= len(args) {
+		return Delegate, nil, nil
+	}
+	if args[index] != "app-server" {
+		if strings.HasPrefix(args[index], "-") && looksLikeProxy(args[index:]) {
+			return Proxy, nil, errors.New("unsupported option before app-server proxy")
+		}
 		return Delegate, nil, nil
 	}
 
+	index++
+	for index < len(args) {
+		next, consumed, err := consumeCommonOption(args, index, true)
+		if err != nil {
+			if containsToken(args[index:], "proxy") {
+				return Proxy, nil, err
+			}
+			return Delegate, nil, nil
+		}
+		if !consumed {
+			break
+		}
+		index = next
+	}
+	if index >= len(args) {
+		return Delegate, nil, nil
+	}
+	if args[index] != "proxy" {
+		if strings.HasPrefix(args[index], "-") && containsToken(args[index:], "proxy") {
+			return Proxy, nil, errors.New("unsupported option before app-server proxy")
+		}
+		return Delegate, nil, nil
+	}
+
+	index++
 	var socket string
-	for index := 2; index < len(args); index++ {
+	for index < len(args) {
+		if args[index] == "--help" || args[index] == "-h" {
+			return Delegate, nil, nil
+		}
+		next, consumed, err := consumeCommonOption(args, index, false)
+		if err != nil {
+			return Proxy, nil, err
+		}
+		if consumed {
+			index = next
+			continue
+		}
+
 		argument := args[index]
 		switch {
 		case argument == "--sock":
 			if socket != "" || index+1 >= len(args) || args[index+1] == "" {
 				return Proxy, nil, errors.New("invalid app-server proxy socket option")
 			}
-			index++
-			socket = args[index]
+			socket = args[index+1]
+			index += 2
 		case strings.HasPrefix(argument, "--sock="):
 			if socket != "" {
 				return Proxy, nil, errors.New("duplicate app-server proxy socket option")
@@ -44,14 +107,85 @@ func Classify(args []string) (Action, []string, error) {
 			if socket == "" {
 				return Proxy, nil, errors.New("invalid app-server proxy socket option")
 			}
+			index++
 		default:
 			return Proxy, nil, errors.New("unsupported app-server proxy option")
 		}
 	}
+
 	if socket == "" {
-		return Proxy, nil, errors.New("app-server proxy socket is required")
+		var err error
+		socket, err = defaultSocket(getenv)
+		if err != nil {
+			return Proxy, nil, err
+		}
 	}
 	return Proxy, []string{"--socket", socket}, nil
+}
+
+func consumeCommonOption(args []string, index int, allowStrict bool) (int, bool, error) {
+	argument := args[index]
+	if argument == "--strict-config" {
+		if allowStrict {
+			return index + 1, true, nil
+		}
+		return index, false, errors.New("unsupported app-server proxy option")
+	}
+
+	for _, option := range []string{"-c", "--config", "--enable", "--disable"} {
+		if argument == option {
+			if index+1 >= len(args) || args[index+1] == "" {
+				return index, false, errors.New("invalid Codex configuration option")
+			}
+			return index + 2, true, nil
+		}
+	}
+
+	for _, option := range []string{"--config=", "--enable=", "--disable="} {
+		if strings.HasPrefix(argument, option) {
+			if strings.TrimPrefix(argument, option) == "" {
+				return index, false, errors.New("invalid Codex configuration option")
+			}
+			return index + 1, true, nil
+		}
+	}
+
+	return index, false, nil
+}
+
+func looksLikeProxy(args []string) bool {
+	for index, argument := range args {
+		if argument == "app-server" && containsToken(args[index+1:], "proxy") {
+			return true
+		}
+	}
+	return false
+}
+
+func containsToken(args []string, token string) bool {
+	for _, argument := range args {
+		if argument == token {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultSocket(getenv func(string) string) (string, error) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	if socket := getenv(socketEnvironment); socket != "" {
+		return socket, nil
+	}
+	if codexHome := getenv(codexHomeEnvironment); codexHome != "" {
+		return filepath.Join(codexHome, controlSocketRelativePath), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", errors.New("resolve default Codex socket")
+	}
+	return filepath.Join(home, ".codex", controlSocketRelativePath), nil
 }
 
 // ResolveRealCodex returns a non-recursive executable for delegated commands.

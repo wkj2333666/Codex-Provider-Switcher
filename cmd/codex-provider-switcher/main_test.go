@@ -88,7 +88,8 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	var got transport.Options
 	delegated := false
 	code := run(context.Background(), filepath.Join(t.TempDir(), "codex"), []string{
-		"app-server", "proxy", "--sock", socket,
+		"-c", `model="top"`, "app-server", "--enable", "feature-a", "proxy",
+		"--disable=feature-b", "--sock", socket,
 	}, dependencies{
 		getenv: env(map[string]string{"CODEX_PROVIDER_SWITCHER_PROVIDER": "provider-b"}),
 		stdin:  strings.NewReader("input"),
@@ -108,6 +109,30 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	}
 	if got.Config.Provider != "provider-b" || got.Config.Socket != socket {
 		t.Fatalf("proxy config = %#v", got.Config)
+	}
+}
+
+func TestRunWrapperDelegatesProxyHelpWithoutProvider(t *testing.T) {
+	current := executable(t, filepath.Join(t.TempDir(), "switcher"))
+	realCodex := executable(t, filepath.Join(t.TempDir(), "codex-real"))
+	delegated := false
+	proxyCalled := false
+	code := run(context.Background(), "codex", []string{"app-server", "proxy", "--help"}, dependencies{
+		getenv: env(map[string]string{
+			"CODEX_PROVIDER_SWITCHER_CODEX": realCodex,
+		}),
+		executable: func() (string, error) { return current, nil },
+		runProxy: func(context.Context, transport.Options) error {
+			proxyCalled = true
+			return nil
+		},
+		execProcess: func(path string, argv, environment []string) error {
+			delegated = path == realCodex && slices.Equal(argv, []string{realCodex, "app-server", "proxy", "--help"})
+			return nil
+		},
+	})
+	if code != 0 || !delegated || proxyCalled {
+		t.Fatalf("run(proxy help) = %d, delegated %v, proxy called %v", code, delegated, proxyCalled)
 	}
 }
 

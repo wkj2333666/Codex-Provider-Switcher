@@ -9,7 +9,7 @@ import (
 )
 
 func TestClassifyInterceptsOnlyAppServerProxy(t *testing.T) {
-	action, proxyArgs, err := Classify([]string{"app-server", "proxy", "--sock", "/tmp/a.sock"})
+	action, proxyArgs, err := Classify([]string{"app-server", "proxy", "--sock", "/tmp/a.sock"}, env(nil))
 	if err != nil {
 		t.Fatalf("Classify() error = %v", err)
 	}
@@ -17,7 +17,7 @@ func TestClassifyInterceptsOnlyAppServerProxy(t *testing.T) {
 		t.Fatalf("Classify() = %v, %q", action, proxyArgs)
 	}
 
-	action, proxyArgs, err = Classify([]string{"app-server", "proxy", "--sock=/tmp/b.sock"})
+	action, proxyArgs, err = Classify([]string{"app-server", "proxy", "--sock=/tmp/b.sock"}, env(nil))
 	if err != nil {
 		t.Fatalf("Classify(--sock=value) error = %v", err)
 	}
@@ -31,7 +31,80 @@ func TestClassifyInterceptsOnlyAppServerProxy(t *testing.T) {
 		{"app-server", "--listen", "stdio://"},
 		{"exec", "echo", "hello"},
 	} {
-		action, proxyArgs, err := Classify(args)
+		action, proxyArgs, err := Classify(args, env(nil))
+		if err != nil || action != Delegate || proxyArgs != nil {
+			t.Fatalf("Classify(%q) = %v, %q, %v", args, action, proxyArgs, err)
+		}
+	}
+}
+
+func TestClassifyInterceptsProxyWithCommonOptionsAtEveryLayer(t *testing.T) {
+	tests := [][]string{
+		{"app-server", "proxy"},
+		{"-c", `model="x"`, "app-server", "proxy"},
+		{"--config=model=\"x\"", "app-server", "proxy"},
+		{"--enable", "feature-a", "app-server", "proxy"},
+		{"--disable=feature-b", "app-server", "proxy"},
+		{"--strict-config", "app-server", "proxy"},
+		{"app-server", "-c", `model="x"`, "proxy"},
+		{"app-server", "--enable=feature-a", "proxy"},
+		{"app-server", "--disable", "feature-b", "proxy"},
+		{"app-server", "--strict-config", "proxy"},
+		{"app-server", "proxy", "-c", `model="x"`},
+		{"app-server", "proxy", "--config=model=\"x\""},
+		{"app-server", "proxy", "--enable", "feature-a"},
+		{"app-server", "proxy", "--disable=feature-b"},
+		{"app-server", "proxy", "-c", "--help"},
+		{
+			"--enable", "top-a", "--disable=top-b", "app-server",
+			"--config", `model="x"`, "--strict-config", "proxy",
+			"-c", `model_reasoning_effort="high"`, "--enable=proxy-a",
+		},
+	}
+	for _, args := range tests {
+		action, proxyArgs, err := Classify(args, env(map[string]string{
+			"CODEX_HOME": "/tmp/codex-home",
+		}))
+		if err != nil || action != Proxy {
+			t.Fatalf("Classify(%q) = %v, %q, %v", args, action, proxyArgs, err)
+		}
+		want := "/tmp/codex-home/app-server-control/app-server-control.sock"
+		if !slices.Equal(proxyArgs, []string{"--socket", want}) {
+			t.Fatalf("Classify(%q) proxy args = %q, want socket %q", args, proxyArgs, want)
+		}
+	}
+}
+
+func TestClassifyFailsClosedForAmbiguousProxyOptions(t *testing.T) {
+	tests := [][]string{
+		{"--secret-option", "app-server", "proxy"},
+		{"app-server", "--secret-option", "proxy"},
+		{"app-server", "proxy", "--secret-option"},
+		{"app-server", "proxy", "-c"},
+		{"app-server", "proxy", "--enable="},
+		{"app-server", "proxy", "--strict-config"},
+	}
+	for _, args := range tests {
+		action, _, err := Classify(args, env(map[string]string{"CODEX_HOME": "/tmp/home"}))
+		if action != Proxy || err == nil {
+			t.Fatalf("Classify(%q) = %v, %v", args, action, err)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("Classify(%q) leaked argument in %v", args, err)
+		}
+	}
+}
+
+func TestClassifyDelegatesKnownNonProxyCommands(t *testing.T) {
+	tests := [][]string{
+		{"exec", "echo", "app-server", "proxy"},
+		{"review", "app-server", "proxy"},
+		{"app-server", "daemon", "proxy"},
+		{"app-server", "proxy", "--help"},
+		{"app-server", "proxy", "-h"},
+	}
+	for _, args := range tests {
+		action, proxyArgs, err := Classify(args, env(nil))
 		if err != nil || action != Delegate || proxyArgs != nil {
 			t.Fatalf("Classify(%q) = %v, %q, %v", args, action, proxyArgs, err)
 		}
@@ -40,7 +113,6 @@ func TestClassifyInterceptsOnlyAppServerProxy(t *testing.T) {
 
 func TestClassifyRejectsUnsafeProxyArgumentsWithoutDelegating(t *testing.T) {
 	tests := [][]string{
-		{"app-server", "proxy"},
 		{"app-server", "proxy", "--sock"},
 		{"app-server", "proxy", "--sock", ""},
 		{"app-server", "proxy", "--unknown"},
@@ -48,7 +120,7 @@ func TestClassifyRejectsUnsafeProxyArgumentsWithoutDelegating(t *testing.T) {
 		{"app-server", "proxy", "secret-positional"},
 	}
 	for _, args := range tests {
-		action, _, err := Classify(args)
+		action, _, err := Classify(args, env(nil))
 		if action != Proxy || err == nil {
 			t.Fatalf("Classify(%q) = action %v, error %v", args, action, err)
 		}
