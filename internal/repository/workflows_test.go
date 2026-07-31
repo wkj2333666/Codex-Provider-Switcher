@@ -47,6 +47,8 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 		"--generate-notes", "contents: read", "contents: write",
 		"go mod tidy", "git diff --exit-code -- go.mod go.sum",
 		`bash scripts/validate-release-tag.sh "$GITHUB_REF_NAME"`,
+		`cp README.md LICENSE THIRD_PARTY_NOTICES "$root/"`,
+		`tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/THIRD_PARTY_NOTICES"`,
 	} {
 		if !strings.Contains(content, required) {
 			t.Errorf("release.yml missing %q", required)
@@ -54,6 +56,23 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 	}
 	if count := strings.Count(content, "contents: write"); count != 1 {
 		t.Errorf("release.yml has %d contents: write grants, want 1", count)
+	}
+}
+
+func TestThirdPartyNoticesContainsCoderWebSocketLicense(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join(repositoryRoot(t), "THIRD_PARTY_NOTICES"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"github.com/coder/websocket v1.8.15",
+		"Copyright (c) 2025 Coder",
+		"Permission to use, copy, modify, and distribute this software",
+		`THE SOFTWARE IS PROVIDED "AS IS"`,
+	} {
+		if !strings.Contains(string(content), required) {
+			t.Errorf("THIRD_PARTY_NOTICES missing %q", required)
+		}
 	}
 }
 

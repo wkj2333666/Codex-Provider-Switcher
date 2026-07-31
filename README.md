@@ -216,4 +216,5 @@ details.
 
 ## License
 
-MIT
+The project is licensed under MIT. Statically linked dependency licenses are
+included in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
