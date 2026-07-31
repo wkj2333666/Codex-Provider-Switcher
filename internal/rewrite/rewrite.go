@@ -92,6 +92,9 @@ func Stream(dst io.Writer, src io.Reader, provider string) error {
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			return nil
 		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return fmt.Errorf("read input line %d: %w", lineNumber, readErr)
+		}
 
 		body, ending := splitLineEnding(line)
 		rewritten, err := Line(body, provider)
@@ -107,9 +110,6 @@ func Stream(dst io.Writer, src io.Reader, provider string) error {
 
 		if errors.Is(readErr, io.EOF) {
 			return nil
-		}
-		if readErr != nil {
-			return fmt.Errorf("read input line %d: %w", lineNumber+1, readErr)
 		}
 	}
 }

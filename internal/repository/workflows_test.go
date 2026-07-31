@@ -2,6 +2,7 @@ package repository
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -43,6 +44,7 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 		`- "v*"`, "go test -race ./...", "linux-amd64", "linux-arm64",
 		"darwin-amd64", "darwin-arm64", "sha256sum", "gh release create",
 		"--generate-notes", "contents: read", "contents: write",
+		`bash scripts/validate-release-tag.sh "$GITHUB_REF_NAME"`,
 	} {
 		if !strings.Contains(content, required) {
 			t.Errorf("release.yml missing %q", required)
@@ -53,16 +55,55 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 	}
 }
 
+func TestReleaseTagValidation(t *testing.T) {
+	root := repositoryRoot(t)
+	script := filepath.Join(root, "scripts", "validate-release-tag.sh")
+	tests := []struct {
+		tag   string
+		valid bool
+	}{
+		{tag: "v0.1.0", valid: true},
+		{tag: "v10.20.30", valid: true},
+		{tag: "v1.2.3-alpha.1", valid: true},
+		{tag: "v1.2.3-alpha+build.01", valid: true},
+		{tag: "v1.2.3-."},
+		{tag: "v1.2.3-01"},
+		{tag: "v1.2.3-a..b"},
+		{tag: "v1.2.3+.."},
+		{tag: "v01.2.3"},
+		{tag: "1.2.3"},
+		{tag: "v1.2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tag, func(t *testing.T) {
+			command := exec.Command("bash", script, tt.tag)
+			err := command.Run()
+			if tt.valid && err != nil {
+				t.Errorf("valid tag rejected: %v", err)
+			}
+			if !tt.valid && err == nil {
+				t.Error("invalid tag accepted")
+			}
+		})
+	}
+}
+
 func readWorkflow(t *testing.T, name string) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot locate repository test")
-	}
-	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	root := repositoryRoot(t)
 	content, err := os.ReadFile(filepath.Join(root, ".github", "workflows", name))
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
 	}
 	return string(content)
+}
+
+func repositoryRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate repository test")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 }

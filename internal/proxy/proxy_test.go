@@ -174,14 +174,49 @@ func TestRunTerminatesChildAfterOutputFailure(t *testing.T) {
 }
 
 func TestRunReportsStartupFailure(t *testing.T) {
+	secretExecutable := "/secret/environment/path/codex"
 	err := Run(Options{
-		Config: config.Config{Provider: "provider-a", Socket: "/tmp/app-server.sock", Codex: "/does/not/exist/codex"},
+		Config: config.Config{Provider: "provider-a", Socket: "/tmp/app-server.sock", Codex: secretExecutable},
 		Stdin:  strings.NewReader(""),
 		Stdout: io.Discard,
 		Stderr: io.Discard,
 	})
 	if err == nil || !strings.Contains(err.Error(), "start Codex proxy") {
 		t.Fatalf("Run() error = %v, want startup failure", err)
+	}
+	if strings.Contains(err.Error(), secretExecutable) {
+		t.Fatalf("Run() leaked executable path: %v", err)
+	}
+}
+
+func TestForwardInputPublishesRewriteErrorBeforeClosingChild(t *testing.T) {
+	done := make(chan error, 1)
+	childInput := &observingWriteCloser{onClose: func() {
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+				t.Errorf("published error at close = %v", err)
+			}
+			done <- err
+		default:
+			t.Error("child stdin closed before rewrite error was published")
+		}
+	}}
+
+	forwardInput(done, childInput, strings.NewReader("not-json\n"), "provider-a")
+	if err := <-done; err == nil {
+		t.Fatal("forwardInput() published nil, want rewrite error")
+	}
+}
+
+func TestForwardInputPublishesCloseErrorAfterSuccessfulStream(t *testing.T) {
+	closeErr := errors.New("test close failure")
+	done := make(chan error, 1)
+	childInput := &observingWriteCloser{closeErr: closeErr}
+
+	forwardInput(done, childInput, strings.NewReader(`{"method":"custom/do"}`+"\n"), "provider-a")
+	if err := <-done; !errors.Is(err, closeErr) {
+		t.Fatalf("forwardInput() error = %v, want close failure", err)
 	}
 }
 
@@ -225,4 +260,20 @@ type errorWriter struct{}
 
 func (errorWriter) Write([]byte) (int, error) {
 	return 0, errors.New("test output failure")
+}
+
+type observingWriteCloser struct {
+	onClose  func()
+	closeErr error
+}
+
+func (*observingWriteCloser) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (writer *observingWriteCloser) Close() error {
+	if writer.onClose != nil {
+		writer.onClose()
+	}
+	return writer.closeErr
 }

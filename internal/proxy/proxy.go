@@ -48,18 +48,12 @@ func Run(options Options) error {
 		return errors.New("create Codex proxy output")
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start Codex proxy: %w", err)
+		return sanitizedStartError(err)
 	}
 
 	inputDone := make(chan error, 1)
 	go func() {
-		streamErr := rewrite.Stream(childInput, stdin, options.Config.Provider)
-		closeErr := childInput.Close()
-		if streamErr != nil {
-			inputDone <- streamErr
-			return
-		}
-		inputDone <- closeErr
+		forwardInput(inputDone, childInput, stdin, options.Config.Provider)
 	}()
 
 	outputDone := make(chan error, 1)
@@ -102,6 +96,15 @@ func Run(options Options) error {
 
 	waitErr := cmd.Wait()
 	_ = childInput.Close()
+	if inputDone != nil {
+		select {
+		case inputErr := <-inputDone:
+			if inputErr != nil && forwardingErr == nil {
+				forwardingErr = fmt.Errorf("input forwarding failed: %w", inputErr)
+			}
+		default:
+		}
+	}
 	if forwardingErr != nil {
 		return forwardingErr
 	}
@@ -109,6 +112,28 @@ func Run(options Options) error {
 		return waitErr
 	}
 	return nil
+}
+
+func forwardInput(done chan<- error, childInput io.WriteCloser, stdin io.Reader, provider string) {
+	streamErr := rewrite.Stream(childInput, stdin, provider)
+	if streamErr != nil {
+		// Publish failures before EOF can make the child exit and close stdout.
+		done <- streamErr
+		_ = childInput.Close()
+		return
+	}
+	done <- childInput.Close()
+}
+
+func sanitizedStartError(err error) error {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return errors.New("start Codex proxy: executable unavailable")
+	case errors.Is(err, os.ErrPermission):
+		return errors.New("start Codex proxy: permission denied")
+	default:
+		return errors.New("start Codex proxy: failed")
+	}
 }
 
 func kill(process *os.Process) {

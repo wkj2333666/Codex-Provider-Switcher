@@ -3,6 +3,7 @@ package rewrite
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -158,8 +159,37 @@ func TestStreamReportsLineWithoutLeakingBody(t *testing.T) {
 	}
 }
 
+func TestStreamDoesNotForwardPartialDataFromReadError(t *testing.T) {
+	t.Parallel()
+
+	readErr := errors.New("test read failure")
+	reader := &dataErrorReader{data: []byte(`{"method":"custom/do"}`), err: readErr}
+	var output bytes.Buffer
+	err := Stream(&output, reader, "provider-a")
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Stream() error = %v, want wrapped read failure", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("Stream() forwarded uncertain partial frame: %q", output.String())
+	}
+}
+
 func valuesEqual(got, want any) bool {
 	gotJSON, _ := json.Marshal(got)
 	wantJSON, _ := json.Marshal(want)
 	return bytes.Equal(gotJSON, wantJSON)
+}
+
+type dataErrorReader struct {
+	data []byte
+	err  error
+}
+
+func (reader *dataErrorReader) Read(destination []byte) (int, error) {
+	if len(reader.data) == 0 {
+		return 0, reader.err
+	}
+	n := copy(destination, reader.data)
+	reader.data = reader.data[n:]
+	return n, reader.err
 }
