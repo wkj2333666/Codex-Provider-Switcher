@@ -85,7 +85,7 @@ func TestRunRejectsConfigurationBeforeStartingProxy(t *testing.T) {
 }
 
 func TestRunPassesResolvedConfigurationAndStreams(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "app-server.sock")
+	socketPath := filepath.Join(shortTempDir(t), "app-server.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestRunPassesResolvedConfigurationAndStreams(t *testing.T) {
 }
 
 func TestRunReportsProxyFailure(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "app-server.sock")
+	socketPath := filepath.Join(shortTempDir(t), "app-server.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatal(err)
@@ -145,4 +145,14 @@ func TestRunReportsProxyFailure(t *testing.T) {
 	if code != 1 || !strings.Contains(stderr.String(), "proxy error: test process failure") {
 		t.Fatalf("run(proxy failure) = %d, stderr %q", code, stderr.String())
 	}
+}
+
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "cps-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }

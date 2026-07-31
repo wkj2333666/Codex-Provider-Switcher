@@ -106,7 +106,7 @@ func TestParseResolvesRelativeExplicitPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	socket := unixSocket(t, filepath.Join(dir, "relative.sock"))
 	codex := executableAt(t, filepath.Join(dir, "codex-bin"))
 	relSocket, err := filepath.Rel(cwd, socket)
@@ -150,7 +150,7 @@ func unixSocket(t *testing.T, name string) string {
 	t.Helper()
 	path := name
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(t.TempDir(), path)
+		path = filepath.Join(shortTempDir(t), path)
 	}
 	listener, err := net.Listen("unix", path)
 	if err != nil {
@@ -162,6 +162,16 @@ func unixSocket(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return abs
+}
+
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "cps-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 func executable(t *testing.T, name string) string {
