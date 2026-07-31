@@ -170,6 +170,35 @@ func TestRunRejectsMessageAboveLimit(t *testing.T) {
 	}
 }
 
+func TestRunClosesWithPolicyViolationForInvalidJSON(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	socket := startWebSocketServer(t, func(connection *websocket.Conn) {
+		_, _, _ = connection.Read(ctx)
+	})
+	client, done := dialTestProxy(t, ctx, socket, Options{})
+	defer client.CloseNow()
+
+	if err := client.Write(ctx, websocket.MessageText, []byte("not-json-secret")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, readErr := client.Read(ctx)
+	if websocket.CloseStatus(readErr) != websocket.StatusPolicyViolation {
+		t.Fatalf("CloseStatus = %v, want %v (error %v)", websocket.CloseStatus(readErr), websocket.StatusPolicyViolation, readErr)
+	}
+	if strings.Contains(readErr.Error(), "not-json-secret") {
+		t.Fatalf("close error leaked payload: %v", readErr)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "forwarding failed") {
+			t.Fatalf("Run() error = %v, want forwarding failure", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Run() did not stop after routing policy violation")
+	}
+}
+
 func TestRunHandlesShortStdioReadsAndWrites(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

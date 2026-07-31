@@ -21,6 +21,8 @@ import (
 
 const maxMessageSize int64 = 64 << 20
 
+var errRoutingPolicy = errors.New("routing policy rejected message")
+
 // Options supplies validated configuration and process streams.
 type Options struct {
 	Config         config.Config
@@ -206,6 +208,20 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider 
 		return nil
 	}
 
+	if ctx.Err() != nil {
+		cancel()
+		_ = downstream.CloseNow()
+		_ = upstream.CloseNow()
+		return nil
+	}
+
+	status := websocket.StatusInternalError
+	reason := "proxy forwarding failed"
+	if errors.Is(first.err, errRoutingPolicy) {
+		status = websocket.StatusPolicyViolation
+		reason = "routing policy rejected message"
+	}
+	closeConnections(status, reason, downstream, upstream)
 	cancel()
 	_ = downstream.CloseNow()
 	_ = upstream.CloseNow()
@@ -214,9 +230,6 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider 
 	case <-time.After(time.Second):
 	}
 
-	if ctx.Err() != nil {
-		return nil
-	}
 	if first.err != nil {
 		return errors.New("WebSocket message forwarding failed")
 	}
@@ -232,11 +245,30 @@ func pump(ctx context.Context, destination, source *websocket.Conn, transformTex
 		if messageType == websocket.MessageText && transformText != nil {
 			payload, err = transformText(payload)
 			if err != nil {
-				return err
+				return errRoutingPolicy
 			}
 		}
 		if err := destination.Write(ctx, messageType, payload); err != nil {
 			return err
+		}
+	}
+}
+
+func closeConnections(status websocket.StatusCode, reason string, connections ...*websocket.Conn) {
+	done := make(chan struct{}, len(connections))
+	for _, connection := range connections {
+		go func(connection *websocket.Conn) {
+			_ = connection.Close(status, reason)
+			done <- struct{}{}
+		}(connection)
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for range connections {
+		select {
+		case <-done:
+		case <-timer.C:
+			return
 		}
 	}
 }
