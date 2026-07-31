@@ -120,7 +120,11 @@ func TestRunStockWrapperUsesDefaultSocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	codexHome := t.TempDir()
+	codexHome, err := os.MkdirTemp("/tmp", "cps-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(codexHome) })
 	controlDir := filepath.Join(codexHome, "app-server-control")
 	if err := os.MkdirAll(controlDir, 0o700); err != nil {
 		t.Fatal(err)
