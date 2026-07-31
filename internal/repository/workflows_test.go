@@ -126,6 +126,10 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 	for _, required := range []string{
 		"WebSocket", "ln -s", "CODEX_PROVIDER_SWITCHER_PROVIDER",
 		"AcceptEnv", "v0.1.0", "Uninstall", "64 MiB",
+		"v0.2.0 is also incompatible with stock Desktop Remote SSH",
+		"`codex app-server proxy` without `--sock`",
+		"CODEX_PROVIDER_SWITCHER_SOCKET", "--strict-config",
+		"same Unix user", "downstream `request.Host`", "THIRD_PARTY_NOTICES",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("documentation missing %q", required)
@@ -135,6 +139,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"runs the official stdio proxy",
 		"Server output is copied byte-for-byte",
 		"Configure each Desktop Remote SSH entry point to launch the switcher as its stdio proxy",
+		"The upstream Host is the fixed local URL placeholder `localhost`",
 	} {
 		if strings.Contains(combined, obsolete) {
 			t.Errorf("documentation retains obsolete claim %q", obsolete)
