@@ -124,16 +124,18 @@ codex-provider-switcher proxy \
   --socket "$HOME/.local/state/codex/app-server.sock"
 ```
 
-Environment equivalents are:
+Direct proxy environment equivalents are:
 
 ```text
 CODEX_PROVIDER_SWITCHER_PROVIDER
 CODEX_PROVIDER_SWITCHER_SOCKET
-CODEX_PROVIDER_SWITCHER_CODEX
 ```
 
 Flags take precedence over environment values. Provider IDs accept ASCII
 letters, digits, `.`, `_`, and `-`.
+
+`CODEX_PROVIDER_SWITCHER_CODEX` is wrapper-only. It identifies the absolute
+real Codex executable used when delegating non-proxy commands.
 
 ## Routing Behavior
 

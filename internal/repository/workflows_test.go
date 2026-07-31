@@ -30,7 +30,8 @@ func TestCIContainsRequiredQualityAndBuildGates(t *testing.T) {
 	for _, required := range []string{
 		"gofmt -l", "go vet ./...", "go test ./...", "go test -race ./...",
 		"linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64",
-		"contents: read", "pull_request:", "workflow_dispatch:",
+		"contents: read", "pull_request:", "workflow_dispatch:", "go mod tidy",
+		"git diff --exit-code -- go.mod go.sum",
 	} {
 		if !strings.Contains(content, required) {
 			t.Errorf("ci.yml missing %q", required)
@@ -44,6 +45,7 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 		`- "v*"`, "go test -race ./...", "linux-amd64", "linux-arm64",
 		"darwin-amd64", "darwin-arm64", "sha256sum", "gh release create",
 		"--generate-notes", "contents: read", "contents: write",
+		"go mod tidy", "git diff --exit-code -- go.mod go.sum",
 		`bash scripts/validate-release-tag.sh "$GITHUB_REF_NAME"`,
 	} {
 		if !strings.Contains(content, required) {

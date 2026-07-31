@@ -89,13 +89,13 @@ func Run(ctx context.Context, options Options) error {
 
 func serveConnection(ctx context.Context, writer http.ResponseWriter, request *http.Request, options Options) error {
 	if !validUpgrade(request) {
-		writer.WriteHeader(http.StatusBadRequest)
+		writeHTTPError(writer, http.StatusBadRequest)
 		return errors.New("invalid downstream WebSocket upgrade")
 	}
 
 	upstream, _, err := dialUpstream(ctx, request, options.Config.Socket)
 	if err != nil {
-		writer.WriteHeader(http.StatusBadGateway)
+		writeHTTPError(writer, http.StatusBadGateway)
 		return errors.New("upstream WebSocket handshake failed")
 	}
 	defer upstream.CloseNow()
@@ -121,6 +121,14 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	downstream.SetReadLimit(limit)
 	upstream.SetReadLimit(limit)
 	return bridge(ctx, downstream, upstream, options.Config.Provider)
+}
+
+func writeHTTPError(writer http.ResponseWriter, status int) {
+	writer.Header().Set("Content-Length", "0")
+	writer.WriteHeader(status)
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func dialUpstream(ctx context.Context, request *http.Request, socket string) (*websocket.Conn, *http.Response, error) {
@@ -161,7 +169,6 @@ func dialUpstream(ctx context.Context, request *http.Request, socket string) (*w
 	return websocket.Dial(ctx, "ws://localhost"+path, &websocket.DialOptions{
 		HTTPClient:      client,
 		HTTPHeader:      headers,
-		Host:            request.Host,
 		Subprotocols:    headerTokens(request.Header.Values("Sec-WebSocket-Protocol")),
 		CompressionMode: websocket.CompressionDisabled,
 	})

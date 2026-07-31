@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +19,81 @@ import (
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
 )
+
+func TestRunFlushesHTTPErrorBeforeProcessExit(t *testing.T) {
+	validUpgrade := "GET / HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	tests := []struct {
+		name       string
+		request    string
+		wantStatus int
+	}{
+		{name: "invalid downstream", request: "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", wantStatus: http.StatusBadRequest},
+		{name: "unavailable upstream", request: validUpgrade, wantStatus: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run=TestTransportProcessHelper")
+			command.Env = append(os.Environ(),
+				"CODEX_PROVIDER_SWITCHER_TRANSPORT_HELPER=1",
+				"CODEX_PROVIDER_SWITCHER_TRANSPORT_SOCKET="+filepath.Join(t.TempDir(), "missing.sock"),
+			)
+			command.Stdin = strings.NewReader(tt.request)
+			var stdout bytes.Buffer
+			command.Stdout = &stdout
+			if err := command.Run(); err == nil {
+				t.Fatal("helper exit = 0, want proxy failure")
+			}
+			response, err := http.ReadResponse(bufio.NewReader(&stdout), &http.Request{Method: http.MethodGet})
+			if err != nil {
+				t.Fatalf("ReadResponse() error = %v; raw output %q", err, stdout.String())
+			}
+			_ = response.Body.Close()
+			if response.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", response.StatusCode, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestServeConnectionFlushesHTTPErrorBeforeReturn(t *testing.T) {
+	request, err := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &flushRecorder{header: make(http.Header)}
+	err = serveConnection(context.Background(), writer, request, Options{
+		Config: config.Config{Provider: "provider-a", Socket: filepath.Join(t.TempDir(), "missing.sock")},
+	})
+	if err == nil {
+		t.Fatal("serveConnection() error = nil")
+	}
+	if writer.status != http.StatusBadRequest || !writer.flushed {
+		t.Fatalf("HTTP error status = %d, flushed = %v", writer.status, writer.flushed)
+	}
+}
+
+func TestTransportProcessHelper(t *testing.T) {
+	if os.Getenv("CODEX_PROVIDER_SWITCHER_TRANSPORT_HELPER") != "1" {
+		return
+	}
+	err := Run(context.Background(), Options{
+		Config: config.Config{
+			Provider: "provider-a",
+			Socket:   os.Getenv("CODEX_PROVIDER_SWITCHER_TRANSPORT_SOCKET"),
+		},
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+	})
+	if err == nil {
+		os.Exit(0)
+	}
+	os.Exit(23)
+}
 
 func TestRunSupportsAllPayloadLengthEncodings(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -305,7 +381,7 @@ func TestRunForwardsHeadersPathAndSubprotocolWithoutCompression(t *testing.T) {
 	defer client.CloseNow()
 
 	details := <-handshake
-	if details.path != "/rpc?connection=1" || details.host != "desktop.test" || details.testHeader != "retained" {
+	if details.path != "/rpc?connection=1" || details.host != "localhost" || details.testHeader != "retained" {
 		t.Fatalf("upstream handshake = %#v", details)
 	}
 	if details.extension != "" {
@@ -494,6 +570,21 @@ type receivedMessage struct {
 	payload     []byte
 	err         error
 }
+
+type flushRecorder struct {
+	header  http.Header
+	status  int
+	flushed bool
+}
+
+func (writer *flushRecorder) Header() http.Header { return writer.header }
+
+func (writer *flushRecorder) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (writer *flushRecorder) WriteHeader(status int) { writer.status = status }
+func (writer *flushRecorder) Flush()                 { writer.flushed = true }
 
 func startWebSocketServer(t *testing.T, handle func(*websocket.Conn)) string {
 	t.Helper()
