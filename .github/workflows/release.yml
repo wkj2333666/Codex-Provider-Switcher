@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24.x"
+
+jobs:
+  quality:
+    name: Validate tagged source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Validate semantic version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            printf 'release tag must be semantic version prefixed by v\n' >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run race detector
+        run: go test -race ./...
+
+  build:
+    name: Package ${{ matrix.target }}
+    needs: quality
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build archive and checksum
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="codex-provider-switcher-${version}-${TARGET}"
+          root="dist/${name}"
+          mkdir -p "$root"
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o "$root/codex-provider-switcher" \
+            ./cmd/codex-provider-switcher
+          cp README.md LICENSE "$root/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          (cd dist && sha256sum "${name}.tar.gz" >"${name}.tar.gz.sha256")
+
+      - name: Upload packaged target
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged targets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find release-assets -maxdepth 1 -type f -name '*.tar.gz' -print | sort)
+          mapfile -t checksums < <(find release-assets -maxdepth 1 -type f -name '*.sha256' -print | sort)
+          test "${#archives[@]}" -eq 4
+          test "${#checksums[@]}" -eq 4
+          for checksum in "${checksums[@]}"; do
+            (cd release-assets && sha256sum -c "$(basename "$checksum")")
+          done
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(find release-assets -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -print0)
+          test "${#assets[@]}" -eq 8
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
