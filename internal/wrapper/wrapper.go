@@ -94,7 +94,7 @@ func Classify(args []string, getenv func(string) string) (Action, []string, erro
 		argument := args[index]
 		switch {
 		case argument == "--sock":
-			if socket != "" || index+1 >= len(args) || args[index+1] == "" {
+			if socket != "" || index+1 >= len(args) || invalidSplitValue(args[index+1]) {
 				return Proxy, nil, errors.New("invalid app-server proxy socket option")
 			}
 			socket = args[index+1]
@@ -134,7 +134,7 @@ func consumeCommonOption(args []string, index int, allowStrict bool) (int, bool,
 
 	for _, option := range []string{"-c", "--config", "--enable", "--disable"} {
 		if argument == option {
-			if index+1 >= len(args) || args[index+1] == "" {
+			if index+1 >= len(args) || invalidSplitValue(args[index+1]) {
 				return index, false, errors.New("invalid Codex configuration option")
 			}
 			return index + 2, true, nil
@@ -151,6 +151,10 @@ func consumeCommonOption(args []string, index int, allowStrict bool) (int, bool,
 	}
 
 	return index, false, nil
+}
+
+func invalidSplitValue(value string) bool {
+	return value == "" || strings.HasPrefix(value, "-")
 }
 
 func looksLikeProxy(args []string) bool {

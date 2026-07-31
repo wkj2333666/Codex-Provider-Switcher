@@ -54,7 +54,6 @@ func TestClassifyInterceptsProxyWithCommonOptionsAtEveryLayer(t *testing.T) {
 		{"app-server", "proxy", "--config=model=\"x\""},
 		{"app-server", "proxy", "--enable", "feature-a"},
 		{"app-server", "proxy", "--disable=feature-b"},
-		{"app-server", "proxy", "-c", "--help"},
 		{
 			"--enable", "top-a", "--disable=top-b", "app-server",
 			"--config", `model="x"`, "--strict-config", "proxy",
@@ -83,6 +82,10 @@ func TestClassifyFailsClosedForAmbiguousProxyOptions(t *testing.T) {
 		{"app-server", "proxy", "-c"},
 		{"app-server", "proxy", "--enable="},
 		{"app-server", "proxy", "--strict-config"},
+		{"-c", "--help", "app-server", "proxy"},
+		{"app-server", "--enable", "--disable", "proxy"},
+		{"app-server", "proxy", "-c", "--help"},
+		{"app-server", "proxy", "--sock", "--help"},
 	}
 	for _, args := range tests {
 		action, _, err := Classify(args, env(map[string]string{"CODEX_HOME": "/tmp/home"}))
