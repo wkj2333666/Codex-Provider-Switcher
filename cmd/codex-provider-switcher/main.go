@@ -92,7 +92,7 @@ func runDirect(ctx context.Context, args []string, deps dependencies) int {
 }
 
 func runWrapper(ctx context.Context, args []string, deps dependencies) int {
-	action, proxyArgs, err := wrapper.Classify(args)
+	action, proxyArgs, err := wrapper.Classify(args, deps.getenv)
 	if err != nil {
 		_, _ = fmt.Fprintf(deps.stderr, "codex-provider-switcher: wrapper error: %v\n", err)
 		return 2

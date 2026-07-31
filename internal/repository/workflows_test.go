@@ -47,6 +47,8 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 		"--generate-notes", "contents: read", "contents: write",
 		"go mod tidy", "git diff --exit-code -- go.mod go.sum",
 		`bash scripts/validate-release-tag.sh "$GITHUB_REF_NAME"`,
+		`cp README.md LICENSE THIRD_PARTY_NOTICES "$root/"`,
+		`tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/THIRD_PARTY_NOTICES"`,
 	} {
 		if !strings.Contains(content, required) {
 			t.Errorf("release.yml missing %q", required)
@@ -54,6 +56,32 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 	}
 	if count := strings.Count(content, "contents: write"); count != 1 {
 		t.Errorf("release.yml has %d contents: write grants, want 1", count)
+	}
+}
+
+func TestThirdPartyNoticesContainsCoderWebSocketLicense(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join(repositoryRoot(t), "THIRD_PARTY_NOTICES"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "github.com/coder/websocket v1.8.15") {
+		t.Error("THIRD_PARTY_NOTICES missing pinned coder/websocket version")
+	}
+	const license = `Copyright (c) 2025 Coder
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.`
+	if !strings.Contains(string(content), license) {
+		t.Error("THIRD_PARTY_NOTICES does not contain the complete coder/websocket ISC license")
 	}
 }
 
@@ -107,6 +135,10 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 	for _, required := range []string{
 		"WebSocket", "ln -s", "CODEX_PROVIDER_SWITCHER_PROVIDER",
 		"AcceptEnv", "v0.1.0", "Uninstall", "64 MiB",
+		"v0.2.0 is also incompatible with stock Desktop Remote SSH",
+		"`codex app-server proxy` without `--sock`",
+		"CODEX_PROVIDER_SWITCHER_SOCKET", "--strict-config",
+		"same Unix user", "downstream `request.Host`", "THIRD_PARTY_NOTICES",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("documentation missing %q", required)
@@ -116,6 +148,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"runs the official stdio proxy",
 		"Server output is copied byte-for-byte",
 		"Configure each Desktop Remote SSH entry point to launch the switcher as its stdio proxy",
+		"The upstream Host is the fixed local URL placeholder `localhost`",
 	} {
 		if strings.Contains(combined, obsolete) {
 			t.Errorf("documentation retains obsolete claim %q", obsolete)

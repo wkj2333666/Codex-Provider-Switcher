@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/transport"
 )
 
@@ -88,7 +92,8 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	var got transport.Options
 	delegated := false
 	code := run(context.Background(), filepath.Join(t.TempDir(), "codex"), []string{
-		"app-server", "proxy", "--sock", socket,
+		"-c", `model="top"`, "app-server", "--enable", "feature-a", "proxy",
+		"--disable=feature-b", "--sock", socket,
 	}, dependencies{
 		getenv: env(map[string]string{"CODEX_PROVIDER_SWITCHER_PROVIDER": "provider-b"}),
 		stdin:  strings.NewReader("input"),
@@ -108,6 +113,129 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	}
 	if got.Config.Provider != "provider-b" || got.Config.Socket != socket {
 		t.Fatalf("proxy config = %#v", got.Config)
+	}
+}
+
+func TestRunStockWrapperUsesDefaultSocket(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	codexHome, err := os.MkdirTemp("/tmp", "cps-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(codexHome) })
+	controlDir := filepath.Join(codexHome, "app-server-control")
+	if err := os.MkdirAll(controlDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(controlDir, "app-server-control.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	received := make(chan []byte, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, acceptErr := websocket.Accept(writer, request, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+			CompressionMode:    websocket.CompressionDisabled,
+		})
+		if acceptErr != nil {
+			return
+		}
+		defer connection.CloseNow()
+		_, payload, readErr := connection.Read(ctx)
+		if readErr == nil {
+			received <- payload
+		}
+		<-ctx.Done()
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+	})
+
+	clientStream, switcherStream := net.Pipe()
+	codeDone := make(chan int, 1)
+	var stderr bytes.Buffer
+	go func() {
+		codeDone <- run(ctx, "codex", []string{"app-server", "proxy"}, dependencies{
+			getenv: env(map[string]string{
+				"CODEX_PROVIDER_SWITCHER_PROVIDER": "provider-a",
+				"CODEX_HOME":                       codexHome,
+			}),
+			stdin:    switcherStream,
+			stdout:   switcherStream,
+			stderr:   &stderr,
+			runProxy: transport.Run,
+		})
+	}()
+
+	client, response, err := websocket.Dial(ctx, "ws://desktop.test/", &websocket.DialOptions{
+		HTTPClient: singleConnHTTPClient(clientStream),
+	})
+	if err != nil {
+		t.Fatalf("WebSocket Dial() error = %v, stderr %q", err, stderr.String())
+	}
+	defer client.CloseNow()
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake status = %d, want 101", response.StatusCode)
+	}
+
+	request := []byte(`{"jsonrpc":"2.0","id":1,"method":"thread/start","params":{"keep":true}}`)
+	if err := client.Write(ctx, websocket.MessageText, request); err != nil {
+		t.Fatal(err)
+	}
+	var message struct {
+		Params map[string]any `json:"params"`
+	}
+	select {
+	case payload := <-received:
+		if err := json.Unmarshal(payload, &message); err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("upstream did not receive rewritten request")
+	}
+	if message.Params["modelProvider"] != "provider-a" || message.Params["keep"] != true {
+		t.Fatalf("upstream params = %#v", message.Params)
+	}
+
+	cancel()
+	_ = client.CloseNow()
+	select {
+	case code := <-codeDone:
+		if code != 0 || stderr.Len() != 0 {
+			t.Fatalf("run(stock wrapper) = %d, stderr %q", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stock wrapper did not stop after cancellation")
+	}
+}
+
+func TestRunWrapperDelegatesProxyHelpWithoutProvider(t *testing.T) {
+	current := executable(t, filepath.Join(t.TempDir(), "switcher"))
+	realCodex := executable(t, filepath.Join(t.TempDir(), "codex-real"))
+	delegated := false
+	proxyCalled := false
+	code := run(context.Background(), "codex", []string{"app-server", "proxy", "--help"}, dependencies{
+		getenv: env(map[string]string{
+			"CODEX_PROVIDER_SWITCHER_CODEX": realCodex,
+		}),
+		executable: func() (string, error) { return current, nil },
+		runProxy: func(context.Context, transport.Options) error {
+			proxyCalled = true
+			return nil
+		},
+		execProcess: func(path string, argv, environment []string) error {
+			delegated = path == realCodex && slices.Equal(argv, []string{realCodex, "app-server", "proxy", "--help"})
+			return nil
+		},
+	})
+	if code != 0 || !delegated || proxyCalled {
+		t.Fatalf("run(proxy help) = %d, delegated %v, proxy called %v", code, delegated, proxyCalled)
 	}
 }
 
@@ -239,4 +367,17 @@ func executable(t *testing.T, path string) string {
 
 func env(values map[string]string) func(string) string {
 	return func(key string) string { return values[key] }
+}
+
+func singleConnHTTPClient(connection net.Conn) *http.Client {
+	used := false
+	return &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			if used {
+				return nil, io.EOF
+			}
+			used = true
+			return connection, nil
+		},
+	}}
 }

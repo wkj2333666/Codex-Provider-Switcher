@@ -100,8 +100,9 @@ jobs:
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o "$root/codex-provider-switcher" \
             ./cmd/codex-provider-switcher
-          cp README.md LICENSE "$root/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES "$root/"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/THIRD_PARTY_NOTICES"
           (cd dist && sha256sum "${name}.tar.gz" >"${name}.tar.gz.sha256")
 
       - name: Upload packaged target

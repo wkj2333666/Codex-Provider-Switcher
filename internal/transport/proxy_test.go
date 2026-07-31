@@ -381,7 +381,7 @@ func TestRunForwardsHeadersPathAndSubprotocolWithoutCompression(t *testing.T) {
 	defer client.CloseNow()
 
 	details := <-handshake
-	if details.path != "/rpc?connection=1" || details.host != "localhost" || details.testHeader != "retained" {
+	if details.path != "/rpc?connection=1" || details.host != "desktop.test" || details.testHeader != "retained" {
 		t.Fatalf("upstream handshake = %#v", details)
 	}
 	if details.extension != "" {

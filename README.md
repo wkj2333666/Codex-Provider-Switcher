@@ -2,7 +2,9 @@
 
 > **v0.1.0 is broken for Desktop Remote SSH.** It parsed the stdin of
 > `codex app-server proxy` as JSONL, but that stream contains an HTTP Upgrade
-> and WebSocket frames. Do not install or use v0.1.0. Use v0.2.0 or newer.
+> and WebSocket frames. **v0.2.0 is also incompatible with stock Desktop Remote SSH**
+> because its wrapper requires an explicit `--sock`. Do not install either
+> version. Use v0.2.1 or newer.
 
 Codex Provider Switcher is a provider-agnostic WebSocket proxy for Codex
 Desktop Remote SSH. Separate SSH entry points can select different model
@@ -14,9 +16,11 @@ This is an independent community project. It is not an OpenAI product.
 ## How It Works
 
 Desktop sends an HTTP WebSocket Upgrade and masked WebSocket frames through the
-remote `codex app-server proxy --sock ...` process. The switcher installs as a
-transparent executable named `codex`, intercepts only that command, and opens a
-new WebSocket directly to the app-server Unix socket:
+remote `codex app-server proxy` process. Stock Desktop invokes
+`codex app-server proxy` without `--sock`; Codex normally resolves its control
+socket from `CODEX_HOME` or the user's `.codex` directory. The switcher installs
+as a transparent executable named `codex`, intercepts that effective command,
+and opens a new WebSocket directly to the same app-server Unix socket:
 
 ```text
 Desktop A -> switcher(provider-a) --+
@@ -113,6 +117,22 @@ setting, so simply documenting a different command is not sufficient.
 The wrapper fails closed when the provider is missing. It never delegates a
 malformed `app-server proxy` invocation to the real CLI.
 
+### Stock Proxy Compatibility
+
+In transparent wrapper mode, the socket is selected in this order:
+
+1. Explicit `--sock <path>` or `--sock=<path>` on `app-server proxy`.
+2. `CODEX_PROVIDER_SWITCHER_SOCKET`.
+3. `$CODEX_HOME/app-server-control/app-server-control.sock`.
+4. `$HOME/.codex/app-server-control/app-server-control.sock`.
+
+The wrapper recognizes repeatable `-c`/`--config`, `--enable`, and `--disable`
+options before `app-server`, between `app-server` and `proxy`, and after
+`proxy`. It also accepts `--strict-config` before either subcommand. Supported
+configuration options are consumed for command classification but cannot
+change the provider selected by the SSH entry point. Proxy help is delegated;
+an invalid effective proxy command returns a sanitized wrapper error.
+
 ## Direct Proxy Mode
 
 Direct mode is available for tests and integrations that can choose the
@@ -174,10 +194,17 @@ supported because provider selection belongs to the loaded thread runtime.
 
 ## Security Boundaries
 
+- The SSH account and processes running as the same Unix user are trusted at
+  the account-authority level. They can already invoke the real Codex binary,
+  connect to their app-server socket, and change their own PATH or environment;
+  this switcher is a routing-correctness layer, not an authorization boundary.
+- Setuid installation, a socket privileged beyond the SSH user, and restricted
+  `ForceCommand` containment are outside the supported deployment model.
 - API keys and provider credentials remain in Codex configuration or the
   daemon environment.
-- End-to-end handshake headers are forwarded but never logged. Hop-by-hop and
-  generated WebSocket headers are removed before the upstream handshake.
+- End-to-end handshake headers, including the downstream `request.Host`, are
+  forwarded but never logged. Hop-by-hop and generated WebSocket headers are
+  removed before the upstream handshake.
 - Diagnostics do not include JSON bodies, prompts, header values, environment
   values, or candidate executable paths.
 - Delegation uses an argument vector and `exec`; no shell evaluates arguments.
@@ -216,4 +243,5 @@ details.
 
 ## License
 
-MIT
+The project is licensed under MIT. Statically linked dependency licenses are
+included in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
