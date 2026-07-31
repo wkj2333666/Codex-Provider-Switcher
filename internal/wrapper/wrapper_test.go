@@ -130,6 +130,75 @@ func TestClassifyRejectsUnsafeProxyArgumentsWithoutDelegating(t *testing.T) {
 	}
 }
 
+func TestClassifyResolvesWrapperSocketPrecedence(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "explicit",
+			args: []string{"app-server", "proxy", "--sock", "/explicit.sock"},
+			env: map[string]string{
+				"CODEX_PROVIDER_SWITCHER_SOCKET": "/switcher-env.sock",
+				"CODEX_HOME":                     "/codex-home",
+			},
+			want: "/explicit.sock",
+		},
+		{
+			name: "switcher environment",
+			args: []string{"app-server", "proxy"},
+			env: map[string]string{
+				"CODEX_PROVIDER_SWITCHER_SOCKET": "/switcher-env.sock",
+				"CODEX_HOME":                     "/codex-home",
+			},
+			want: "/switcher-env.sock",
+		},
+		{
+			name: "Codex home",
+			args: []string{"app-server", "proxy"},
+			env:  map[string]string{"CODEX_HOME": "/codex-home"},
+			want: "/codex-home/app-server-control/app-server-control.sock",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, proxyArgs, err := Classify(tt.args, env(tt.env))
+			if err != nil || action != Proxy {
+				t.Fatalf("Classify() = %v, %q, %v", action, proxyArgs, err)
+			}
+			if !slices.Equal(proxyArgs, []string{"--socket", tt.want}) {
+				t.Fatalf("proxy args = %q, want socket %q", proxyArgs, tt.want)
+			}
+		})
+	}
+}
+
+func TestClassifyFallsBackToUserCodexHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	action, proxyArgs, err := Classify([]string{"app-server", "proxy"}, env(nil))
+	if err != nil || action != Proxy {
+		t.Fatalf("Classify() = %v, %q, %v", action, proxyArgs, err)
+	}
+	want := filepath.Join(home, ".codex", "app-server-control", "app-server-control.sock")
+	if !slices.Equal(proxyArgs, []string{"--socket", want}) {
+		t.Fatalf("proxy args = %q, want socket %q", proxyArgs, want)
+	}
+}
+
+func TestClassifyRejectsUnavailableUserHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	action, _, err := Classify([]string{"app-server", "proxy"}, env(nil))
+	if action != Proxy || err == nil {
+		t.Fatalf("Classify() = %v, %v", action, err)
+	}
+	if err.Error() != "resolve default Codex socket" {
+		t.Fatalf("Classify() error = %q", err)
+	}
+}
+
 func TestResolveRealCodexUsesAbsoluteEnvironmentOverride(t *testing.T) {
 	current := executable(t, filepath.Join(t.TempDir(), "switcher"))
 	realCodex := executable(t, filepath.Join(t.TempDir(), "codex-real"))
