@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"net"
@@ -24,7 +26,11 @@ func TestParseProxyFlagsOverrideEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseProxy() error = %v", err)
 	}
-	want := Config{Provider: "flag-provider", Socket: flagSocket}
+	want := Config{
+		Provider: "flag-provider",
+		Socket:   flagSocket,
+		StateDir: customStateDir(flagSocket),
+	}
 	if result.Config != want {
 		t.Fatalf("Config = %#v, want %#v", result.Config, want)
 	}
@@ -39,7 +45,11 @@ func TestParseProxyUsesEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseProxy() error = %v", err)
 	}
-	want := Config{Provider: "provider_1.test", Socket: socket}
+	want := Config{
+		Provider: "provider_1.test",
+		Socket:   socket,
+		StateDir: customStateDir(socket),
+	}
 	if result.Config != want {
 		t.Fatalf("Config = %#v, want %#v", result.Config, want)
 	}
@@ -99,6 +109,62 @@ func TestParseProxyResolvesRelativeSocket(t *testing.T) {
 	}
 }
 
+func TestParseProxyResolvesStateDirectoryPrecedence(t *testing.T) {
+	t.Parallel()
+	root := shortTempDir(t)
+	codexHome := filepath.Join(root, "codex-home")
+	if err := os.MkdirAll(filepath.Join(codexHome, "app-server-control"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := unixSocket(t, filepath.Join(codexHome, "app-server-control", "app-server-control.sock"))
+	flagState := filepath.Join(root, "flag-state")
+	envState := filepath.Join(root, "env-state")
+
+	result, err := ParseProxy([]string{
+		"--provider", "openai",
+		"--socket", socket,
+		"--state-dir", flagState,
+	}, environment(map[string]string{
+		"CODEX_HOME":                        codexHome,
+		"CODEX_PROVIDER_SWITCHER_STATE_DIR": envState,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Config.StateDir != flagState {
+		t.Fatalf("flag StateDir = %q", result.Config.StateDir)
+	}
+
+	result, err = ParseProxy([]string{"--provider", "openai", "--socket", socket}, environment(map[string]string{
+		"CODEX_HOME":                        codexHome,
+		"CODEX_PROVIDER_SWITCHER_STATE_DIR": envState,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Config.StateDir != envState {
+		t.Fatalf("environment StateDir = %q", result.Config.StateDir)
+	}
+
+	result, err = ParseProxy([]string{"--provider", "openai", "--socket", socket}, environment(map[string]string{
+		"CODEX_HOME": codexHome,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(codexHome, "codex-provider-switcher"); result.Config.StateDir != want {
+		t.Fatalf("CODEX_HOME StateDir = %q, want %q", result.Config.StateDir, want)
+	}
+
+	result, err = ParseProxy([]string{"--provider", "openai", "--socket", socket}, environment(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(codexHome, "codex-provider-switcher"); result.Config.StateDir != want {
+		t.Fatalf("inferred StateDir = %q, want %q", result.Config.StateDir, want)
+	}
+}
+
 func TestParseProxyControlModesSkipConfigurationValidation(t *testing.T) {
 	result, err := ParseProxy([]string{"--version"}, environment(nil))
 	if err != nil {
@@ -144,4 +210,9 @@ func shortTempDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
+}
+
+func customStateDir(socket string) string {
+	digest := sha256.Sum256([]byte(socket))
+	return filepath.Join(filepath.Dir(socket), ".codex-provider-switcher-"+hex.EncodeToString(digest[:6]))
 }
