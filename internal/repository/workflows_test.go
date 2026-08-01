@@ -151,7 +151,6 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"prepareHandoff",
 		"dirty marker", "best-effort `restore`", "prepareHandoffV2",
 		"one SSH alias", "`/provider status`", "`/provider switch openai`", "`/provider switch sub2api`",
-		"`$provider status`", "`$provider switch <name>`",
 		"$HOME/.agents/skills/provider", "Provider switched to sub2api.",
 		"Runtime provider: unknown.", "Selected provider: app-server configuration.",
 		"will be applied before the next model turn",
@@ -172,6 +171,8 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"CODEX_PROVIDER_SWITCHER_PROVIDER",
 		"`/provider openai`",
 		"`/provider sub2api`",
+		"`/ provider status`",
+		"`/ provider switch <name>`",
 	} {
 		if strings.Contains(combined, obsolete) {
 			t.Errorf("documentation retains obsolete claim %q", obsolete)
@@ -195,12 +196,12 @@ func TestProviderPluginExposesExplicitStatusAndSwitchCommands(t *testing.T) {
 	if err := json.Unmarshal(content, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Version != "0.5.0" {
-		t.Fatalf("plugin version = %q, want 0.5.0", manifest.Version)
+	if manifest.Version != "0.5.1" {
+		t.Fatalf("plugin version = %q, want 0.5.1", manifest.Version)
 	}
 	want := []string{
-		"Use $provider status to show this task's current provider.",
-		"Use $provider switch sub2api to switch this task to sub2api.",
+		"Use /provider status to show this task's current provider.",
+		"Use /provider switch sub2api to switch this task to sub2api.",
 	}
 	if len(manifest.Interface.DefaultPrompt) != len(want) {
 		t.Fatalf("default prompts = %#v", manifest.Interface.DefaultPrompt)

@@ -10,12 +10,12 @@
 
 ## Global Constraints
 
-- Accepted commands are `/provider status`, `/provider switch <name>`, their `$provider` skill equivalents, and literal `/ provider ...` plain-text equivalents.
+- The only user-facing commands are `/provider status` and `/provider switch <name>`; `$provider` is accepted only as Desktop's skill-encoded internal form.
 - Status never resumes, switches, or writes provider state.
 - Switch success requires an app-server response matching the requested provider.
 - Control turns never invoke a model or enter rollout history.
 - Provider identifiers retain the existing ASCII grammar.
-- Release version is `0.5.0`.
+- Corrected release version is `0.5.1`.
 
 ---
 
@@ -64,7 +64,7 @@
 - Modify: `internal/repository/workflows_test.go`
 
 **Interfaces:**
-- Produces: discoverable explicit status/switch help and plugin version `0.5.0`.
+- Produces: discoverable explicit status/switch help and plugin version `0.5.1`.
 
 - [ ] Add failing repository assertions for the new grammar, status copy, removed legacy examples, and version.
 - [ ] Update plugin/skill/docs and confirm repository tests are GREEN.
@@ -76,10 +76,10 @@
 - No additional source files unless review finds a defect.
 
 **Interfaces:**
-- Produces: reviewed `v0.5.0` release and atomically installed wrapper/skill.
+- Produces: reviewed `v0.5.1` release and atomically installed wrapper/skill.
 
 - [ ] Run gofmt, full tests, vet, diff checks, and four CGO-disabled platform builds.
 - [ ] Review the complete diff for protocol accuracy, fail-closed behavior, secret handling, compatibility, and missing tests; fix findings inline.
-- [ ] Push a ready PR, wait for all CI, merge, tag `v0.5.0`, and verify all eight release assets.
+- [ ] Push a ready PR, wait for all CI, merge, tag `v0.5.1`, and verify all eight release assets.
 - [ ] Atomically deploy Linux ARM64 binary and provider skill without restarting existing daemons or proxies.
 - [ ] Verify stock and Android-shaped WebSocket handshakes and report remaining UI acceptance only.

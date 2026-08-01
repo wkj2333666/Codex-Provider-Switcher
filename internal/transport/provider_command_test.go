@@ -41,17 +41,6 @@ func TestParseProviderCommandRecognizesStrictControlInputs(t *testing.T) {
 			action:   providerCommandSwitch,
 			provider: "provider_1.test",
 		},
-		{
-			name:   "plain spaced status",
-			input:  `{"id":5,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider status"}]}}`,
-			action: providerCommandStatus,
-		},
-		{
-			name:     "plain spaced switch",
-			input:    `{"id":6,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider switch sub2api"}]}}`,
-			action:   providerCommandSwitch,
-			provider: "sub2api",
-		},
 	}
 
 	for _, tt := range tests {
@@ -74,7 +63,6 @@ func TestParseProviderCommandRejectsMalformedControlsWithoutLeaking(t *testing.T
 	inputs := []string{
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"}]}}`,
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider openai"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch secret/bad"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status trailing secret"}]}}`,
@@ -102,6 +90,9 @@ func TestParseProviderCommandForwardsOrdinaryMessages(t *testing.T) {
 	t.Parallel()
 	inputs := []string{
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"Explain /provider switch openai to me"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider switch sub2api"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider openai"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider status"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$other openai"},{"type":"skill","name":"other","path":"/skill/SKILL.md"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`,

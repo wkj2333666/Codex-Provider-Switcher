@@ -10,8 +10,8 @@ Replace the ambiguous provider control syntax with two explicit operations:
 ```
 
 Desktop skill invocations use the equivalent `$provider status` and
-`$provider switch <name>` forms. Plain clients may also send the literal spaced
-forms `/ provider status` and `/ provider switch <name>`.
+`$provider switch <name>` internal wire forms, which are accepted only with the
+corresponding skill metadata. They are not additional user-facing commands.
 
 ## Command Grammar
 
@@ -58,7 +58,8 @@ to rollout history.
 
 The skill description, examples, README, architecture documentation, and
 repository assertions move to the explicit grammar. Because the pre-1.0 command
-surface changes incompatibly, the release version becomes `0.5.0`.
+surface changes incompatibly, the initial release version is `0.5.0`. Removing
+the unintended spaced alias is released as `0.5.1`.
 
 ## Verification
 

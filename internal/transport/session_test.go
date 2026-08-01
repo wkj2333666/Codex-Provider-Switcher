@@ -803,7 +803,7 @@ func TestSessionProviderStatusReportsRuntimeAndSelectionWithoutMutation(t *testi
 
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			request := []byte(`{"id":20,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider status"}]}}`)
+			request := []byte(`{"id":20,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status"}]}}`)
 			if err := current.handleDownstreamText(ctx, request); err != nil {
 				t.Fatal(err)
 			}
