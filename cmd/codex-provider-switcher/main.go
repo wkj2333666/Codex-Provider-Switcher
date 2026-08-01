@@ -23,16 +23,16 @@ const usage = `Usage:
   codex-provider-switcher --version
 
 Proxy options:
-  --provider <id>  Provider to inject into task requests
+  --provider <id>  Optional explicit provider override
   --socket <path>  Shared app-server Unix socket
   --version        Print the switcher version and exit
   --help           Print this help and exit
 
 Environment:
-  CODEX_PROVIDER_SWITCHER_PROVIDER
   CODEX_PROVIDER_SWITCHER_SOCKET
   CODEX_PROVIDER_SWITCHER_CODEX
 
+When --provider is omitted, app-server configuration selects the provider.
 When installed under the name codex, app-server proxy is intercepted and all
 other commands are delegated to the real Codex executable.
 `

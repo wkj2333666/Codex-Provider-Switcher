@@ -33,9 +33,9 @@ upgraded.
 
 ## Components
 
-`internal/config` resolves proxy flags over environment values, validates the
-default provider identifier, verifies the Unix socket, and derives the private
-per-task selection directory.
+`internal/config` resolves proxy flags over non-provider environment values,
+validates an optional explicit provider override, verifies the Unix socket, and
+derives the private per-task selection directory.
 
 `internal/provider` owns the provider identifier grammar. `internal/selection`
 persists one selected provider per task using hashed filenames, bounded reads,
@@ -90,9 +90,9 @@ unchanged and requires `--socket` or `CODEX_PROVIDER_SWITCHER_SOCKET`.
 
 Selection state resolves from `--state-dir`,
 `CODEX_PROVIDER_SWITCHER_STATE_DIR`, `$CODEX_HOME`, the stock control-socket
-layout, or a socket-specific hidden directory. A missing task selection falls
-back to `CODEX_PROVIDER_SWITCHER_PROVIDER`; an unreadable or corrupt selection
-fails closed.
+layout, or a socket-specific hidden directory. A missing task selection sends
+no provider override; app-server applies its own effective configuration. An
+unreadable or corrupt saved selection fails closed.
 
 ## Message Flow
 
@@ -169,11 +169,13 @@ signals, and exit behavior.
 
 ## Routing Policy
 
-One SSH alias supplies a default provider, while each task's durable selection
-is the routing authority after its first successful provider command:
+App-server configuration supplies the default provider. Each task's durable
+selection becomes the routing authority after its first successful provider
+command:
 
-- `thread/start`, `thread/resume`, and `thread/fork` receive the selected
-  `params.modelProvider`.
+- `thread/start` and `thread/fork` receive an explicit `params.modelProvider`
+  only in direct override mode. `thread/resume` also applies a saved task
+  selection.
 - `thread/list` receives an empty `params.modelProviders` list so tasks from all
   configured providers remain visible.
 - Ordinary `turn/start` is held until the selected provider is ready, then
@@ -182,9 +184,12 @@ is the routing authority after its first successful provider command:
 - `model/list`, unknown methods, server messages, and binary messages are not
   rewritten.
 
-A missing provider, corrupt selection, malformed provider control, attachment
-on a provider control, or unsafe target `params` shape fails closed. Ordinary
-prompts that merely mention `/provider` or `$provider` remain ordinary prompts.
+A corrupt selection, malformed provider control, attachment on a provider
+control, or unsafe overridden `params` shape fails closed. Ordinary prompts
+that merely mention `/provider` or `$provider` remain ordinary prompts. With no
+selection, provider-bearing requests pass through byte-for-byte. The switcher
+does not read or parse `config.toml`, so Codex retains its full configuration
+precedence, profiles, project settings, CLI overrides, and built-in defaults.
 Diagnostics never format message bodies, prompts, handshake values, environment
 contents, or credentials.
 

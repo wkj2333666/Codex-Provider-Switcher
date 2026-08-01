@@ -106,6 +106,66 @@ func TestSessionRecordsEffectiveProviderFromResumeResponse(t *testing.T) {
 	}
 }
 
+func TestSessionDefersUnsavedProviderToAppServer(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	selections := &fakeProviderSelections{values: map[string]string{}}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			if _, present := message.params["modelProvider"]; present {
+				return errors.New("switcher injected an unsaved provider")
+			}
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"openai"}}`, message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.selections = selections
+	current.coordinator = coordinator
+
+	resume := []byte(`{"id":27,"method":"thread/resume","params":{"threadId":"thr-a"}}`)
+	if err := current.handleDownstreamText(context.Background(), resume); err != nil {
+		t.Fatal(err)
+	}
+	if got := current.effectiveProvider("thr-a"); got != "openai" {
+		t.Fatalf("effective provider = %q, want app-server result openai", got)
+	}
+
+	turn := []byte(`{"id":28,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), turn); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 2 || !bytes.Equal(messages[1], turn) {
+		t.Fatalf("upstream messages = %q", messages)
+	}
+	if coordinator.prepareHandoffCalls != 0 || coordinator.unsubscribeCalls != 0 || coordinator.resubscribeCalls != 0 {
+		t.Fatalf("unsaved provider triggered handoff: %#v", coordinator)
+	}
+}
+
+func TestNewSessionAllowsNoProviderOverride(t *testing.T) {
+	t.Parallel()
+	current, err := newSessionState("", "/tmp/app-server.sock",
+		func(context.Context, websocket.MessageType, []byte) error { return nil },
+		func(context.Context, websocket.MessageType, []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("newSessionState() error = %v", err)
+	}
+	current.closeState()
+}
+
 func TestSessionClearsActiveThreadOnErrorAndCompletion(t *testing.T) {
 	t.Parallel()
 	var downstream messageRecorder

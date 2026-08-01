@@ -87,6 +87,19 @@ func TestLinePassesUnknownMethodThroughByteForByte(t *testing.T) {
 	}
 }
 
+func TestLineDefersProviderMethodsWhenNoOverrideIsSelected(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(` { "jsonrpc": "2.0", "id": 1, "method": "thread/resume", "params": {"threadId":"thr-a"} } `)
+	got, err := Line(input, "")
+	if err != nil {
+		t.Fatalf("Line() error = %v", err)
+	}
+	if !bytes.Equal(got, input) {
+		t.Fatalf("Line() = %q, want app-server default request %q", got, input)
+	}
+}
+
 func TestLineRejectsInvalidMessages(t *testing.T) {
 	t.Parallel()
 
