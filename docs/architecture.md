@@ -119,14 +119,23 @@ thread flock
   -> forward original turn/start
 ```
 
-An explicit `$provider <name>` skill invocation, or an exact plain-text
-`/provider <name>` input, uses the same sequence but does not forward the
-original `turn/start`. After provider verification it atomically saves the task
-selection and sends Desktop a synthetic response, `turn/started`, user and
-agent item events, and `turn/completed`. The fake agent message reports
-`Provider switched to sub2api.` for that target. It does not invoke a model or
-enter persisted rollout history, so the confirmation disappears after reopening
-while the saved provider remains effective.
+An explicit `$provider switch <name>` skill invocation, or the exact plain-text
+`/provider switch <name>` and `/ provider switch <name>` forms, uses the same
+sequence but does not forward the original `turn/start`. After provider
+verification it atomically saves the task selection and sends Desktop a
+synthetic response, `turn/started`, user and agent item events, and
+`turn/completed`. The fake agent message reports `Provider switched to
+sub2api.` for that target. It does not invoke a model or enter persisted rollout
+history, so the confirmation disappears after reopening while the saved
+provider remains effective.
+
+`$provider status`, `/provider status`, and `/ provider status` take the thread
+lock and run peer preparation but perform no handoff and make no app-server
+request. The fake turn reports the provider verified from this connection's
+latest start/resume response plus the durable selection. Missing runtime state
+is shown as `Runtime provider: unknown.`; no saved override is shown as
+`Selected provider: app-server configuration.` If selection and runtime differ,
+the response says the selection `will be applied before the next model turn`.
 
 Ordinary `thread/resume` uses the same lock and holds it through the app-server
 response, so a new subscriber cannot appear midway through handoff. Internal
@@ -184,14 +193,14 @@ command:
 - `model/list`, unknown methods, server messages, and binary messages are not
   rewritten.
 
-A corrupt selection, malformed provider control, attachment on a provider
-control, or unsafe overridden `params` shape fails closed. Ordinary prompts
-that merely mention `/provider` or `$provider` remain ordinary prompts. With no
-selection, provider-bearing requests pass through byte-for-byte. The switcher
-does not read or parse `config.toml`, so Codex retains its full configuration
-precedence, profiles, project settings, CLI overrides, and built-in defaults.
-Diagnostics never format message bodies, prompts, handshake values, environment
-contents, or credentials.
+A corrupt selection, malformed provider control, legacy `/provider <name>`
+input, attachment on a provider control, or unsafe overridden `params` shape
+fails closed. Ordinary prompts that merely mention `/provider` or `$provider`
+remain ordinary prompts. With no selection, provider-bearing requests pass
+through byte-for-byte. The switcher does not read or parse `config.toml`, so
+Codex retains its full configuration precedence, profiles, project settings,
+CLI overrides, and built-in defaults. Diagnostics never format message bodies,
+prompts, handshake values, environment contents, or credentials.
 
 Provider handoff is also fail closed. A peer reporting an active turn aborts in
 the prepare phase before any unsubscribe occurs. A second-phase failure, a

@@ -159,7 +159,7 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if err != nil || message.idKey == "" || current.coordinator == nil {
 		return errRoutingPolicy
 	}
-	commandProvider, commandRecognized, commandErr := parseProviderCommand(message)
+	command, commandRecognized, commandErr := parseProviderCommand(message)
 	if commandErr != nil {
 		return current.writeProviderCommandError(ctx, message.id)
 	}
@@ -175,7 +175,10 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	targetProvider := commandProvider
+	if commandRecognized && command.action == providerCommandStatus {
+		return current.writeProviderStatus(ctx, message.id, threadID)
+	}
+	targetProvider := command.provider
 	if !commandRecognized {
 		var selected bool
 		targetProvider, selected, err = current.selectedProvider(threadID)
@@ -198,16 +201,10 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		if current.selections == nil || current.selections.Set(threadID, targetProvider) != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
-		messages, err := encodeProviderSwitchTurn(message.id, threadID, targetProvider, time.Now())
-		if err != nil {
-			return current.writeHandoffError(ctx, message.id)
-		}
-		for _, synthetic := range messages {
-			if err := current.writeDownstream(ctx, websocket.MessageText, synthetic); err != nil {
-				return err
-			}
-		}
-		return nil
+		return current.writeProviderControlTurn(
+			ctx, message.id, threadID, "/provider switch "+targetProvider,
+			"Provider switched to "+targetProvider+".",
+		)
 	}
 
 	current.setActive(threadID, true)
@@ -216,6 +213,51 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		current.removeDesktopRequest(message.idKey)
 		current.setActive(threadID, false)
 		return err
+	}
+	return nil
+}
+
+func (current *session) writeProviderStatus(ctx context.Context, id json.RawMessage, threadID string) error {
+	selected, hasSelection, err := current.selectedProvider(threadID)
+	if err != nil {
+		return current.writeHandoffError(ctx, id)
+	}
+	runtime := current.effectiveProvider(threadID)
+	if !providerid.Valid(runtime) {
+		runtime = ""
+	}
+	feedback := providerStatusFeedback(runtime, selected, hasSelection)
+	return current.writeProviderControlTurn(ctx, id, threadID, "/provider status", feedback)
+}
+
+func providerStatusFeedback(runtime, selected string, hasSelection bool) string {
+	runtimeLine := "Runtime provider: unknown."
+	if runtime != "" {
+		runtimeLine = "Runtime provider: " + runtime + " (verified)."
+	}
+	if !hasSelection {
+		return runtimeLine + "\nSelected provider: app-server configuration."
+	}
+	selectedLine := "Selected provider: " + selected + "."
+	if runtime != selected {
+		selectedLine = "Selected provider: " + selected + " (will be applied before the next model turn)."
+	}
+	return runtimeLine + "\n" + selectedLine
+}
+
+func (current *session) writeProviderControlTurn(
+	ctx context.Context,
+	id json.RawMessage,
+	threadID, commandText, feedback string,
+) error {
+	messages, err := encodeProviderControlTurn(id, threadID, commandText, feedback, time.Now())
+	if err != nil {
+		return current.writeHandoffError(ctx, id)
+	}
+	for _, synthetic := range messages {
+		if err := current.writeDownstream(ctx, websocket.MessageText, synthetic); err != nil {
+			return err
+		}
 	}
 	return nil
 }

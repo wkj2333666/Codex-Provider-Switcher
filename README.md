@@ -33,9 +33,10 @@ All other `codex` commands are delegated unchanged to the real Codex
 executable. The switcher does not start a second daemon or access SQLite.
 
 Live wrapper processes connected to the same app-server form a local provider
-handoff group. The explicit `/provider <name>` control switches the current
-idle task, persists its selection, and returns a local synthetic confirmation
-without invoking a model.
+handoff group. `/provider status` reports the current task's verified runtime
+and saved selection. `/provider switch <name>` switches an idle task, persists
+its selection, and returns a local synthetic confirmation without invoking a
+model.
 
 ## Requirements
 
@@ -113,22 +114,37 @@ stable. A task without a saved switcher selection is sent without a provider
 override, so app-server configuration selects the provider using Codex's normal
 configuration precedence and built-in defaults.
 
-### Switch The Current Task
+### Inspect Or Switch The Current Task
 
 After reconnecting the `pi` entry so Desktop discovers the installed skill,
-invoke it from the slash menu and choose a configured provider. For example,
-use `/provider openai` for the native provider or `/provider sub2api` for the
-configured alternative:
+invoke it from the slash menu. Query the current routing state or explicitly
+switch to a configured provider. For example, use `/provider switch openai`
+for the native provider or `/provider switch sub2api` for the configured
+alternative:
 
 ```text
-/provider openai
-/provider sub2api
+/provider status
+/provider switch openai
+/provider switch sub2api
 ```
 
-Desktop transmits an explicit skill invocation as `$provider <name>`. The
-switcher also accepts an exact plain-text `/provider <name>` control input for
-clients that send slash text directly. Mentions inside ordinary prompts are not
-commands.
+Desktop transmits explicit skill invocations as `$provider status` and
+`$provider switch <name>`. Plain clients may send `/provider ...` or the literal
+spaced form `/ provider ...`. The legacy `/provider <name>` form is rejected,
+and mentions inside ordinary prompts are not commands.
+
+Status is read-only and does not resume a task or change its provider. A loaded
+task can report:
+
+```text
+Runtime provider: openai (verified).
+Selected provider: app-server configuration.
+```
+
+When the connection has not observed a start or resume response, it reports
+`Runtime provider: unknown.` rather than guessing. If a saved selection differs
+from the verified runtime, the second line says it `will be applied before the
+next model turn`.
 
 For a successful switch, the switcher performs the provider handoff and emits a
 synthetic local turn containing, for example:
@@ -147,8 +163,8 @@ is selected by `--state-dir`, then `CODEX_PROVIDER_SWITCHER_STATE_DIR`, then
 `$CODEX_HOME/codex-provider-switcher`; stock socket paths infer the same
 directory. A custom socket uses a socket-specific directory beside that socket.
 
-The wrapper fails closed when the provider is missing. It never delegates a
-malformed `app-server proxy` invocation to the real CLI.
+The wrapper fails closed when the effective socket is unavailable. It never
+delegates a malformed `app-server proxy` invocation to the real CLI.
 
 ### Stock Proxy Compatibility
 
@@ -222,8 +238,9 @@ A task can be used sequentially through different providers on the same
 Desktop connection:
 
 ```text
-/provider openai  -> local handoff -> later messages use openai
-/provider sub2api -> local handoff -> later messages use sub2api
+/provider status          -> local read-only synthetic status
+/provider switch openai   -> local handoff -> later messages use openai
+/provider switch sub2api  -> local handoff -> later messages use sub2api
 ```
 
 Different tasks can be active through different providers at the same time.
@@ -231,9 +248,9 @@ Opening or viewing a task does not change its saved selection. A provider
 command on an idle task performs the handoff before returning its fake turn:
 
 ```text
-/provider sub2api -> unsubscribe idle peers -> resume with sub2api
-                  -> resubscribe detached peers -> persist selection
-                  -> synthesize local completed turn
+/provider switch sub2api -> unsubscribe idle peers -> resume with sub2api
+                         -> resubscribe detached peers -> persist selection
+                         -> synthesize local completed turn
 ```
 
 The handoff keeps the same thread id and persisted history. It does not restart
