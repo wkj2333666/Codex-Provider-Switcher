@@ -114,6 +114,34 @@ func TestSessionPrepareRejectsActiveThread(t *testing.T) {
 	}
 }
 
+func TestSessionClearsProviderAfterDesktopUnsubscribeAndThreadClose(t *testing.T) {
+	t.Parallel()
+	var downstream messageRecorder
+	session := newTestSession(t, nil, downstream.write)
+	session.stateMu.Lock()
+	session.effective["thr-unsubscribe"] = "sub2api"
+	session.effective["thr-closed"] = "sub2api"
+	session.desktop["4"] = &desktopRequest{
+		method:       "thread/unsubscribe",
+		threadID:     "thr-unsubscribe",
+		responseSeen: make(chan struct{}),
+	}
+	session.stateMu.Unlock()
+
+	if err := session.handleUpstreamText(context.Background(), []byte(`{"id":4,"result":{"status":"unsubscribed"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.effectiveProvider("thr-unsubscribe"); got != "" {
+		t.Fatalf("provider after Desktop unsubscribe = %q", got)
+	}
+	if err := session.handleUpstreamText(context.Background(), []byte(`{"method":"thread/closed","params":{"threadId":"thr-closed"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.effectiveProvider("thr-closed"); got != "" {
+		t.Fatalf("provider after thread/closed = %q", got)
+	}
+}
+
 func TestSessionUnsubscribeConsumesResponseAndClearsProvider(t *testing.T) {
 	t.Parallel()
 	var current *session

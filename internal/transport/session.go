@@ -97,10 +97,40 @@ func (current *session) handleDownstreamText(ctx context.Context, payload []byte
 		return current.handleTurnStart(ctx, message, rewritten)
 	case "thread/resume":
 		return current.handleThreadResume(ctx, message, rewritten)
+	case "thread/unsubscribe":
+		return current.handleThreadUnsubscribe(ctx, message, rewritten)
 	case "thread/start", "thread/fork":
 		current.trackDesktopRequest(message, &desktopRequest{method: message.method})
 	}
 	return current.writeUpstream(ctx, websocket.MessageText, rewritten)
+}
+
+func (current *session) handleThreadUnsubscribe(ctx context.Context, message rpcMessage, payload []byte) error {
+	threadID, err := requireThreadID(message)
+	if err != nil || message.idKey == "" || current.coordinator == nil {
+		return errRoutingPolicy
+	}
+	release, err := current.coordinator.LockThread(ctx, threadID)
+	if err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	defer release()
+
+	seen := make(chan struct{})
+	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
+	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
+		current.removeDesktopRequest(message.idKey)
+		return err
+	}
+	select {
+	case <-seen:
+		return nil
+	case <-ctx.Done():
+		current.removeDesktopRequest(message.idKey)
+		return ctx.Err()
+	case <-current.closed:
+		return nil
+	}
 }
 
 func (current *session) handleTurnStart(ctx context.Context, message rpcMessage, payload []byte) error {
@@ -325,6 +355,9 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 			if request.method == "turn/start" && message.hasError {
 				delete(current.active, request.threadID)
 			}
+			if request.method == "thread/unsubscribe" && !message.hasError {
+				delete(current.effective, request.threadID)
+			}
 		}
 		current.stateMu.Unlock()
 		if request != nil && request.responseSeen != nil {
@@ -341,6 +374,10 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 		case "turn/completed":
 			if message.threadID != "" {
 				current.setActive(message.threadID, false)
+			}
+		case "thread/closed":
+			if message.threadID != "" {
+				current.clearEffectiveProvider(message.threadID)
 			}
 		}
 	}
@@ -400,6 +437,12 @@ func (current *session) effectiveProvider(threadID string) string {
 	current.stateMu.Lock()
 	defer current.stateMu.Unlock()
 	return current.effective[threadID]
+}
+
+func (current *session) clearEffectiveProvider(threadID string) {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	delete(current.effective, threadID)
 }
 
 func (current *session) setActive(threadID string, active bool) {
