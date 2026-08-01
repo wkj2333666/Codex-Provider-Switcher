@@ -471,3 +471,45 @@ Run formatting, module consistency, `go test ./...`, `go vet ./...`, repeated
 handoff tests, and four CGO-disabled cross-builds. Push a PR, require GitHub x86
 race and macOS checks, merge, publish the next patch release, validate all
 archives/checksums/notices, then atomically update the installed wrapper.
+
+### Task 7: Recover Every Failed Handoff Globally
+
+**Files:**
+- Modify: `internal/handoff/coordinator.go`
+- Modify: `internal/handoff/coordinator_test.go`
+- Modify: `internal/transport/session.go`
+- Modify: `internal/transport/session_test.go`
+- Modify: `internal/transport/handoff_integration_test.go`
+- Modify: `README.md`
+- Modify: `docs/architecture.md`
+
+- [ ] **Step 1: Reproduce resume-failure detachment**
+
+Add two switcher peers plus one non-cooperating subscriber. Force the requested
+provider verification to fail and assert every original subscriber is restored
+before the rejected turn returns.
+
+- [ ] **Step 2: Reproduce cross-session partial recovery**
+
+Make one peer rejoin and a later peer fail. Send next through the successful
+same-provider peer and assert it performs a complete handoff rather than the
+fast path.
+
+- [ ] **Step 3: Add global dirty state**
+
+Create, inspect, and clear a mode-0600 per-thread dirty marker under the existing
+runtime directory. Mark before unsubscribe and clear only after complete
+success. Dirty state must be visible to every coordinator for the same daemon.
+
+- [ ] **Step 4: Add best-effort restore**
+
+Extend the control protocol with `restore`, visit every peer even after an
+error, and have detached sessions resume with only `threadId`, accepting the
+actual returned provider. Run restore on unsubscribe, sender resume, resubscribe,
+or dirty-clear failures.
+
+- [ ] **Step 5: Bump capability and verify**
+
+Use `prepareHandoffV2` so older live peers reject before mutation. Run all tests,
+vet, 20 repeated recovery tests, four cross-builds, GitHub race/macOS CI, and
+publish the next patch release.

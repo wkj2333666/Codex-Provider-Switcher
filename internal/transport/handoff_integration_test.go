@@ -154,6 +154,12 @@ func TestRunRejectsHandoffWithNonCooperatingSubscriber(t *testing.T) {
 	if provider := resumeTestThread(t, ctx, raw, 2); provider != "openai" {
 		t.Fatalf("raw resume provider = %q", provider)
 	}
+	openai, openaiDone := dialProviderProxy(t, ctx, server.socket, "openai")
+	defer openai.CloseNow()
+	initializeTestClient(t, ctx, openai)
+	if provider := resumeTestThread(t, ctx, openai, 2); provider != "openai" {
+		t.Fatalf("openai resume provider = %q", provider)
+	}
 
 	sub2api, sub2apiDone := dialProviderProxy(t, ctx, server.socket, "sub2api")
 	defer sub2api.CloseNow()
@@ -174,10 +180,20 @@ func TestRunRejectsHandoffWithNonCooperatingSubscriber(t *testing.T) {
 		t.Fatalf("blocked turn reached app-server: %#v", unexpected)
 	case <-time.After(100 * time.Millisecond):
 	}
+	if subscribers := server.subscriberCount(); subscribers != 3 {
+		t.Fatalf("subscriber count after failed handoff = %d, want 3", subscribers)
+	}
+
+	rawVisible := sendTestTurnAndCollect(t, ctx, raw, 3)
+	assertNoInternalMessages(t, rawVisible)
+	readUntilMethod(t, ctx, openai, "turn/started")
+	readUntilMethod(t, ctx, openai, "turn/completed")
 
 	cancel()
 	_ = raw.CloseNow()
+	_ = openai.CloseNow()
 	_ = sub2api.CloseNow()
+	waitProxyDone(t, openaiDone)
 	waitProxyDone(t, sub2apiDone)
 }
 

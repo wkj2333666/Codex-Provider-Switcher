@@ -223,6 +223,13 @@ The same peer activity check also runs on the same-provider path, closing the
 window where two aliases could submit before the second received
 `turn/started`.
 
+Once a handoff starts changing subscriptions, a per-task dirty marker remains
+until every phase succeeds. A failed unsubscribe, sender resume, or peer
+resubscribe triggers best-effort `restore` for every live peer without a
+provider override. This reattaches previously open views to the actual runtime.
+The dirty marker forces the next sender to run the complete handoff even when a
+different session already reports the requested provider.
+
 Automatic handoff requires Codex CLI 0.146.0 or newer. Older app-server
 versions do not provide the idle zero-subscriber replacement behavior needed
 for an immediate provider change; the switcher detects the unchanged provider
@@ -239,7 +246,11 @@ namespace derived from the Unix account and app-server socket:
 
 These sockets coordinate only wrapper processes for the same daemon. Per-task
 file locks serialize resume/send transitions and are released automatically if
-a process exits. Stale control sockets are removed after a failed local connect.
+a process exits. Hashed dirty markers persist incomplete transitions across
+proxy exits. Stale control sockets are removed after a failed local connect.
+Cross-provider mutation requires the `prepareHandoffV2` capability, so older
+live proxies fail before any subscription changes; reconnect every alias after
+an upgrade.
 
 ## Security Boundaries
 

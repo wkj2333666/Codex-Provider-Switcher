@@ -143,6 +143,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"active turn", "-32090", "/tmp/cps-", "resubscribe detached peers",
 		"previously open Desktop views", "same-provider",
 		"prepareHandoff",
+		"dirty marker", "best-effort `restore`", "prepareHandoffV2",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("documentation missing %q", required)

@@ -97,7 +97,8 @@ For an idle cross-provider send, the downstream pump pauses the original
 ```text
 thread flock
   -> prepare every live peer (no mutation)
-  -> prepareHandoff capability check for subscription restoration
+  -> prepareHandoffV2 capability check for recovery support
+  -> create per-thread dirty marker
   -> unsubscribe every ready peer
   -> internal thread/resume with requested modelProvider
   -> verify returned thread id and modelProvider
@@ -113,8 +114,15 @@ Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before
 the turn begins, so previously open Desktop views continue receiving item and
 turn notifications. Explicit Desktop unsubscribe clears detach state and is
-never reversed. Any resubscribe failure clears the sender's provider cache and
-fails the turn, forcing a complete transition on retry.
+never reversed. The dirty marker is removed only after the sender resume and
+all peer resubscribes succeed.
+
+Any failure after the marker is created runs best-effort `restore` against all
+peers, continuing after individual errors. Detached peers resume with only the
+thread id and accept the app-server's actual provider, so recovery does not
+request another provider transition. The marker remains after failure; every
+session checks it before the same-provider fast path, forcing the next sender
+through a complete handoff.
 
 The WebSocket library handles client masking, 7/16/64-bit payload lengths,
 fragment reassembly, ping, pong, and close control frames. Message frame
@@ -163,8 +171,8 @@ sender marks its thread active before writing upstream while still holding the
 cross-process lock; a second peer therefore observes `busy` even if its
 app-server `turn/started` notification has not arrived yet.
 
-Cross-provider sends then use the distinct `prepareHandoff` control method.
-Pre-resubscribe switcher versions reject that method, so a mixed-version
+Cross-provider sends then use the distinct `prepareHandoffV2` control method.
+Pre-recovery switcher versions reject that method, so a mixed-version
 deployment fails before any peer is unsubscribed. Reconnecting every Desktop
 SSH alias after upgrading activates the new protocol on all live proxies.
 
