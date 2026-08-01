@@ -929,6 +929,8 @@ func TestSessionProviderCommandRejectsMalformedInputWithoutForwarding(t *testing
 	requests := []string{
 		`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch secret/bad"}]}}`,
 		`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) status trailing secret"}]}}`,
+		`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md)status"}]}}`,
+		`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md)switch openai"}]}}`,
 	}
 	for _, request := range requests {
 		var upstream, downstream messageRecorder

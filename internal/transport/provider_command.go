@@ -8,6 +8,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
 
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
@@ -149,11 +150,16 @@ func parseProviderMarkdownArguments(text string) ([]string, bool) {
 	}
 	skillPath := remainder[:closing]
 	cleaned := path.Clean(skillPath)
-	if skillPath == "" || strings.ContainsAny(skillPath, "\r\n") || !path.IsAbs(skillPath) ||
+	if skillPath == "" || strings.ContainsRune(skillPath, '\x00') ||
+		strings.ContainsAny(skillPath, "\r\n") || !path.IsAbs(skillPath) ||
 		!strings.HasSuffix(cleaned, "/provider/SKILL.md") {
 		return nil, false
 	}
-	return strings.Fields(remainder[closing+1:]), true
+	tail := remainder[closing+1:]
+	if tail != "" && strings.IndexFunc(tail, unicode.IsSpace) != 0 {
+		return nil, true
+	}
+	return strings.Fields(tail), true
 }
 
 type syntheticTurn struct {

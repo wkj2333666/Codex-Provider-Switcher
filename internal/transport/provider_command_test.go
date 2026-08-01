@@ -85,6 +85,8 @@ func TestParseProviderCommandRejectsMalformedControlsWithoutLeaking(t *testing.T
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) switch secret/bad"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) status trailing secret"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) status"},{"type":"image","url":"secret-url"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md)status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md)switch openai"}]}}`,
 	}
 	for _, input := range inputs {
 		message, err := parseRPCMessage([]byte(input))
@@ -117,7 +119,9 @@ func TestParseProviderCommandForwardsOrdinaryMessages(t *testing.T) {
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/other/SKILL.md) status"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider)/SKILL.md) status"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills\n/provider/SKILL.md) status"}]}}`,
-		"{\"id\":1,\"method\":\"turn/start\",\"params\":{\"threadId\":\"thr-a\",\"input\":[{\"type\":\"text\",\"text\":\"```text\\\\n[$provider](/home/user/.agents/skills/provider/SKILL.md) status\\\\n```\"}]}}",
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider]() status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/\u0000/provider/SKILL.md) status"}]}}`,
+		"{\"id\":1,\"method\":\"turn/start\",\"params\":{\"threadId\":\"thr-a\",\"input\":[{\"type\":\"text\",\"text\":\"```text\\n[$provider](/home/user/.agents/skills/provider/SKILL.md) status\\n```\"}]}}",
 	}
 	for _, input := range inputs {
 		message, err := parseRPCMessage([]byte(input))
