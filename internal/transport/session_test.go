@@ -926,30 +926,37 @@ func TestSessionProviderCommandSwitchesWithoutForwardingModelTurn(t *testing.T) 
 
 func TestSessionProviderCommandRejectsMalformedInputWithoutForwarding(t *testing.T) {
 	t.Parallel()
-	var upstream, downstream messageRecorder
-	current := newTestSession(t, upstream.write, downstream.write)
-	current.coordinator = &fakeHandoffCoordinator{}
-	current.selections = &fakeProviderSelections{values: map[string]string{}}
+	requests := []string{
+		`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch secret/bad"}]}}`,
+		`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) status trailing secret"}]}}`,
+	}
+	for _, request := range requests {
+		var upstream, downstream messageRecorder
+		current := newTestSession(t, upstream.write, downstream.write)
+		current.coordinator = &fakeHandoffCoordinator{}
+		current.selections = &fakeProviderSelections{values: map[string]string{}}
 
-	request := []byte(`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch secret/bad"}]}}`)
-	if err := current.handleDownstreamText(context.Background(), request); err != nil {
-		t.Fatal(err)
-	}
-	if len(upstream.messages()) != 0 {
-		t.Fatalf("malformed command reached upstream: %q", upstream.messages())
-	}
-	messages := downstream.messages()
-	if len(messages) != 1 || bytes.Contains(messages[0], []byte("secret")) {
-		t.Fatalf("malformed command response = %q", messages)
-	}
-	var response struct {
-		Error struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(messages[0], &response) != nil || response.Error.Code != -32602 || response.Error.Message != invalidProviderCommandMessage {
-		t.Fatalf("malformed command error = %#v", response)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := current.handleDownstreamText(ctx, []byte(request)); err != nil {
+			t.Fatal(err)
+		}
+		if len(upstream.messages()) != 0 {
+			t.Fatalf("malformed command reached upstream: %q", upstream.messages())
+		}
+		messages := downstream.messages()
+		if len(messages) != 1 || bytes.Contains(messages[0], []byte("secret")) {
+			t.Fatalf("malformed command response = %q", messages)
+		}
+		var response struct {
+			Error struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(messages[0], &response) != nil || response.Error.Code != providerCommandErrorCode || response.Error.Message != invalidProviderCommandMessage {
+			t.Fatalf("malformed command error = %#v", response)
+		}
 	}
 }
 

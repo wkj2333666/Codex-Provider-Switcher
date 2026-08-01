@@ -56,7 +56,7 @@ func TestRunSwitchesProviderOnNextTurn(t *testing.T) {
 	waitProxyDone(t, sub2apiDone)
 }
 
-func TestProviderSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
+func TestProviderDesktopMarkdownSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	server := newHandoffAppServer(t, ctx, true)
@@ -70,8 +70,11 @@ func TestProviderSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
 	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
 		"threadId": "thr-shared",
 		"input": []any{
-			map[string]any{"type": "text", "text": "$provider status", "text_elements": []any{}},
-			map[string]any{"type": "skill", "name": "provider", "path": "/home/user/.agents/skills/provider/SKILL.md"},
+			map[string]any{
+				"type":          "text",
+				"text":          "[$provider](/home/user/.agents/skills/provider/SKILL.md) status",
+				"text_elements": []any{},
+			},
 		},
 	})
 	statusResponseSeen, statusMethods, statusFeedback := readProviderControlLifecycle(t, ctx, connection, "3")
@@ -85,8 +88,11 @@ func TestProviderSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
 	sendRPC(t, ctx, connection, 4, "turn/start", map[string]any{
 		"threadId": "thr-shared",
 		"input": []any{
-			map[string]any{"type": "text", "text": "$provider switch sub2api", "text_elements": []any{}},
-			map[string]any{"type": "skill", "name": "provider", "path": "/home/user/.agents/skills/provider/SKILL.md"},
+			map[string]any{
+				"type":          "text",
+				"text":          "[$provider](/home/user/.agents/skills/provider/SKILL.md) switch sub2api",
+				"text_elements": []any{},
+			},
 		},
 	})
 	responseSeen, methods, feedback := readProviderControlLifecycle(t, ctx, connection, "4")
