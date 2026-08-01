@@ -140,7 +140,9 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"CODEX_PROVIDER_SWITCHER_SOCKET", "--strict-config",
 		"same Unix user", "downstream `request.Host`", "THIRD_PARTY_NOTICES",
 		"send-time provider handoff", "`turn/start`", "Codex CLI 0.146.0",
-		"active turn", "-32090", "/tmp/cps-",
+		"active turn", "-32090", "/tmp/cps-", "resubscribe detached peers",
+		"previously open Desktop views", "same-provider",
+		"prepareHandoff",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("documentation missing %q", required)

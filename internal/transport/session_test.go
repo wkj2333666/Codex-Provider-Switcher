@@ -269,6 +269,80 @@ func TestSessionUnsubscribeClearsProviderWhenResponseIsUncertain(t *testing.T) {
 	}
 }
 
+func TestSessionResubscribesCoordinatorDetachedThread(t *testing.T) {
+	t.Parallel()
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		switch message.method {
+		case "thread/unsubscribe":
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"status":"unsubscribed"}}`, message.idKey)))
+		case "thread/resume":
+			var provider string
+			_ = json.Unmarshal(message.params["modelProvider"], &provider)
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":%q}}`, message.idKey, provider)))
+		default:
+			return nil
+		}
+	}
+	current = newTestSession(t, writer, nil)
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "openai"
+	current.resumeTemplates["thr-a"] = map[string]json.RawMessage{
+		"threadId": json.RawMessage(`"thr-a"`),
+		"history":  json.RawMessage(`[{"type":"message"}]`),
+		"path":     json.RawMessage(`"/stale/rollout.jsonl"`),
+	}
+	current.stateMu.Unlock()
+
+	if _, err := current.Unsubscribe(context.Background(), "thr-a"); err != nil {
+		t.Fatal(err)
+	}
+	status, err := current.Resubscribe(context.Background(), "thr-a", "sub2api")
+	if err != nil || status != handoff.StatusResubscribed {
+		t.Fatalf("Resubscribe() = %q, %v", status, err)
+	}
+	if got := current.effectiveProvider("thr-a"); got != "sub2api" {
+		t.Fatalf("effective provider after resubscribe = %q", got)
+	}
+	messages := upstream.messages()
+	if len(messages) != 2 {
+		t.Fatalf("upstream messages = %q", messages)
+	}
+	resume, err := parseRPCMessage(messages[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := resume.params["history"]; ok {
+		t.Fatalf("resubscribe reused history: %#v", resume.params)
+	}
+	if _, ok := resume.params["path"]; ok {
+		t.Fatalf("resubscribe reused stale path: %#v", resume.params)
+	}
+}
+
+func TestSessionDoesNotResubscribeThreadThatPeerDidNotDetach(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	status, err := current.Resubscribe(context.Background(), "thr-a", "sub2api")
+	if err != nil || status != handoff.StatusNotSubscribed {
+		t.Fatalf("Resubscribe() = %q, %v", status, err)
+	}
+	if len(upstream.messages()) != 0 {
+		t.Fatalf("unexpected upstream resume: %q", upstream.messages())
+	}
+}
+
 func TestSessionSwitchesProviderBeforeTurnStart(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
@@ -303,7 +377,8 @@ func TestSessionSwitchesProviderBeforeTurnStart(t *testing.T) {
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	if coordinator.lockCalls != 1 || coordinator.prepareCalls != 1 || coordinator.unsubscribeCalls != 1 || coordinator.releaseCalls != 1 {
+	if coordinator.lockCalls != 1 || coordinator.prepareCalls != 1 || coordinator.prepareHandoffCalls != 1 || coordinator.unsubscribeCalls != 1 ||
+		coordinator.resubscribeCalls != 1 || coordinator.releaseCalls != 1 {
 		t.Fatalf("coordinator calls = %#v", coordinator)
 	}
 	messages := upstream.messages()
@@ -326,6 +401,28 @@ func TestSessionSwitchesProviderBeforeTurnStart(t *testing.T) {
 	}
 	if !current.isActive("thr-a") {
 		t.Fatal("forwarded turn was not marked active")
+	}
+}
+
+func TestSessionChecksPeersBeforeSameProviderTurn(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":11,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.prepareCalls != 1 || coordinator.unsubscribeCalls != 0 || coordinator.resubscribeCalls != 0 {
+		t.Fatalf("coordinator calls = %#v", coordinator)
+	}
+	if len(upstream.messages()) != 1 {
+		t.Fatalf("upstream messages = %q", upstream.messages())
 	}
 }
 
@@ -365,6 +462,76 @@ func TestSessionReturnsStaticErrorWhenHandoffFails(t *testing.T) {
 	}
 	if bytes.Contains(messages[0], []byte("secret prompt")) || bytes.Contains(messages[0], []byte("secret peer")) {
 		t.Fatalf("handoff error leaked details: %s", messages[0])
+	}
+}
+
+func TestSessionRejectsLegacyPeerBeforeUnsubscribe(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{
+		prepareHandoffErr: errors.New("legacy peer"),
+		unsubscribeErr:    errors.New("must not be called"),
+	}
+	var upstream, downstream messageRecorder
+	current := newTestSession(t, upstream.write, downstream.write)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "openai"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":14,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.prepareHandoffCalls != 1 || coordinator.unsubscribeCalls != 0 {
+		t.Fatalf("coordinator calls = %#v", coordinator)
+	}
+	if len(upstream.messages()) != 0 || len(downstream.messages()) != 1 {
+		t.Fatalf("upstream = %q, downstream = %q", upstream.messages(), downstream.messages())
+	}
+}
+
+func TestSessionRetriesFullHandoffAfterResubscribeFailure(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{resubscribeErr: errors.New("peer unavailable")}
+	var current *session
+	var upstream, downstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, downstream.write)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "openai"
+	current.stateMu.Unlock()
+
+	first := []byte(`{"id":12,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if got := current.effectiveProvider("thr-a"); got != "" {
+		t.Fatalf("effective provider after failed resubscribe = %q", got)
+	}
+	coordinator.resubscribeErr = nil
+	second := []byte(`{"id":13,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.unsubscribeCalls != 2 || coordinator.resubscribeCalls != 2 {
+		t.Fatalf("coordinator calls = %#v", coordinator)
+	}
+	if messages := upstream.messages(); len(messages) != 3 {
+		t.Fatalf("upstream messages = %q", messages)
 	}
 }
 
@@ -439,12 +606,16 @@ func newTestSession(t *testing.T, upstreamWrite, downstreamWrite websocketWriteF
 }
 
 type fakeHandoffCoordinator struct {
-	lockCalls        int
-	prepareCalls     int
-	unsubscribeCalls int
-	releaseCalls     int
-	prepareErr       error
-	unsubscribeErr   error
+	lockCalls           int
+	prepareCalls        int
+	prepareHandoffCalls int
+	unsubscribeCalls    int
+	resubscribeCalls    int
+	releaseCalls        int
+	prepareErr          error
+	prepareHandoffErr   error
+	unsubscribeErr      error
+	resubscribeErr      error
 }
 
 func (coordinator *fakeHandoffCoordinator) LockThread(context.Context, string) (func(), error) {
@@ -457,9 +628,19 @@ func (coordinator *fakeHandoffCoordinator) PrepareAll(context.Context, string) e
 	return coordinator.prepareErr
 }
 
+func (coordinator *fakeHandoffCoordinator) PrepareHandoffAll(context.Context, string) error {
+	coordinator.prepareHandoffCalls++
+	return coordinator.prepareHandoffErr
+}
+
 func (coordinator *fakeHandoffCoordinator) UnsubscribeAll(context.Context, string) error {
 	coordinator.unsubscribeCalls++
 	return coordinator.unsubscribeErr
+}
+
+func (coordinator *fakeHandoffCoordinator) ResubscribeAll(context.Context, string, string) error {
+	coordinator.resubscribeCalls++
+	return coordinator.resubscribeErr
 }
 
 func (coordinator *fakeHandoffCoordinator) Close() error { return nil }

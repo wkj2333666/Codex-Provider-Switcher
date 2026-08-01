@@ -426,3 +426,48 @@ Fix every Critical and Important issue with a failing regression test.
 Push the feature branch, create a PR, wait for Ubuntu race, macOS tests, and all
 four cross-builds, then merge. Tag the merged main with the next patch version,
 wait for Release, and verify all four archives and checksums.
+
+### Task 6: Resynchronize Peers And Close Same-Provider Race
+
+**Files:**
+- Modify: `internal/handoff/coordinator.go`
+- Modify: `internal/handoff/coordinator_test.go`
+- Modify: `internal/transport/session.go`
+- Modify: `internal/transport/session_test.go`
+- Modify: `internal/transport/handoff_integration_test.go`
+
+- [ ] **Step 1: Reproduce stale peer subscriptions**
+
+Make the fake app-server broadcast turn notifications to all subscribed
+connections. After B switches a shared thread, assert both A and B remain
+subscribed and A receives B's `turn/started` and `turn/completed`. Verify RED
+because v0.3.0 leaves only B subscribed.
+
+- [ ] **Step 2: Reproduce same-provider cross-session concurrency**
+
+Delay the fake server's first `turn/started` broadcast. Start a turn through
+openai connection A, then immediately start through openai connection B.
+Assert B receives switcher error `-32090` and only one request reaches the fake
+app-server. Verify RED because v0.3.0 skips peer prepare on the same-provider
+path.
+
+- [ ] **Step 3: Add the resubscribe control phase**
+
+Extend the bounded peer protocol with
+`{method:"resubscribe",threadId:"...",provider:"..."}`. Track coordinator
+detach state per session, internally resume only detached peers with the new
+effective provider, verify each response, and clear detach state only after a
+successful reattach.
+
+- [ ] **Step 4: Prepare every turn**
+
+Call `PrepareAll` for every `turn/start` while holding the thread lock. Keep
+unsubscribe, cold resume, and peer resubscribe conditional on provider
+mismatch. Re-run the focused integration tests and verify GREEN.
+
+- [ ] **Step 5: Verify and release**
+
+Run formatting, module consistency, `go test ./...`, `go vet ./...`, repeated
+handoff tests, and four CGO-disabled cross-builds. Push a PR, require GitHub x86
+race and macOS checks, merge, publish the next patch release, validate all
+archives/checksums/notices, then atomically update the installed wrapper.

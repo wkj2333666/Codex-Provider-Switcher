@@ -37,6 +37,11 @@ func TestRunSwitchesProviderOnNextTurn(t *testing.T) {
 		t.Fatalf("sub2api turn = %#v", record)
 	}
 	assertNoInternalMessages(t, subVisible)
+	if subscribers := server.subscriberCount(); subscribers != 2 {
+		t.Fatalf("subscriber count after switch = %d, want 2", subscribers)
+	}
+	readUntilMethod(t, ctx, openai, "turn/started")
+	readUntilMethod(t, ctx, openai, "turn/completed")
 
 	openVisible := sendTestTurnAndCollect(t, ctx, openai, 3)
 	if record := <-server.turns; record.threadID != "thr-shared" || record.provider != "openai" {
@@ -49,6 +54,47 @@ func TestRunSwitchesProviderOnNextTurn(t *testing.T) {
 	_ = sub2api.CloseNow()
 	waitProxyDone(t, openaiDone)
 	waitProxyDone(t, sub2apiDone)
+}
+
+func TestRunRejectsConcurrentSameProviderTurnBeforePeerNotification(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, false)
+	server.startedGate = make(chan struct{})
+	first, firstDone := dialProviderProxy(t, ctx, server.socket, "openai")
+	second, secondDone := dialProviderProxy(t, ctx, server.socket, "openai")
+	defer first.CloseNow()
+	defer second.CloseNow()
+
+	initializeTestClient(t, ctx, first)
+	initializeTestClient(t, ctx, second)
+	resumeTestThread(t, ctx, first, 2)
+	resumeTestThread(t, ctx, second, 2)
+
+	sendRPC(t, ctx, first, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input":    []any{},
+	})
+	if record := <-server.turns; record.provider != "openai" {
+		t.Fatalf("first turn = %#v", record)
+	}
+	sendRPC(t, ctx, second, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input":    []any{},
+	})
+	response := readResponse(t, ctx, second, `3`)
+	if response.errorCode != handoffErrorCode || response.errorMessage != handoffUnavailableMessage {
+		t.Fatalf("concurrent turn response = %#v", response)
+	}
+	if calls := server.turnStartCallCount(); calls != 1 {
+		t.Fatalf("app-server turn/start calls = %d, want 1", calls)
+	}
+
+	cancel()
+	_ = first.CloseNow()
+	_ = second.CloseNow()
+	waitProxyDone(t, firstDone)
+	waitProxyDone(t, secondDone)
 }
 
 func TestRunRejectsHandoffWhilePeerTurnIsActive(t *testing.T) {
@@ -141,10 +187,13 @@ type handoffAppServer struct {
 	autoComplete bool
 
 	mu          sync.Mutex
+	writeMu     sync.Mutex
 	nextClient  int
 	provider    string
 	active      bool
-	subscribers map[int]bool
+	subscribers map[int]*websocket.Conn
+	startedGate chan struct{}
+	turnStarts  int
 	turns       chan handoffTurnRecord
 }
 
@@ -159,7 +208,7 @@ func newHandoffAppServer(t *testing.T, ctx context.Context, autoComplete bool) *
 		ctx:          ctx,
 		autoComplete: autoComplete,
 		provider:     "openai",
-		subscribers:  make(map[int]bool),
+		subscribers:  make(map[int]*websocket.Conn),
 		turns:        make(chan handoffTurnRecord, 8),
 	}
 	server.socket = startUnixHTTPServer(t, http.HandlerFunc(server.handleUpgrade))
@@ -219,7 +268,7 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 	if requestedProvider != "" && requestedProvider != server.provider && len(server.subscribers) == 0 && !server.active {
 		server.provider = requestedProvider
 	}
-	server.subscribers[clientID] = true
+	server.subscribers[clientID] = connection
 	provider := server.provider
 	server.mu.Unlock()
 	server.writeResult(connection, message.id, map[string]any{
@@ -243,22 +292,38 @@ func (server *handoffAppServer) handleUnsubscribe(connection *websocket.Conn, cl
 func (server *handoffAppServer) handleTurnStart(connection *websocket.Conn, message rpcMessage) {
 	threadID, _ := requireThreadID(message)
 	server.mu.Lock()
+	server.turnStarts++
+	if server.active {
+		server.mu.Unlock()
+		server.writeError(connection, message.id, -32001, "turn already active")
+		return
+	}
 	server.active = true
 	provider := server.provider
+	subscribers := server.subscriberConnectionsLocked()
+	startedGate := server.startedGate
 	server.mu.Unlock()
 	server.turns <- handoffTurnRecord{threadID: threadID, provider: provider}
 	server.writeResult(connection, message.id, map[string]any{
 		"turn": map[string]any{"id": "turn-test", "status": "inProgress", "items": []any{}},
 	})
-	server.writeNotification(connection, "turn/started", map[string]any{
+	if startedGate != nil {
+		select {
+		case <-startedGate:
+		case <-server.ctx.Done():
+			return
+		}
+	}
+	server.broadcastNotification(subscribers, "turn/started", map[string]any{
 		"threadId": threadID,
 		"turn":     map[string]any{"id": "turn-test", "status": "inProgress", "items": []any{}},
 	})
 	if server.autoComplete {
 		server.mu.Lock()
 		server.active = false
+		subscribers = server.subscriberConnectionsLocked()
 		server.mu.Unlock()
-		server.writeNotification(connection, "turn/completed", map[string]any{
+		server.broadcastNotification(subscribers, "turn/completed", map[string]any{
 			"threadId": threadID,
 			"turn":     map[string]any{"id": "turn-test", "status": "completed", "items": []any{}},
 		})
@@ -271,6 +336,20 @@ func (server *handoffAppServer) subscriberCount() int {
 	return len(server.subscribers)
 }
 
+func (server *handoffAppServer) turnStartCallCount() int {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	return server.turnStarts
+}
+
+func (server *handoffAppServer) subscriberConnectionsLocked() []*websocket.Conn {
+	connections := make([]*websocket.Conn, 0, len(server.subscribers))
+	for _, connection := range server.subscribers {
+		connections = append(connections, connection)
+	}
+	return connections
+}
+
 func (server *handoffAppServer) writeResult(connection *websocket.Conn, id json.RawMessage, result any) {
 	server.writeJSON(connection, map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -279,11 +358,27 @@ func (server *handoffAppServer) writeNotification(connection *websocket.Conn, me
 	server.writeJSON(connection, map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
 }
 
+func (server *handoffAppServer) broadcastNotification(connections []*websocket.Conn, method string, params any) {
+	for _, connection := range connections {
+		server.writeNotification(connection, method, params)
+	}
+}
+
+func (server *handoffAppServer) writeError(connection *websocket.Conn, id json.RawMessage, code int, message string) {
+	server.writeJSON(connection, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error":   map[string]any{"code": code, "message": message},
+	})
+}
+
 func (server *handoffAppServer) writeJSON(connection *websocket.Conn, value any) {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return
 	}
+	server.writeMu.Lock()
+	defer server.writeMu.Unlock()
 	_ = connection.Write(server.ctx, websocket.MessageText, payload)
 }
 

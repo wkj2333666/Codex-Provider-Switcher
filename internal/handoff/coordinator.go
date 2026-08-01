@@ -35,12 +35,14 @@ const (
 	StatusUnsubscribed  PeerStatus = "unsubscribed"
 	StatusNotSubscribed PeerStatus = "notSubscribed"
 	StatusNotLoaded     PeerStatus = "notLoaded"
+	StatusResubscribed  PeerStatus = "resubscribed"
 )
 
 // Handler applies peer requests to one proxy connection.
 type Handler interface {
 	Prepare(threadID string) PeerStatus
 	Unsubscribe(context.Context, string) (PeerStatus, error)
+	Resubscribe(context.Context, string, string) (PeerStatus, error)
 }
 
 // Coordinator exposes one peer endpoint and discovers other live endpoints in
@@ -57,6 +59,7 @@ type Coordinator struct {
 type controlRequest struct {
 	Method   string `json:"method"`
 	ThreadID string `json:"threadId"`
+	Provider string `json:"provider,omitempty"`
 }
 
 type controlResponse struct {
@@ -140,15 +143,36 @@ func (coordinator *Coordinator) LockThread(ctx context.Context, threadID string)
 // PrepareAll verifies that every live peer can release the target thread
 // without changing subscription state.
 func (coordinator *Coordinator) PrepareAll(ctx context.Context, threadID string) error {
-	return coordinator.visitPeers(ctx, threadID, "prepare", func(status PeerStatus) bool {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "prepare", ThreadID: threadID}, func(status PeerStatus) bool {
+		return status == StatusReady
+	})
+}
+
+// PrepareHandoffAll verifies that every peer supports subscription restoration
+// before the first unsubscribe mutates app-server state.
+func (coordinator *Coordinator) PrepareHandoffAll(ctx context.Context, threadID string) error {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareHandoff", ThreadID: threadID}, func(status PeerStatus) bool {
 		return status == StatusReady
 	})
 }
 
 // UnsubscribeAll removes every cooperating connection's subscription.
 func (coordinator *Coordinator) UnsubscribeAll(ctx context.Context, threadID string) error {
-	return coordinator.visitPeers(ctx, threadID, "unsubscribe", func(status PeerStatus) bool {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "unsubscribe", ThreadID: threadID}, func(status PeerStatus) bool {
 		return status == StatusUnsubscribed || status == StatusNotSubscribed || status == StatusNotLoaded
+	})
+}
+
+// ResubscribeAll restores every connection detached by the handoff under the
+// verified effective provider.
+func (coordinator *Coordinator) ResubscribeAll(ctx context.Context, threadID, provider string) error {
+	if provider == "" {
+		return errors.New("invalid provider handoff resubscribe")
+	}
+	return coordinator.visitPeers(ctx, controlRequest{
+		Method: "resubscribe", ThreadID: threadID, Provider: provider,
+	}, func(status PeerStatus) bool {
+		return status == StatusResubscribed || status == StatusNotSubscribed
 	})
 }
 
@@ -192,10 +216,25 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 	switch request.Method {
 	case "prepare":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
+	case "prepareHandoff":
+		response.Status = coordinator.handler.Prepare(request.ThreadID)
 	case "unsubscribe":
 		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 		defer cancel()
 		status, err := coordinator.handler.Unsubscribe(ctx, request.ThreadID)
+		if err != nil {
+			response.Error = true
+		} else {
+			response.Status = status
+		}
+	case "resubscribe":
+		if request.Provider == "" {
+			response.Error = true
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+		defer cancel()
+		status, err := coordinator.handler.Resubscribe(ctx, request.ThreadID, request.Provider)
 		if err != nil {
 			response.Error = true
 		} else {
@@ -215,7 +254,7 @@ func (coordinator *Coordinator) writeControlResponse(connection net.Conn, respon
 	_, _ = connection.Write(append(encoded, '\n'))
 }
 
-func (coordinator *Coordinator) visitPeers(ctx context.Context, threadID, method string, accept func(PeerStatus) bool) error {
+func (coordinator *Coordinator) visitPeers(ctx context.Context, request controlRequest, accept func(PeerStatus) bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -225,7 +264,7 @@ func (coordinator *Coordinator) visitPeers(ctx context.Context, threadID, method
 	}
 	sort.Strings(paths)
 	for _, path := range paths {
-		status, stale, err := callPeer(ctx, path, controlRequest{Method: method, ThreadID: threadID})
+		status, stale, err := callPeer(ctx, path, request)
 		if stale {
 			removeStaleSocket(path)
 			continue
