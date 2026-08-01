@@ -120,15 +120,21 @@ thread flock
 ```
 
 The exact user-facing `/provider switch <name>` command uses the same sequence
-but does not forward the original `turn/start`. Desktop encodes an invocation
-selected from the provider skill as `$provider switch <name>` plus a `provider`
-skill item; that wire form is accepted only with exactly one valid skill item
-and is not a separate user-facing command. After provider verification the
-switcher atomically saves the task selection and sends Desktop a synthetic
-response, `turn/started`, user and agent item events, and `turn/completed`. The
-fake agent message reports `Provider switched to sub2api.` for that target. It
-does not invoke a model or enter persisted rollout history, so the confirmation
-disappears after reopening while the saved provider remains effective.
+but does not forward the original `turn/start`. Current Desktop encodes an
+invocation selected from the provider skill as one text item such as
+`[$provider](<absolute-path>/provider/SKILL.md) switch sub2api`. That form is
+recognized only when the whole input contains exactly one text item, the link
+starts the complete trimmed input, its label is exactly `$provider`, and the
+cleaned absolute path ends in `/provider/SKILL.md`. The parser does not read the
+linked file, and ordinary mentions are not controls. The earlier
+`$provider switch <name>` plus one `provider` skill item remains accepted for
+compatibility; neither internal wire form is a separate user-facing command.
+After provider verification the switcher atomically saves the task selection
+and sends Desktop a synthetic response, `turn/started`, user and agent item
+events, and `turn/completed`. The fake agent message reports `Provider switched
+to sub2api.` for that target. It does not invoke a model or enter persisted
+rollout history, so the confirmation disappears after reopening while the
+saved provider remains effective.
 
 The exact user-facing `/provider status` command and its skill-encoded internal
 wire form take the thread lock and run peer preparation but perform no handoff

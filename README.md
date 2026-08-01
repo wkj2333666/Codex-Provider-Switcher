@@ -129,10 +129,14 @@ alternative:
 ```
 
 The only user-facing commands are `/provider status` and `/provider switch
-<name>`. The bundled Desktop skill's internal transport form is accepted only
-when accompanied by its `provider` skill metadata. The spaced `/ provider ...`
-and legacy `/provider <name>` forms are not controls, and mentions inside
-ordinary prompts are not commands.
+<name>`. When selected from the current Desktop skill menu, the command arrives
+as a single text item such as
+`[$provider](<absolute-path>/provider/SKILL.md) status`. The switcher accepts
+that internal form only when the whole input contains exactly one text item and
+the linked absolute path ends in `/provider/SKILL.md`; ordinary mentions are
+not controls. The earlier `$provider ...` plus `provider` skill-item encoding
+remains accepted for compatibility. The spaced `/ provider ...` and legacy
+`/provider <name>` forms are not controls.
 
 Status is read-only and does not resume a task or change its provider. A loaded
 task can report:

@@ -157,6 +157,9 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"does not invoke a model", "disappears after reopening",
 		"CODEX_PROVIDER_SWITCHER_STATE_DIR",
 		"does not read or parse `config.toml`", "optional `--provider`",
+		"`[$provider](<absolute-path>/provider/SKILL.md) status`",
+		"whole input contains exactly one text item",
+		"ordinary mentions are not controls",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("documentation missing %q", required)
@@ -173,6 +176,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"`/provider sub2api`",
 		"`/ provider status`",
 		"`/ provider switch <name>`",
+		"any occurrence of `[$provider]`",
 	} {
 		if strings.Contains(combined, obsolete) {
 			t.Errorf("documentation retains obsolete claim %q", obsolete)
@@ -196,8 +200,8 @@ func TestProviderPluginExposesExplicitStatusAndSwitchCommands(t *testing.T) {
 	if err := json.Unmarshal(content, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Version != "0.5.1" {
-		t.Fatalf("plugin version = %q, want 0.5.1", manifest.Version)
+	if manifest.Version != "0.5.2" {
+		t.Fatalf("plugin version = %q, want 0.5.2", manifest.Version)
 	}
 	want := []string{
 		"Use /provider status to show this task's current provider.",
