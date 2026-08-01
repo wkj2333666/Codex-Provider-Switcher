@@ -74,9 +74,6 @@ func parseProviderCommand(message rpcMessage) (providerCommand, bool, error) {
 		case fields[0] == "/provider" || fields[0] == "$provider":
 			marker = fields[0]
 			arguments = fields[1:]
-		case len(fields) >= 2 && fields[0] == "/" && fields[1] == "provider":
-			marker = "/provider"
-			arguments = fields[2:]
 		default:
 			continue
 		}

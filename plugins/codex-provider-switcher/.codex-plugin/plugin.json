@@ -1,6 +1,6 @@
 {
   "name": "codex-provider-switcher",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Inspect or switch the active model provider for a Codex task without invoking a model.",
   "author": {
     "name": "wkj2333666",
@@ -26,8 +26,8 @@
     ],
     "websiteURL": "https://github.com/wkj2333666/Codex-Provider-Switcher",
     "defaultPrompt": [
-      "Use $provider status to show this task's current provider.",
-      "Use $provider switch sub2api to switch this task to sub2api."
+      "Use /provider status to show this task's current provider.",
+      "Use /provider switch sub2api to switch this task to sub2api."
     ]
   }
 }

@@ -119,23 +119,24 @@ thread flock
   -> forward original turn/start
 ```
 
-An explicit `$provider switch <name>` skill invocation, or the exact plain-text
-`/provider switch <name>` and `/ provider switch <name>` forms, uses the same
-sequence but does not forward the original `turn/start`. After provider
-verification it atomically saves the task selection and sends Desktop a
-synthetic response, `turn/started`, user and agent item events, and
-`turn/completed`. The fake agent message reports `Provider switched to
-sub2api.` for that target. It does not invoke a model or enter persisted rollout
-history, so the confirmation disappears after reopening while the saved
-provider remains effective.
+The exact user-facing `/provider switch <name>` command uses the same sequence
+but does not forward the original `turn/start`. Desktop encodes an invocation
+selected from the provider skill as `$provider switch <name>` plus a `provider`
+skill item; that wire form is accepted only with exactly one valid skill item
+and is not a separate user-facing command. After provider verification the
+switcher atomically saves the task selection and sends Desktop a synthetic
+response, `turn/started`, user and agent item events, and `turn/completed`. The
+fake agent message reports `Provider switched to sub2api.` for that target. It
+does not invoke a model or enter persisted rollout history, so the confirmation
+disappears after reopening while the saved provider remains effective.
 
-`$provider status`, `/provider status`, and `/ provider status` take the thread
-lock and run peer preparation but perform no handoff and make no app-server
-request. The fake turn reports the provider verified from this connection's
-latest start/resume response plus the durable selection. Missing runtime state
-is shown as `Runtime provider: unknown.`; no saved override is shown as
-`Selected provider: app-server configuration.` If selection and runtime differ,
-the response says the selection `will be applied before the next model turn`.
+The exact user-facing `/provider status` command and its skill-encoded internal
+wire form take the thread lock and run peer preparation but perform no handoff
+and make no app-server request. The fake turn reports the provider verified
+from this connection's latest start/resume response plus the durable selection.
+Missing runtime state is shown as `Runtime provider: unknown.`; no saved
+override is shown as `Selected provider: app-server configuration.` If
+selection and runtime differ, the response says the selection `will be applied before the next model turn`.
 
 Ordinary `thread/resume` uses the same lock and holds it through the app-server
 response, so a new subscriber cannot appear midway through handoff. Internal

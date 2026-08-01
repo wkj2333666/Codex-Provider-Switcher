@@ -128,10 +128,11 @@ alternative:
 /provider switch sub2api
 ```
 
-Desktop transmits explicit skill invocations as `$provider status` and
-`$provider switch <name>`. Plain clients may send `/provider ...` or the literal
-spaced form `/ provider ...`. The legacy `/provider <name>` form is rejected,
-and mentions inside ordinary prompts are not commands.
+The only user-facing commands are `/provider status` and `/provider switch
+<name>`. The bundled Desktop skill's internal transport form is accepted only
+when accompanied by its `provider` skill metadata. The spaced `/ provider ...`
+and legacy `/provider <name>` forms are not controls, and mentions inside
+ordinary prompts are not commands.
 
 Status is read-only and does not resume a task or change its provider. A loaded
 task can report:
