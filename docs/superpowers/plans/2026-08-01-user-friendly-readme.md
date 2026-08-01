@@ -21,71 +21,38 @@
 
 ---
 
-### Task 1: Define The Bilingual Documentation Contract
+### Task 1: Define The Release Packaging Contract
 
 **Files:**
 - Modify: `internal/repository/workflows_test.go`
 - Test: `internal/repository/workflows_test.go`
 
 **Interfaces:**
-- Consumes: repository-root file reads already used by `TestDocumentationDescribesStockDesktopWrapper`.
-- Produces: a failing contract that requires both language files, reciprocal language links, release checksum verification, wrapper installation, skill installation, upgrade, troubleshooting, and uninstall sections.
+- Consumes: the existing release workflow source assertions.
+- Produces: a failing contract that prevents release archives from omitting the Simplified Chinese guide.
 
-- [ ] **Step 1: Add a focused failing bilingual README test**
+- [ ] **Step 1: Require the Chinese guide in release archives**
 
-Add this test before `TestDocumentationDescribesStockDesktopWrapper`:
+In `TestReleaseContainsRequiredTargetsChecksumsAndPermissions`, replace the
+existing README copy requirement with these two requirements:
 
 ```go
-func TestReadmesProvideMatchingUserDeploymentGuides(t *testing.T) {
-	root := repositoryRoot(t)
-	read := func(name string) string {
-		content, err := os.ReadFile(filepath.Join(root, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(content)
-	}
-
-	english := read("README.md")
-	chinese := read("README.zh-CN.md")
-
-	for _, required := range []string{
-		"README.zh-CN.md", "GitHub Releases", "sha256sum", "shasum -a 256",
-		"$HOME/.local/lib/codex-provider-switcher", "$HOME/.agents/skills/provider",
-		"CODEX_PROVIDER_SWITCHER_CODEX", "/provider status",
-		"/provider switch <name>", "## Upgrade", "## Troubleshooting",
-		"## Uninstall", "docs/architecture.md",
-	} {
-		if !strings.Contains(english, required) {
-			t.Errorf("English README missing %q", required)
-		}
-	}
-
-	for _, required := range []string{
-		"README.md", "GitHub Releases", "sha256sum", "shasum -a 256",
-		"$HOME/.local/lib/codex-provider-switcher", "$HOME/.agents/skills/provider",
-		"CODEX_PROVIDER_SWITCHER_CODEX", "/provider status",
-		"/provider switch <name>", "## 升级", "## 常见问题",
-		"## 卸载", "docs/architecture.md",
-	} {
-		if !strings.Contains(chinese, required) {
-			t.Errorf("Chinese README missing %q", required)
-		}
-	}
-}
+`cp README.md README.zh-CN.md LICENSE THIRD_PARTY_NOTICES "$root/"`,
+`tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/README.zh-CN.md"`,
 ```
 
 - [ ] **Step 2: Run the test to verify RED**
 
-Run: `go test ./internal/repository -run TestReadmesProvideMatchingUserDeploymentGuides -count=1`
+Run: `go test ./internal/repository -run TestReleaseContainsRequiredTargetsChecksumsAndPermissions -count=1`
 
-Expected: FAIL because `README.zh-CN.md` does not exist.
+Expected: FAIL because `.github/workflows/release.yml` neither copies nor checks
+`README.zh-CN.md`.
 
 - [ ] **Step 3: Commit the failing documentation contract**
 
 ```bash
 git add internal/repository/workflows_test.go
-git commit -m "test: require bilingual deployment guides"
+git commit -m "test: require Chinese guide in release archives"
 ```
 
 ---
@@ -200,14 +167,7 @@ Run: `go test ./internal/repository -run TestDocumentationDescribesStockDesktopW
 Expected: PASS, proving advanced accuracy claims were retained across the
 English README and architecture document.
 
-- [ ] **Step 4: Run the new contract and confirm it remains RED only for Chinese**
-
-Run: `go test ./internal/repository -run TestReadmesProvideMatchingUserDeploymentGuides -count=1`
-
-Expected: FAIL because `README.zh-CN.md` still does not exist; the English
-requirements produce no errors before that file read.
-
-- [ ] **Step 5: Commit the English guide**
+- [ ] **Step 4: Commit the English guide**
 
 ```bash
 git add README.md docs/architecture.md
@@ -261,9 +221,9 @@ sub2api` as literal examples. Explain that control responses are local and do
 not invoke a model, and that users must reconnect the Desktop host after an
 install or upgrade.
 
-- [ ] **Step 2: Run the bilingual contract to verify GREEN**
+- [ ] **Step 2: Run the documentation and packaging tests to verify GREEN**
 
-Run: `go test ./internal/repository -run 'TestReadmesProvideMatchingUserDeploymentGuides|TestDocumentationDescribesStockDesktopWrapper' -count=1`
+Run: `go test ./internal/repository -run 'TestReleaseContainsRequiredTargetsChecksumsAndPermissions|TestDocumentationDescribesStockDesktopWrapper' -count=1`
 
 Expected: PASS.
 
