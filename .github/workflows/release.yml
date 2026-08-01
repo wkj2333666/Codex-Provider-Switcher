@@ -110,10 +110,11 @@ jobs:
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o "$root/codex-provider-switcher" \
             ./cmd/codex-provider-switcher
-          cp README.md LICENSE THIRD_PARTY_NOTICES "$root/"
+          cp README.md README.zh-CN.md LICENSE THIRD_PARTY_NOTICES "$root/"
           mkdir -p "$root/plugins"
           cp -R plugins/codex-provider-switcher "$root/plugins/"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/README.zh-CN.md"
           tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/THIRD_PARTY_NOTICES"
           tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/plugins/codex-provider-switcher/skills/provider/SKILL.md"
           (cd dist && sha256sum "${name}.tar.gz" >"${name}.tar.gz.sha256")
