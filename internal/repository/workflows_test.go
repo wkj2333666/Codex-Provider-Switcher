@@ -138,7 +138,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 	combined := readme + "\n" + architecture
 
 	for _, required := range []string{
-		"WebSocket", "ln -s", "CODEX_PROVIDER_SWITCHER_PROVIDER",
+		"WebSocket", "ln -s", "app-server configuration",
 		"v0.1.0", "Uninstall", "64 MiB",
 		"v0.2.0 is also incompatible with stock Desktop Remote SSH",
 		"`codex app-server proxy` without `--sock`",
@@ -153,6 +153,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"$HOME/.agents/skills/provider", "Provider switched to sub2api.",
 		"does not invoke a model", "disappears after reopening",
 		"CODEX_PROVIDER_SWITCHER_STATE_DIR",
+		"does not read or parse `config.toml`", "optional `--provider`",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("documentation missing %q", required)
@@ -164,6 +165,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"Configure each Desktop Remote SSH entry point to launch the switcher as its stdio proxy",
 		"The upstream Host is the fixed local URL placeholder `localhost`",
 		"AcceptEnv CODEX_PROVIDER_SWITCHER_PROVIDER",
+		"CODEX_PROVIDER_SWITCHER_PROVIDER",
 	} {
 		if strings.Contains(combined, obsolete) {
 			t.Errorf("documentation retains obsolete claim %q", obsolete)

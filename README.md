@@ -24,7 +24,7 @@ and opens a new WebSocket directly to the same app-server Unix socket:
 
 ```text
 Desktop (one SSH alias)
-    -> switcher(default provider)
+    -> switcher(no default provider override)
     -> one Codex app-server
     -> one task store
 ```
@@ -82,7 +82,6 @@ the example real path with the value printed by `command -v codex` above:
 
 ```bash
 export CODEX_PROVIDER_SWITCHER_CODEX="/absolute/path/to/real/codex"
-export CODEX_PROVIDER_SWITCHER_PROVIDER="openai"
 export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 ```
 
@@ -110,8 +109,9 @@ Host pi
 Desktop assigns a different host ID and sidebar to every SSH alias, even when
 the aliases reach the same machine. Multiple aliases therefore cannot provide
 one shared Desktop task list. The single-alias setup keeps the host identity
-stable; `CODEX_PROVIDER_SWITCHER_PROVIDER` in the remote login profile supplies
-the fallback provider for tasks that have no saved selection.
+stable. A task without a saved switcher selection is sent without a provider
+override, so app-server configuration selects the provider using Codex's normal
+configuration precedence and built-in defaults.
 
 ### Switch The Current Task
 
@@ -162,9 +162,9 @@ In transparent wrapper mode, the socket is selected in this order:
 The wrapper recognizes repeatable `-c`/`--config`, `--enable`, and `--disable`
 options before `app-server`, between `app-server` and `proxy`, and after
 `proxy`. It also accepts `--strict-config` before either subcommand. Supported
-configuration options are consumed for command classification but cannot
-change the provider selected by the SSH entry point. Proxy help is delegated;
-an invalid effective proxy command returns a sanitized wrapper error.
+configuration options are consumed for command classification and remain part
+of app-server's own effective configuration. Proxy help is delegated; an
+invalid effective proxy command returns a sanitized wrapper error.
 
 ## Direct Proxy Mode
 
@@ -180,13 +180,13 @@ codex-provider-switcher proxy \
 Direct proxy environment equivalents are:
 
 ```text
-CODEX_PROVIDER_SWITCHER_PROVIDER
 CODEX_PROVIDER_SWITCHER_SOCKET
 CODEX_PROVIDER_SWITCHER_STATE_DIR
 ```
 
-Flags take precedence over environment values. Direct mode also accepts
-`--state-dir`. Provider IDs accept ASCII letters, digits, `.`, `_`, and `-`.
+Direct mode accepts an optional `--provider` override and `--state-dir`. When
+`--provider` is omitted, the request is left for app-server configuration to
+resolve. Provider IDs accept ASCII letters, digits, `.`, `_`, and `-`.
 
 `CODEX_PROVIDER_SWITCHER_CODEX` is wrapper-only. It identifies the absolute
 real Codex executable used when delegating non-proxy commands.
@@ -195,14 +195,17 @@ real Codex executable used when delegating non-proxy commands.
 
 | Client method | Enforced field |
 | --- | --- |
-| `thread/start` | `params.modelProvider = <selected provider>` |
-| `thread/resume` | `params.modelProvider = <selected provider>` |
-| `thread/fork` | `params.modelProvider = <selected provider>` |
+| `thread/start` | Explicit direct-mode selection overrides `params.modelProvider`; otherwise unchanged |
+| `thread/resume` | Saved or explicit selection overrides `params.modelProvider`; otherwise unchanged |
+| `thread/fork` | Explicit direct-mode selection overrides `params.modelProvider`; otherwise unchanged |
 | `thread/list` | `params.modelProviders = []` |
 
-An existing client value is overwritten. Missing or null `params` becomes an
-object. A target request with non-object `params` closes the connection instead
-of risking fallback to the wrong provider.
+When an override is active, an existing client value is overwritten. Missing or
+null `params` becomes an object. A target request with non-object `params`
+closes the connection instead of risking fallback to the wrong provider. With
+no override, provider-bearing methods pass through byte-for-byte. The switcher
+does not read or parse `config.toml`; app-server remains the single owner of
+Codex configuration resolution.
 
 Only downstream WebSocket text messages are candidates for JSON-RPC parsing.
 Unknown valid text messages pass through byte-for-byte. Binary messages and all
@@ -308,7 +311,7 @@ shell, and remove the isolated wrapper directory and provider skill:
 ```bash
 rm -rf "$HOME/.local/lib/codex-provider-switcher"
 rm -rf "$HOME/.agents/skills/provider"
-unset CODEX_PROVIDER_SWITCHER_CODEX CODEX_PROVIDER_SWITCHER_PROVIDER
+unset CODEX_PROVIDER_SWITCHER_CODEX
 hash -r 2>/dev/null || true
 command -v codex
 codex --version

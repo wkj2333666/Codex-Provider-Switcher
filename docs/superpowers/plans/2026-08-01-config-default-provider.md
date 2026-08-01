@@ -1,42 +1,47 @@
-# Codex Config Default Provider Implementation Plan
+# App-Server Default Provider Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Resolve the unsaved-task provider from Codex `config.toml` instead of `CODEX_PROVIDER_SWITCHER_PROVIDER`.
+**Goal:** Stop specifying a provider for unsaved tasks and defer to app-server's effective configuration.
 
-**Architecture:** `internal/config` resolves the Codex home and parses one bounded TOML document. The direct flag overrides the document; persistent task selections remain unchanged in `internal/transport`.
+**Architecture:** An empty connection provider represents no override. Thread responses supply the effective provider used by send-time coordination; saved task selections and slash controls remain explicit overrides.
 
-**Tech Stack:** Go 1.24, `pelletier/go-toml/v2`, GitHub Actions.
+**Tech Stack:** Go 1.24, coder/websocket, GitHub Actions.
 
 ## Global Constraints
 
-- Missing config or `model_provider` means built-in provider `openai`.
-- Invalid explicit configuration fails closed without leaking paths or values.
-- `CODEX_PROVIDER_SWITCHER_PROVIDER` has no effect.
+- Do not read or parse Codex `config.toml`.
+- Do not define a switcher-side default provider.
+- Existing saved task selections retain precedence.
 - Existing daemon and proxy processes are not restarted during deployment.
 
 ---
 
-### Task 1: Config Resolution
+### Task 1: Optional Provider Override
 
 **Files:**
 - Modify: `internal/config/config.go`
 - Modify: `internal/config/config_test.go`
-- Modify: `go.mod`
-- Modify: `go.sum`
-- Modify: `THIRD_PARTY_NOTICES`
+- Modify: `internal/rewrite/rewrite.go`
+- Modify: `internal/rewrite/rewrite_test.go`
 
-**Interfaces:**
-- Consumes: `ParseProxy(args []string, getenv func(string) string)`
-- Produces: `Config.Provider` from `--provider`, TOML `model_provider`, or `openai`
+- [x] **Step 1: Write RED tests** for ignored legacy environment and byte-for-byte provider methods with no override.
+- [x] **Step 2: Verify RED** in config and rewrite packages.
+- [x] **Step 3: Allow an empty provider and skip provider rewrites.**
+- [x] **Step 4: Verify focused GREEN tests.**
 
-- [ ] **Step 1: Write failing tests** for explicit config, implicit `openai`, ignored legacy environment, flag precedence, invalid TOML, invalid provider, and resolution from `CODEX_HOME` and socket layout.
-- [ ] **Step 2: Run RED** with `go test ./internal/config -count=1 -v` and confirm failures are caused by environment-based resolution.
-- [ ] **Step 3: Implement bounded TOML resolution** with `pelletier/go-toml/v2` and sanitized errors.
-- [ ] **Step 4: Run GREEN** with `go test ./internal/config -count=1 -v`.
-- [ ] **Step 5: Add the dependency license** and run `go mod tidy`.
+### Task 2: Effective Provider Coordination
 
-### Task 2: Public Contract
+**Files:**
+- Modify: `internal/transport/session.go`
+- Modify: `internal/transport/session_test.go`
+
+- [x] **Step 1: Write RED tests** for empty session provider, default resume, effective response tracking, and ordinary send without handoff.
+- [x] **Step 2: Verify RED** in the transport package.
+- [x] **Step 3: Use the observed effective provider when no explicit selection exists.**
+- [x] **Step 4: Verify focused GREEN tests.**
+
+### Task 3: Public Contract And Release
 
 **Files:**
 - Modify: `cmd/codex-provider-switcher/main.go`
@@ -46,24 +51,7 @@
 - Modify: `docs/architecture.md`
 - Modify: `plugins/codex-provider-switcher/.codex-plugin/plugin.json`
 
-**Interfaces:**
-- Consumes: the new config resolution contract
-- Produces: help and installation instructions with no provider environment variable
-
-- [ ] **Step 1: Write failing CLI and repository tests** that reject the legacy environment variable from public docs and require `model_provider` semantics.
-- [ ] **Step 2: Run RED** with `go test ./cmd/codex-provider-switcher ./internal/repository -count=1`.
-- [ ] **Step 3: Update help, docs, architecture, notices checks, and plugin version.**
-- [ ] **Step 4: Run GREEN** for the focused packages.
-
-### Task 3: Verify And Release
-
-**Files:**
-- Modify only files required by failing verification.
-
-**Interfaces:**
-- Produces: merged release and deployed binary
-
-- [ ] **Step 1: Run full tests, vet, formatting, repeated transport tests, and four CGO-disabled cross-builds.**
-- [ ] **Step 2: Commit, push, open a ready PR, and wait for all CI checks.**
-- [ ] **Step 3: Merge, tag the next semantic release, and verify all eight assets.**
-- [ ] **Step 4: Install the arm64 release atomically, validate a real WebSocket handshake, and confirm daemon/proxy PID and start times did not change.**
+- [x] **Step 1: Write RED tests** removing the legacy variable from help and docs.
+- [x] **Step 2: Update help, docs, architecture, and plugin version.**
+- [x] **Step 3: Run focused and full verification.**
+- [ ] **Step 4: Commit, push, merge, release, and deploy without restarting existing processes.**

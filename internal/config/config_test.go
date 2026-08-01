@@ -36,17 +36,17 @@ func TestParseProxyFlagsOverrideEnvironment(t *testing.T) {
 	}
 }
 
-func TestParseProxyUsesEnvironment(t *testing.T) {
+func TestParseProxyDefersProviderToAppServerAndIgnoresLegacyEnvironment(t *testing.T) {
 	socket := unixSocket(t, "app-server.sock")
 	result, err := ParseProxy(nil, environment(map[string]string{
-		"CODEX_PROVIDER_SWITCHER_PROVIDER": "provider_1.test",
+		"CODEX_PROVIDER_SWITCHER_PROVIDER": "legacy-provider-must-not-win",
 		"CODEX_PROVIDER_SWITCHER_SOCKET":   socket,
 	}))
 	if err != nil {
 		t.Fatalf("ParseProxy() error = %v", err)
 	}
 	want := Config{
-		Provider: "provider_1.test",
+		Provider: "",
 		Socket:   socket,
 		StateDir: customStateDir(socket),
 	}
@@ -68,7 +68,6 @@ func TestParseProxyRejectsInvalidConfiguration(t *testing.T) {
 		wantErr    string
 		rejectText string
 	}{
-		{name: "missing provider", args: []string{"--socket", socket}, wantErr: "provider is required"},
 		{name: "invalid provider", args: []string{"--provider", "secret bad provider", "--socket", socket}, wantErr: "invalid provider", rejectText: "secret bad provider"},
 		{name: "missing socket", args: []string{"--provider", "provider-a"}, wantErr: "socket is required"},
 		{name: "regular file socket", args: []string{"--provider", "provider-a", "--socket", regularFile}, wantErr: "not a Unix socket"},

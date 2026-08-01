@@ -33,6 +33,9 @@ func Line(line []byte, provider string) ([]byte, error) {
 	if !injectProvider && method != "thread/list" {
 		return line, nil
 	}
+	if injectProvider && provider == "" {
+		return line, nil
+	}
 
 	paramsRaw, paramsPresent := message["params"]
 	params, err := objectParams(paramsRaw, paramsPresent && hasNonNull(paramsRaw))

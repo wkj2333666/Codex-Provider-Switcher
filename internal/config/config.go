@@ -14,12 +14,12 @@ import (
 )
 
 const (
-	providerEnvironment = "CODEX_PROVIDER_SWITCHER_PROVIDER"
-	socketEnvironment   = "CODEX_PROVIDER_SWITCHER_SOCKET"
-	stateEnvironment    = "CODEX_PROVIDER_SWITCHER_STATE_DIR"
+	socketEnvironment = "CODEX_PROVIDER_SWITCHER_SOCKET"
+	stateEnvironment  = "CODEX_PROVIDER_SWITCHER_STATE_DIR"
 )
 
-// Config contains fully resolved values for one proxied connection.
+// Config contains fully resolved values for one proxied connection. Provider
+// is empty when app-server should apply its own effective configuration.
 type Config struct {
 	Provider string
 	Socket   string
@@ -32,14 +32,14 @@ type Result struct {
 	ShowVersion bool
 }
 
-// ParseProxy resolves direct proxy flags over environment values and validates
-// the result.
+// ParseProxy resolves direct proxy flags and non-provider environment values,
+// then validates the result.
 func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
 
-	provider := getenv(providerEnvironment)
+	provider := ""
 	socket := getenv(socketEnvironment)
 	stateDirectory := getenv(stateEnvironment)
 
@@ -59,10 +59,7 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 		return Result{ShowVersion: true}, nil
 	}
 
-	if provider == "" {
-		return Result{}, errors.New("provider is required")
-	}
-	if !providerid.Valid(provider) {
+	if provider != "" && !providerid.Valid(provider) {
 		return Result{}, errors.New("invalid provider: expected only letters, digits, dot, underscore, or hyphen")
 	}
 	if socket == "" {
@@ -73,7 +70,6 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-
 	resolvedStateDirectory, err := resolveStateDirectory(stateDirectory, resolvedSocket, getenv)
 	if err != nil {
 		return Result{}, err

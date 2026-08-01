@@ -35,10 +35,13 @@ func TestRunHelp(t *testing.T) {
 		if code != 0 || called || stderr.Len() != 0 {
 			t.Fatalf("run(%q) = %d, called %v, stderr %q", args, code, called, stderr.String())
 		}
-		for _, text := range []string{"Usage:", "proxy", "--provider", "--socket", "CODEX_PROVIDER_SWITCHER_PROVIDER"} {
+		for _, text := range []string{"Usage:", "proxy", "--provider", "--socket", "app-server configuration"} {
 			if !strings.Contains(stdout.String(), text) {
 				t.Errorf("help missing %q:\n%s", text, stdout.String())
 			}
+		}
+		if strings.Contains(stdout.String(), "CODEX_PROVIDER_SWITCHER_PROVIDER") {
+			t.Fatalf("help retains legacy provider environment:\n%s", stdout.String())
 		}
 	}
 }
@@ -95,7 +98,9 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 		"-c", `model="top"`, "app-server", "--enable", "feature-a", "proxy",
 		"--disable=feature-b", "--sock", socket,
 	}, dependencies{
-		getenv: env(map[string]string{"CODEX_PROVIDER_SWITCHER_PROVIDER": "provider-b"}),
+		getenv: env(map[string]string{
+			"CODEX_PROVIDER_SWITCHER_PROVIDER": "legacy-provider",
+		}),
 		stdin:  strings.NewReader("input"),
 		stdout: io.Discard,
 		stderr: io.Discard,
@@ -111,7 +116,7 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	if code != 0 || delegated {
 		t.Fatalf("run(wrapper proxy) = %d, delegated %v", code, delegated)
 	}
-	if got.Config.Provider != "provider-b" || got.Config.Socket != socket {
+	if got.Config.Provider != "" || got.Config.Socket != socket {
 		t.Fatalf("proxy config = %#v", got.Config)
 	}
 }
@@ -163,8 +168,7 @@ func TestRunStockWrapperUsesDefaultSocket(t *testing.T) {
 	go func() {
 		codeDone <- run(ctx, "codex", []string{"app-server", "proxy"}, dependencies{
 			getenv: env(map[string]string{
-				"CODEX_PROVIDER_SWITCHER_PROVIDER": "provider-a",
-				"CODEX_HOME":                       codexHome,
+				"CODEX_HOME": codexHome,
 			}),
 			stdin:    switcherStream,
 			stdout:   switcherStream,
@@ -199,7 +203,7 @@ func TestRunStockWrapperUsesDefaultSocket(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("upstream did not receive rewritten request")
 	}
-	if message.Params["modelProvider"] != "provider-a" || message.Params["keep"] != true {
+	if _, present := message.Params["modelProvider"]; present || message.Params["keep"] != true {
 		t.Fatalf("upstream params = %#v", message.Params)
 	}
 
@@ -239,16 +243,19 @@ func TestRunWrapperDelegatesProxyHelpWithoutProvider(t *testing.T) {
 	}
 }
 
-func TestRunWrapperFailsClosedWithoutProvider(t *testing.T) {
+func TestRunWrapperDefersDefaultProviderToAppServer(t *testing.T) {
 	socket := unixSocket(t)
 	calledProxy := false
 	delegated := false
 	var stderr bytes.Buffer
 	code := run(context.Background(), "codex", []string{"app-server", "proxy", "--sock", socket}, dependencies{
-		getenv: func(string) string { return "" },
+		getenv: env(map[string]string{"HOME": t.TempDir()}),
 		stderr: &stderr,
-		runProxy: func(context.Context, transport.Options) error {
+		runProxy: func(_ context.Context, options transport.Options) error {
 			calledProxy = true
+			if options.Config.Provider != "" {
+				t.Fatalf("Provider = %q, want no override", options.Config.Provider)
+			}
 			return nil
 		},
 		execProcess: func(string, []string, []string) error {
@@ -256,11 +263,8 @@ func TestRunWrapperFailsClosedWithoutProvider(t *testing.T) {
 			return nil
 		},
 	})
-	if code != 2 || calledProxy || delegated {
-		t.Fatalf("run(missing provider) = %d, proxy %v, delegated %v", code, calledProxy, delegated)
-	}
-	if !strings.Contains(stderr.String(), "configuration error") {
-		t.Fatalf("stderr = %q", stderr.String())
+	if code != 0 || !calledProxy || delegated || stderr.Len() != 0 {
+		t.Fatalf("run(default provider) = %d, proxy %v, delegated %v, stderr %q", code, calledProxy, delegated, stderr.String())
 	}
 }
 

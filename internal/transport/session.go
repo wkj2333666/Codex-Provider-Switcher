@@ -76,7 +76,7 @@ type session struct {
 }
 
 func newSessionState(provider, appServerSocket string, upstreamWrite, downstreamWrite websocketWriteFunc) (*session, error) {
-	if provider == "" || appServerSocket == "" || upstreamWrite == nil || downstreamWrite == nil {
+	if appServerSocket == "" || upstreamWrite == nil || downstreamWrite == nil {
 		return nil, errors.New("invalid provider handoff session")
 	}
 	prefixBytes := make([]byte, 8)
@@ -177,9 +177,16 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	}
 	targetProvider := commandProvider
 	if !commandRecognized {
-		targetProvider, err = current.selectedProvider(threadID)
+		var selected bool
+		targetProvider, selected, err = current.selectedProvider(threadID)
 		if err != nil {
 			return current.writeHandoffError(ctx, message.id)
+		}
+		if !selected {
+			targetProvider = current.effectiveProvider(threadID)
+			if targetProvider == "" {
+				return current.writeHandoffError(ctx, message.id)
+			}
 		}
 	}
 	if current.coordinator.IsDirty(threadID) || current.effectiveProvider(threadID) != targetProvider {
@@ -227,7 +234,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		return current.writeHandoffError(ctx, message.id)
 	}
 	defer release()
-	targetProvider, err := current.selectedProvider(threadID)
+	targetProvider, _, err := current.selectedProvider(threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
@@ -292,21 +299,21 @@ func (current *session) internalResume(ctx context.Context, threadID, targetProv
 	return current.internalResumeWithProvider(ctx, threadID, targetProvider, true)
 }
 
-func (current *session) selectedProvider(threadID string) (string, error) {
+func (current *session) selectedProvider(threadID string) (string, bool, error) {
 	if current.selections == nil {
-		return current.provider, nil
+		return current.provider, current.provider != "", nil
 	}
 	selected, ok, err := current.selections.Get(threadID)
 	if err != nil {
-		return "", errors.New("read provider selection")
+		return "", false, errors.New("read provider selection")
 	}
 	if !ok {
-		return current.provider, nil
+		return current.provider, current.provider != "", nil
 	}
 	if !providerid.Valid(selected) {
-		return "", errors.New("invalid provider selection")
+		return "", false, errors.New("invalid provider selection")
 	}
-	return selected, nil
+	return selected, true, nil
 }
 
 func (current *session) internalResumeWithProvider(ctx context.Context, threadID, expectedProvider string, reuseTemplate bool) error {
