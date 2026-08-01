@@ -86,7 +86,8 @@ An explicit proxy `--sock` wins over `CODEX_PROVIDER_SWITCHER_SOCKET`, which
 wins over `$CODEX_HOME/app-server-control/app-server-control.sock`. If neither
 environment value is set, the wrapper uses
 `$HOME/.codex/app-server-control/app-server-control.sock`. Direct mode remains
-unchanged and requires `--socket` or `CODEX_PROVIDER_SWITCHER_SOCKET`.
+unchanged, accepts an optional `--provider`, and requires `--socket` or
+`CODEX_PROVIDER_SWITCHER_SOCKET`.
 
 Selection state resolves from `--state-dir`,
 `CODEX_PROVIDER_SWITCHER_STATE_DIR`, `$CODEX_HOME`, the stock control-socket
@@ -137,9 +138,10 @@ rollout history, so the confirmation disappears after reopening while the
 saved provider remains effective.
 
 The exact user-facing `/provider status` command and its skill-encoded internal
-wire form take the thread lock and run peer preparation but perform no handoff
-and make no app-server request. The fake turn reports the provider verified
-from this connection's latest start/resume response plus the durable selection.
+wire form, `[$provider](<absolute-path>/provider/SKILL.md) status`, take the
+thread lock and run peer preparation but perform no handoff and make no
+app-server request. The fake turn reports the provider verified from this
+connection's latest start/resume response plus the durable selection.
 Missing runtime state is shown as `Runtime provider: unknown.`; no saved
 override is shown as `Selected provider: app-server configuration.` If
 selection and runtime differ, the response says the selection `will be applied before the next model turn`.
