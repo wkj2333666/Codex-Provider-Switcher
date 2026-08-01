@@ -2,25 +2,28 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
+
+	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
 const (
 	providerEnvironment = "CODEX_PROVIDER_SWITCHER_PROVIDER"
 	socketEnvironment   = "CODEX_PROVIDER_SWITCHER_SOCKET"
+	stateEnvironment    = "CODEX_PROVIDER_SWITCHER_STATE_DIR"
 )
-
-var providerPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // Config contains fully resolved values for one proxied connection.
 type Config struct {
 	Provider string
 	Socket   string
+	StateDir string
 }
 
 // Result contains either a runnable configuration or a control action.
@@ -38,11 +41,13 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 
 	provider := getenv(providerEnvironment)
 	socket := getenv(socketEnvironment)
+	stateDirectory := getenv(stateEnvironment)
 
 	flags := flag.NewFlagSet("codex-provider-switcher", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&provider, "provider", provider, "provider to inject into task requests")
 	flags.StringVar(&socket, "socket", socket, "shared app-server Unix socket")
+	flags.StringVar(&stateDirectory, "state-dir", stateDirectory, "persistent per-task provider state")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	if err := flags.Parse(args); err != nil {
 		return Result{}, err
@@ -57,7 +62,7 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 	if provider == "" {
 		return Result{}, errors.New("provider is required")
 	}
-	if !providerPattern.MatchString(provider) {
+	if !providerid.Valid(provider) {
 		return Result{}, errors.New("invalid provider: expected only letters, digits, dot, underscore, or hyphen")
 	}
 	if socket == "" {
@@ -69,10 +74,40 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 		return Result{}, err
 	}
 
+	resolvedStateDirectory, err := resolveStateDirectory(stateDirectory, resolvedSocket, getenv)
+	if err != nil {
+		return Result{}, err
+	}
+
 	return Result{Config: Config{
 		Provider: provider,
 		Socket:   resolvedSocket,
+		StateDir: resolvedStateDirectory,
 	}}, nil
+}
+
+func resolveStateDirectory(directory, socket string, getenv func(string) string) (string, error) {
+	if directory != "" {
+		absolute, err := filepath.Abs(directory)
+		if err != nil {
+			return "", errors.New("resolve provider state directory")
+		}
+		return absolute, nil
+	}
+	if codexHome := getenv("CODEX_HOME"); codexHome != "" {
+		absolute, err := filepath.Abs(filepath.Join(codexHome, "codex-provider-switcher"))
+		if err != nil {
+			return "", errors.New("resolve provider state directory")
+		}
+		return absolute, nil
+	}
+	controlDirectory := filepath.Dir(socket)
+	if filepath.Base(socket) == "app-server-control.sock" && filepath.Base(controlDirectory) == "app-server-control" {
+		return filepath.Join(filepath.Dir(controlDirectory), "codex-provider-switcher"), nil
+	}
+	digest := sha256.Sum256([]byte(socket))
+	name := ".codex-provider-switcher-" + hex.EncodeToString(digest[:6])
+	return filepath.Join(filepath.Dir(socket), name), nil
 }
 
 func resolveSocket(path string) (string, error) {

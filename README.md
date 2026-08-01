@@ -7,9 +7,9 @@
 > version. Use v0.2.1 or newer.
 
 Codex Provider Switcher is a provider-agnostic WebSocket proxy for Codex
-Desktop Remote SSH. Separate SSH entry points can select different model
-providers while sharing one Codex app-server daemon, one `CODEX_HOME`, and one
-task database.
+Desktop Remote SSH. One SSH alias can switch each task between configured model
+providers while retaining one Desktop host identity, one sidebar, one Codex
+app-server daemon, one `CODEX_HOME`, and one task database.
 
 This is an independent community project. It is not an OpenAI product.
 
@@ -23,18 +23,19 @@ as a transparent executable named `codex`, intercepts that effective command,
 and opens a new WebSocket directly to the same app-server Unix socket:
 
 ```text
-Desktop A -> switcher(provider-a) --+
-                                      +-> one Codex app-server -> one task store
-Desktop B -> switcher(provider-b) --+
+Desktop (one SSH alias)
+    -> switcher(default provider)
+    -> one Codex app-server
+    -> one task store
 ```
 
 All other `codex` commands are delegated unchanged to the real Codex
 executable. The switcher does not start a second daemon or access SQLite.
 
-Live wrapper processes connected to the same app-server also form a local
-send-time provider handoff group. Opening a task only loads it for viewing. The
-SSH alias that sends the next `turn/start` becomes the requested provider for
-that task before the turn reaches app-server.
+Live wrapper processes connected to the same app-server form a local provider
+handoff group. The explicit `/provider <name>` control switches the current
+idle task, persists its selection, and returns a local synthetic confirmation
+without invoking a model.
 
 ## Requirements
 
@@ -70,6 +71,10 @@ install -m 0755 codex-provider-switcher \
   "$HOME/.local/lib/codex-provider-switcher/codex-provider-switcher"
 ln -s ../codex-provider-switcher \
   "$HOME/.local/lib/codex-provider-switcher/bin/codex"
+
+install -d -m 0755 "$HOME/.agents/skills/provider"
+cp -R plugins/codex-provider-switcher/skills/provider/. \
+  "$HOME/.agents/skills/provider/"
 ```
 
 Add these values to the remote login-shell profile used by Desktop, replacing
@@ -77,6 +82,7 @@ the example real path with the value printed by `command -v codex` above:
 
 ```bash
 export CODEX_PROVIDER_SWITCHER_CODEX="/absolute/path/to/real/codex"
+export CODEX_PROVIDER_SWITCHER_PROVIDER="openai"
 export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 ```
 
@@ -91,33 +97,55 @@ codex --version
 `command -v codex` must show the wrapper symlink. `codex --version` must still
 show the real Codex version because non-proxy commands are delegated.
 
-### Select A Provider Per SSH Alias
+### Use One SSH Alias
 
-OpenSSH can attach the provider identity to each local alias:
+Keep one Desktop Remote SSH entry for the machine. For example:
 
 ```sshconfig
-Host codex-provider-a
+Host pi
     HostName server.example.com
     User developer
-    SetEnv CODEX_PROVIDER_SWITCHER_PROVIDER=provider-a
-
-Host codex-provider-b
-    HostName server.example.com
-    User developer
-    SetEnv CODEX_PROVIDER_SWITCHER_PROVIDER=provider-b
 ```
 
-The remote SSH server must permit that variable, for example in
-`sshd_config`:
+Desktop assigns a different host ID and sidebar to every SSH alias, even when
+the aliases reach the same machine. Multiple aliases therefore cannot provide
+one shared Desktop task list. The single-alias setup keeps the host identity
+stable; `CODEX_PROVIDER_SWITCHER_PROVIDER` in the remote login profile supplies
+the fallback provider for tasks that have no saved selection.
+
+### Switch The Current Task
+
+After reconnecting the `pi` entry so Desktop discovers the installed skill,
+invoke it from the slash menu and choose a configured provider. For example,
+use `/provider openai` for the native provider or `/provider sub2api` for the
+configured alternative:
 
 ```text
-AcceptEnv CODEX_PROVIDER_SWITCHER_PROVIDER
+/provider openai
+/provider sub2api
 ```
 
-Reload the SSH daemon after validating its configuration. If server policy
-does not allow `AcceptEnv`, use separate remote accounts or an equivalent
-server-side environment wrapper. Desktop does not expose a custom proxy-command
-setting, so simply documenting a different command is not sufficient.
+Desktop transmits an explicit skill invocation as `$provider <name>`. The
+switcher also accepts an exact plain-text `/provider <name>` control input for
+clients that send slash text directly. Mentions inside ordinary prompts are not
+commands.
+
+For a successful switch, the switcher performs the provider handoff and emits a
+synthetic local turn containing, for example:
+
+```text
+Provider switched to sub2api.
+```
+
+The control turn does not invoke a model, consume model tokens, or enter Codex
+rollout history. Its confirmation is UI-only and disappears after reopening
+the task. The provider selection does persist and applies to later messages and
+resumes for that task.
+
+Selections are private mode-0600 files in a mode-0700 directory. The location
+is selected by `--state-dir`, then `CODEX_PROVIDER_SWITCHER_STATE_DIR`, then
+`$CODEX_HOME/codex-provider-switcher`; stock socket paths infer the same
+directory. A custom socket uses a socket-specific directory beside that socket.
 
 The wrapper fails closed when the provider is missing. It never delegates a
 malformed `app-server proxy` invocation to the real CLI.
@@ -154,10 +182,11 @@ Direct proxy environment equivalents are:
 ```text
 CODEX_PROVIDER_SWITCHER_PROVIDER
 CODEX_PROVIDER_SWITCHER_SOCKET
+CODEX_PROVIDER_SWITCHER_STATE_DIR
 ```
 
-Flags take precedence over environment values. Provider IDs accept ASCII
-letters, digits, `.`, `_`, and `-`.
+Flags take precedence over environment values. Direct mode also accepts
+`--state-dir`. Provider IDs accept ASCII letters, digits, `.`, `_`, and `-`.
 
 `CODEX_PROVIDER_SWITCHER_CODEX` is wrapper-only. It identifies the absolute
 real Codex executable used when delegating non-proxy commands.
@@ -186,22 +215,22 @@ limit is 64 MiB.
 
 ## Task Semantics
 
-A task can be used sequentially through different providers:
+A task can be used sequentially through different providers on the same
+Desktop connection:
 
 ```text
-resume with provider-a -> finish the turn -> leave the task
-resume with provider-b -> continue from the same persisted history
+/provider openai  -> local handoff -> later messages use openai
+/provider sub2api -> local handoff -> later messages use sub2api
 ```
 
 Different tasks can be active through different providers at the same time.
-For one task, opening or viewing it through another SSH alias does not switch
-the loaded runtime. Provider handoff occurs when that alias sends the next
-message:
+Opening or viewing a task does not change its saved selection. A provider
+command on an idle task performs the handoff before returning its fake turn:
 
 ```text
-open in sub2api alias -> view only, no provider change
-send next message     -> unsubscribe idle peers -> resume with sub2api
-                      -> resubscribe detached peers -> start turn
+/provider sub2api -> unsubscribe idle peers -> resume with sub2api
+                  -> resubscribe detached peers -> persist selection
+                  -> synthesize local completed turn
 ```
 
 The handoff keeps the same thread id and persisted history. It does not restart
@@ -215,13 +244,12 @@ remain hidden, but previously open Desktop views receive the new turn's normal
 item and lifecycle notifications and stay synchronized. A Desktop connection
 that explicitly unsubscribed is not reattached.
 
-An active turn is never interrupted or stolen. If another alias is still
-running a turn, a client bypassed the switcher, or app-server cannot confirm the
-requested provider, the new `turn/start` is not forwarded. Desktop receives a
-JSON-RPC `-32090` error and can retry after the active turn finishes.
-The same peer activity check also runs on the same-provider path, closing the
-window where two aliases could submit before the second received
-`turn/started`.
+An active turn is never interrupted or stolen. If another live connection is
+still running a turn, a client bypassed the switcher, or app-server cannot
+confirm the requested provider, the control is rejected. Desktop receives a
+JSON-RPC `-32090` error and can retry after the active turn finishes. The same
+peer activity check also runs on the same-provider path, closing the window
+where two connections could submit before the second received `turn/started`.
 
 Once a handoff starts changing subscriptions, a per-task dirty marker remains
 until every phase succeeds. A failed unsubscribe, sender resume, or peer
@@ -249,8 +277,8 @@ file locks serialize resume/send transitions and are released automatically if
 a process exits. Hashed dirty markers persist incomplete transitions across
 proxy exits. Stale control sockets are removed after a failed local connect.
 Cross-provider mutation requires the `prepareHandoffV2` capability, so older
-live proxies fail before any subscription changes; reconnect every alias after
-an upgrade.
+live proxies fail before any subscription changes; reconnect the Desktop entry
+after an upgrade.
 
 ## Security Boundaries
 
@@ -274,11 +302,12 @@ an upgrade.
 
 ## Uninstall
 
-Remove the two profile exports added during installation, start a fresh login
-shell, and remove the isolated wrapper directory:
+Remove the profile exports added during installation, start a fresh login
+shell, and remove the isolated wrapper directory and provider skill:
 
 ```bash
 rm -rf "$HOME/.local/lib/codex-provider-switcher"
+rm -rf "$HOME/.agents/skills/provider"
 unset CODEX_PROVIDER_SWITCHER_CODEX CODEX_PROVIDER_SWITCHER_PROVIDER
 hash -r 2>/dev/null || true
 command -v codex
@@ -298,7 +327,8 @@ go vet ./...
 ```
 
 CI cross-builds Linux and macOS binaries for amd64 and arm64. A `v*` tag runs
-the release workflow and publishes four archives plus SHA-256 files.
+the release workflow and publishes four archives plus SHA-256 files. Every
+archive includes the explicit-only provider skill plugin.
 
 See [docs/architecture.md](docs/architecture.md) for transport and lifecycle
 details.

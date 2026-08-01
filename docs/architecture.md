@@ -34,7 +34,12 @@ upgraded.
 ## Components
 
 `internal/config` resolves proxy flags over environment values, validates the
-provider identifier, and verifies the Unix socket.
+default provider identifier, verifies the Unix socket, and derives the private
+per-task selection directory.
+
+`internal/provider` owns the provider identifier grammar. `internal/selection`
+persists one selected provider per task using hashed filenames, bounded reads,
+mode-0600 files, a mode-0700 directory, and atomic replace plus directory sync.
 
 `internal/wrapper` classifies invocations of a transparent executable named
 `codex`. Its three-stage parser recognizes supported common configuration
@@ -60,8 +65,10 @@ uses per-thread `flock` files to serialize transitions.
 
 `internal/transport/session` multiplexes Desktop and switcher-internal JSON-RPC
 requests on one upstream WebSocket. It correlates and hides internal responses,
-tracks effective providers and active turns, and preserves ordinary Desktop
-messages byte-for-byte after routing policy is applied.
+tracks effective providers and active turns, resolves durable task selections,
+and preserves ordinary Desktop messages byte-for-byte after routing policy is
+applied. It also recognizes exact provider controls and encodes a synthetic
+Codex turn lifecycle after a verified switch.
 
 `cmd/codex-provider-switcher` owns mode selection, signal cancellation, help,
 version output, diagnostics, and process exit codes. Delegated commands replace
@@ -80,6 +87,12 @@ wins over `$CODEX_HOME/app-server-control/app-server-control.sock`. If neither
 environment value is set, the wrapper uses
 `$HOME/.codex/app-server-control/app-server-control.sock`. Direct mode remains
 unchanged and requires `--socket` or `CODEX_PROVIDER_SWITCHER_SOCKET`.
+
+Selection state resolves from `--state-dir`,
+`CODEX_PROVIDER_SWITCHER_STATE_DIR`, `$CODEX_HOME`, the stock control-socket
+layout, or a socket-specific hidden directory. A missing task selection falls
+back to `CODEX_PROVIDER_SWITCHER_PROVIDER`; an unreadable or corrupt selection
+fails closed.
 
 ## Message Flow
 
@@ -105,6 +118,15 @@ thread flock
   -> resubscribe detached peers with the verified provider
   -> forward original turn/start
 ```
+
+An explicit `$provider <name>` skill invocation, or an exact plain-text
+`/provider <name>` input, uses the same sequence but does not forward the
+original `turn/start`. After provider verification it atomically saves the task
+selection and sends Desktop a synthetic response, `turn/started`, user and
+agent item events, and `turn/completed`. The fake agent message reports
+`Provider switched to sub2api.` for that target. It does not invoke a model or
+enter persisted rollout history, so the confirmation disappears after reopening
+while the saved provider remains effective.
 
 Ordinary `thread/resume` uses the same lock and holds it through the app-server
 response, so a new subscriber cannot appear midway through handoff. Internal
@@ -147,18 +169,24 @@ signals, and exit behavior.
 
 ## Routing Policy
 
-The provider identity is the SSH entry point's routing authority:
+One SSH alias supplies a default provider, while each task's durable selection
+is the routing authority after its first successful provider command:
 
 - `thread/start`, `thread/resume`, and `thread/fork` receive the selected
   `params.modelProvider`.
 - `thread/list` receives an empty `params.modelProviders` list so tasks from all
   configured providers remain visible.
-- `turn/start`, `model/list`, unknown methods, server messages, and binary
-  messages are not rewritten.
+- Ordinary `turn/start` is held until the selected provider is ready, then
+  forwarded byte-for-byte.
+- Exact provider controls are consumed locally and replaced by a fake lifecycle.
+- `model/list`, unknown methods, server messages, and binary messages are not
+  rewritten.
 
-A missing provider or unsafe target `params` shape fails closed. Diagnostics
-never format message bodies, prompts, handshake values, environment contents,
-or credentials.
+A missing provider, corrupt selection, malformed provider control, attachment
+on a provider control, or unsafe target `params` shape fails closed. Ordinary
+prompts that merely mention `/provider` or `$provider` remain ordinary prompts.
+Diagnostics never format message bodies, prompts, handshake values, environment
+contents, or credentials.
 
 Provider handoff is also fail closed. A peer reporting an active turn aborts in
 the prepare phase before any unsubscribe occurs. A second-phase failure, a
@@ -173,8 +201,9 @@ app-server `turn/started` notification has not arrived yet.
 
 Cross-provider sends then use the distinct `prepareHandoffV2` control method.
 Pre-recovery switcher versions reject that method, so a mixed-version
-deployment fails before any peer is unsubscribed. Reconnecting every Desktop
-SSH alias after upgrading activates the new protocol on all live proxies.
+deployment fails before any peer is unsubscribed. Reconnecting the one Desktop
+SSH alias after upgrading activates the new protocol on every live proxy for
+that host identity.
 
 The remote SSH account and every process running as the same Unix user are
 trusted at the account-authority level. Such a caller can already bypass the
@@ -189,16 +218,15 @@ Every switcher process connects to one separately managed app-server socket.
 The project neither starts an app-server nor reads its SQLite database. This
 keeps one daemon and one writer for one `CODEX_HOME` and task store.
 
-Different tasks can use different providers concurrently. One loaded task must
-not be operated concurrently through different providers. With Codex CLI
-0.146.0 or newer, a loaded idle task can move providers on the next send: after
-the final subscriber leaves, a resume with different overrides causes
-app-server to shut down the cached runtime and cold-resume the same persisted
-thread immediately. No daemon restart or 30-minute inactivity wait is needed.
-
-Opening a task through another alias can subscribe that connection without
-changing the loaded provider. The next `turn/start` triggers the coordinated
-handoff. An active turn remains owned by its current provider until completion.
+Desktop should use one SSH alias because each alias has a distinct host ID and
+sidebar. Different tasks under that one host identity can use different
+providers concurrently. One loaded task must not be operated concurrently
+through different providers. With Codex CLI 0.146.0 or newer, a loaded idle task
+can move providers on an explicit provider control: after the final subscriber
+leaves, a resume with different overrides causes app-server to shut down the
+cached runtime and cold-resume the same persisted task immediately. No daemon
+restart or 30-minute inactivity wait is needed. An active turn remains owned by
+its current provider until completion.
 
 ## Release Model
 
@@ -211,7 +239,9 @@ repeat the quality gate and package:
 - `darwin/amd64`
 - `darwin/arm64`
 
-Each archive includes the binary, README, MIT license, and
-`THIRD_PARTY_NOTICES`. The build job lists each completed archive and rejects it
-unless the third-party notice is present. The publication job is the only job
-granted `contents: write` and attaches one SHA-256 file per archive.
+Each archive includes the binary, README, MIT license,
+`THIRD_PARTY_NOTICES`, and the explicit-only provider skill plugin. The quality
+job validates the manifest and skill policy. The build job lists each completed
+archive and rejects it unless both the third-party notice and provider skill are
+present. The publication job is the only job granted `contents: write` and
+attaches one SHA-256 file per archive.

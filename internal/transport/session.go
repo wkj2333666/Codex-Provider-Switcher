@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
+	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rewrite"
 )
 
@@ -21,6 +22,7 @@ const (
 	handoffUnavailableMessage = "provider handoff unavailable; retry after the active turn finishes"
 	internalCallTimeout       = 30 * time.Second
 	handoffRecoveryTimeout    = 5 * time.Second
+	providerCommandErrorCode  = -32602
 )
 
 type handoffCoordinator interface {
@@ -37,6 +39,11 @@ type handoffCoordinator interface {
 }
 
 type websocketWriteFunc func(context.Context, websocket.MessageType, []byte) error
+
+type providerSelections interface {
+	Get(string) (string, bool, error)
+	Set(string, string) error
+}
 
 type desktopRequest struct {
 	method       string
@@ -65,6 +72,7 @@ type session struct {
 	closed            chan struct{}
 	closeOnce         sync.Once
 	coordinator       handoffCoordinator
+	selections        providerSelections
 }
 
 func newSessionState(provider, appServerSocket string, upstreamWrite, downstreamWrite websocketWriteFunc) (*session, error) {
@@ -92,23 +100,25 @@ func newSessionState(provider, appServerSocket string, upstreamWrite, downstream
 }
 
 func (current *session) handleDownstreamText(ctx context.Context, payload []byte) error {
-	rewritten, err := rewrite.Line(payload, current.provider)
-	if err != nil {
-		return errRoutingPolicy
-	}
-	message, err := parseRPCMessage(rewritten)
+	message, err := parseRPCMessage(payload)
 	if err != nil {
 		return errRoutingPolicy
 	}
 
 	switch message.method {
 	case "turn/start":
-		return current.handleTurnStart(ctx, message, rewritten)
+		return current.handleTurnStart(ctx, message, payload)
 	case "thread/resume":
-		return current.handleThreadResume(ctx, message, rewritten)
+		return current.handleThreadResume(ctx, message, payload)
 	case "thread/unsubscribe":
-		return current.handleThreadUnsubscribe(ctx, message, rewritten)
-	case "thread/start", "thread/fork":
+		return current.handleThreadUnsubscribe(ctx, message, payload)
+	}
+
+	rewritten, err := rewrite.Line(payload, current.provider)
+	if err != nil {
+		return errRoutingPolicy
+	}
+	if message.method == "thread/start" || message.method == "thread/fork" {
 		current.trackDesktopRequest(message, &desktopRequest{method: message.method})
 	}
 	return current.writeUpstream(ctx, websocket.MessageText, rewritten)
@@ -149,6 +159,10 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if err != nil || message.idKey == "" || current.coordinator == nil {
 		return errRoutingPolicy
 	}
+	commandProvider, commandRecognized, commandErr := parseProviderCommand(message)
+	if commandErr != nil {
+		return current.writeProviderCommandError(ctx, message.id)
+	}
 	release, err := current.coordinator.LockThread(ctx, threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
@@ -161,10 +175,32 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	if current.coordinator.IsDirty(threadID) || current.effectiveProvider(threadID) != current.provider {
-		if err := current.handoff(ctx, threadID); err != nil {
+	targetProvider := commandProvider
+	if !commandRecognized {
+		targetProvider, err = current.selectedProvider(threadID)
+		if err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
+	}
+	if current.coordinator.IsDirty(threadID) || current.effectiveProvider(threadID) != targetProvider {
+		if err := current.handoff(ctx, threadID, targetProvider); err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
+	}
+	if commandRecognized {
+		if current.selections == nil || current.selections.Set(threadID, targetProvider) != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
+		messages, err := encodeProviderSwitchTurn(message.id, threadID, targetProvider, time.Now())
+		if err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
+		for _, synthetic := range messages {
+			if err := current.writeDownstream(ctx, websocket.MessageText, synthetic); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	current.setActive(threadID, true)
@@ -191,12 +227,20 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		return current.writeHandoffError(ctx, message.id)
 	}
 	defer release()
+	targetProvider, err := current.selectedProvider(threadID)
+	if err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	rewritten, err := rewrite.Line(payload, targetProvider)
+	if err != nil {
+		return errRoutingPolicy
+	}
 
 	seen := make(chan struct{})
 	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
 	current.clearEffectiveProvider(threadID)
 	current.setDetached(threadID, false)
-	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
+	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
 		current.removeDesktopRequest(message.idKey)
 		return err
 	}
@@ -211,7 +255,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	}
 }
 
-func (current *session) handoff(ctx context.Context, threadID string) error {
+func (current *session) handoff(ctx context.Context, threadID, targetProvider string) error {
 	if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
 		return errors.New("provider handoff capability check failed")
 	}
@@ -222,11 +266,11 @@ func (current *session) handoff(ctx context.Context, threadID string) error {
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff unsubscribe failed")
 	}
-	if err := current.internalResume(ctx, threadID); err != nil {
+	if err := current.internalResume(ctx, threadID, targetProvider); err != nil {
 		current.restoreAfterHandoffFailure(threadID)
 		return err
 	}
-	if err := current.coordinator.ResubscribeAll(ctx, threadID, current.provider); err != nil {
+	if err := current.coordinator.ResubscribeAll(ctx, threadID, targetProvider); err != nil {
 		current.clearEffectiveProvider(threadID)
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff resubscribe failed")
@@ -244,8 +288,25 @@ func (current *session) restoreAfterHandoffFailure(threadID string) {
 	_ = current.coordinator.RestoreAll(ctx, threadID)
 }
 
-func (current *session) internalResume(ctx context.Context, threadID string) error {
-	return current.internalResumeWithProvider(ctx, threadID, current.provider, true)
+func (current *session) internalResume(ctx context.Context, threadID, targetProvider string) error {
+	return current.internalResumeWithProvider(ctx, threadID, targetProvider, true)
+}
+
+func (current *session) selectedProvider(threadID string) (string, error) {
+	if current.selections == nil {
+		return current.provider, nil
+	}
+	selected, ok, err := current.selections.Get(threadID)
+	if err != nil {
+		return "", errors.New("read provider selection")
+	}
+	if !ok {
+		return current.provider, nil
+	}
+	if !providerid.Valid(selected) {
+		return "", errors.New("invalid provider selection")
+	}
+	return selected, nil
 }
 
 func (current *session) internalResumeWithProvider(ctx context.Context, threadID, expectedProvider string, reuseTemplate bool) error {
@@ -380,6 +441,14 @@ func (current *session) Restore(ctx context.Context, threadID string) (handoff.P
 
 func (current *session) writeHandoffError(ctx context.Context, id json.RawMessage) error {
 	payload, err := encodeRPCError(id, handoffErrorCode, handoffUnavailableMessage)
+	if err != nil {
+		return err
+	}
+	return current.writeDownstream(ctx, websocket.MessageText, payload)
+}
+
+func (current *session) writeProviderCommandError(ctx context.Context, id json.RawMessage) error {
+	payload, err := encodeRPCError(id, providerCommandErrorCode, invalidProviderCommandMessage)
 	if err != nil {
 		return err
 	}

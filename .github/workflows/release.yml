@@ -53,6 +53,16 @@ jobs:
       - name: Run race detector
         run: go test -race ./...
 
+      - name: Validate provider plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m json.tool plugins/codex-provider-switcher/.codex-plugin/plugin.json >/dev/null
+          test -f plugins/codex-provider-switcher/skills/provider/SKILL.md
+          test -f plugins/codex-provider-switcher/skills/provider/agents/openai.yaml
+          grep -Fx 'name: provider' plugins/codex-provider-switcher/skills/provider/SKILL.md
+          grep -Fx '  allow_implicit_invocation: false' plugins/codex-provider-switcher/skills/provider/agents/openai.yaml
+
   build:
     name: Package ${{ matrix.target }}
     needs: quality
@@ -101,8 +111,11 @@ jobs:
             -o "$root/codex-provider-switcher" \
             ./cmd/codex-provider-switcher
           cp README.md LICENSE THIRD_PARTY_NOTICES "$root/"
+          mkdir -p "$root/plugins"
+          cp -R plugins/codex-provider-switcher "$root/plugins/"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
           tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/THIRD_PARTY_NOTICES"
+          tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/plugins/codex-provider-switcher/skills/provider/SKILL.md"
           (cd dist && sha256sum "${name}.tar.gz" >"${name}.tar.gz.sha256")
 
       - name: Upload packaged target
