@@ -41,6 +41,17 @@ func TestParseProviderCommandRecognizesStrictControlInputs(t *testing.T) {
 			action:   providerCommandSwitch,
 			provider: "provider_1.test",
 		},
+		{
+			name:   "Desktop Markdown status",
+			input:  `{"id":5,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"  [$provider](/home/user/.agents/skills/provider/SKILL.md) status  ","text_elements":[]}]}}`,
+			action: providerCommandStatus,
+		},
+		{
+			name:     "Desktop Markdown switch",
+			input:    `{"id":6,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/Users/test/.agents/skills/provider/SKILL.md) switch provider_1.test"}]}}`,
+			action:   providerCommandSwitch,
+			provider: "provider_1.test",
+		},
 	}
 
 	for _, tt := range tests {
@@ -70,6 +81,12 @@ func TestParseProviderCommandRejectsMalformedControlsWithoutLeaking(t *testing.T
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status"},"secret-invalid-item"]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider"},{"type":"skill","name":"provider","path":"/secret/SKILL.md"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider status"},{"type":"text","text":"secret"},{"type":"skill","name":"provider","path":"/skill/SKILL.md"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md)"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) switch secret/bad"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) status trailing secret"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md) status"},{"type":"image","url":"secret-url"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md)status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider/SKILL.md)switch openai"}]}}`,
 	}
 	for _, input := range inputs {
 		message, err := parseRPCMessage([]byte(input))
@@ -96,6 +113,15 @@ func TestParseProviderCommandForwardsOrdinaryMessages(t *testing.T) {
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider status"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$other openai"},{"type":"skill","name":"other","path":"/skill/SKILL.md"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"Explain [$provider](/home/user/.agents/skills/provider/SKILL.md) status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$other](/home/user/.agents/skills/provider/SKILL.md) status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](relative/provider/SKILL.md) status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/other/SKILL.md) status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills/provider)/SKILL.md) status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/.agents/skills\n/provider/SKILL.md) status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider]() status"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"[$provider](/home/user/\u0000/provider/SKILL.md) status"}]}}`,
+		"{\"id\":1,\"method\":\"turn/start\",\"params\":{\"threadId\":\"thr-a\",\"input\":[{\"type\":\"text\",\"text\":\"```text\\n[$provider](/home/user/.agents/skills/provider/SKILL.md) status\\n```\"}]}}",
 	}
 	for _, input := range inputs {
 		message, err := parseRPCMessage([]byte(input))

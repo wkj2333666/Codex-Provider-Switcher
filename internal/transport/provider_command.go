@@ -5,13 +5,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path"
 	"strings"
 	"time"
+	"unicode"
 
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
-const invalidProviderCommandMessage = "invalid provider command; use /provider status or /provider switch <name>"
+const (
+	invalidProviderCommandMessage = "invalid provider command; use /provider status or /provider switch <name>"
+	providerMarkdownPrefix        = "[$provider]("
+)
 
 type providerCommandAction uint8
 
@@ -75,7 +80,12 @@ func parseProviderCommand(message rpcMessage) (providerCommand, bool, error) {
 			marker = fields[0]
 			arguments = fields[1:]
 		default:
-			continue
+			var markdown bool
+			arguments, markdown = parseProviderMarkdownArguments(item.Text)
+			if !markdown {
+				continue
+			}
+			marker = providerMarkdownPrefix
 		}
 		if commandIndex != -1 {
 			return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
@@ -110,6 +120,10 @@ func parseProviderCommand(message rpcMessage) (providerCommand, bool, error) {
 		if !skillValid {
 			return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 		}
+	} else if commandMarker == providerMarkdownPrefix {
+		if len(items) != 1 {
+			return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
+		}
 	} else if len(items) != 1 {
 		return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 	}
@@ -122,6 +136,30 @@ func parseProviderCommand(message rpcMessage) (providerCommand, bool, error) {
 	default:
 		return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 	}
+}
+
+func parseProviderMarkdownArguments(text string) ([]string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, providerMarkdownPrefix) {
+		return nil, false
+	}
+	remainder := trimmed[len(providerMarkdownPrefix):]
+	closing := strings.IndexByte(remainder, ')')
+	if closing < 0 {
+		return nil, false
+	}
+	skillPath := remainder[:closing]
+	cleaned := path.Clean(skillPath)
+	if skillPath == "" || strings.ContainsRune(skillPath, '\x00') ||
+		strings.ContainsAny(skillPath, "\r\n") || !path.IsAbs(skillPath) ||
+		!strings.HasSuffix(cleaned, "/provider/SKILL.md") {
+		return nil, false
+	}
+	tail := remainder[closing+1:]
+	if tail != "" && strings.IndexFunc(tail, unicode.IsSpace) != 0 {
+		return nil, true
+	}
+	return strings.Fields(tail), true
 }
 
 type syntheticTurn struct {

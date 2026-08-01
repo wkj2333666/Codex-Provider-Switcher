@@ -1,6 +1,6 @@
 {
   "name": "codex-provider-switcher",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Inspect or switch the active model provider for a Codex task without invoking a model.",
   "author": {
     "name": "wkj2333666",
