@@ -97,15 +97,24 @@ For an idle cross-provider send, the downstream pump pauses the original
 ```text
 thread flock
   -> prepare every live peer (no mutation)
+  -> prepareHandoff capability check for subscription restoration
   -> unsubscribe every ready peer
   -> internal thread/resume with requested modelProvider
   -> verify returned thread id and modelProvider
+  -> resubscribe detached peers with the verified provider
   -> forward original turn/start
 ```
 
 Ordinary `thread/resume` uses the same lock and holds it through the app-server
 response, so a new subscriber cannot appear midway through handoff. Internal
 request ids and their responses never reach Desktop.
+
+Only peers whose coordinator unsubscribe actually detached an existing
+subscription are resumed. That resume restores the app-server listener before
+the turn begins, so previously open Desktop views continue receiving item and
+turn notifications. Explicit Desktop unsubscribe clears detach state and is
+never reversed. Any resubscribe failure clears the sender's provider cache and
+fails the turn, forcing a complete transition on retry.
 
 The WebSocket library handles client masking, 7/16/64-bit payload lengths,
 fragment reassembly, ping, pong, and close control frames. Message frame
@@ -148,6 +157,16 @@ the prepare phase before any unsubscribe occurs. A second-phase failure, a
 non-switcher subscriber, an older server, or a returned provider mismatch keeps
 the original turn from reaching app-server and produces static JSON-RPC error
 `-32090`.
+
+The prepare phase runs for every send, including the same-provider path. The
+sender marks its thread active before writing upstream while still holding the
+cross-process lock; a second peer therefore observes `busy` even if its
+app-server `turn/started` notification has not arrived yet.
+
+Cross-provider sends then use the distinct `prepareHandoff` control method.
+Pre-resubscribe switcher versions reject that method, so a mixed-version
+deployment fails before any peer is unsubscribed. Reconnecting every Desktop
+SSH alias after upgrading activates the new protocol on all live proxies.
 
 The remote SSH account and every process running as the same Unix user are
 trusted at the account-authority level. Such a caller can already bypass the

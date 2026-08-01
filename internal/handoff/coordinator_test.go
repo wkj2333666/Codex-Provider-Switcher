@@ -2,6 +2,7 @@ package handoff
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -59,6 +60,56 @@ func TestPrepareAllAbortsBeforeUnsubscribeWhenPeerBusy(t *testing.T) {
 	}
 }
 
+func TestPrepareHandoffAllRejectsLegacyPeerBeforeMutation(t *testing.T) {
+	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
+	legacyPath := filepath.Join(coordinator.directory, "session-legacy.sock")
+	listener, err := net.Listen("unix", legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(legacyPath)
+	})
+	methodSeen := make(chan string, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		data, readErr := readControlMessage(connection)
+		if readErr != nil {
+			return
+		}
+		var request controlRequest
+		if json.Unmarshal(data, &request) != nil {
+			return
+		}
+		methodSeen <- request.Method
+		response := controlResponse{Status: StatusReady}
+		if request.Method != "prepare" {
+			response = controlResponse{Error: true}
+		}
+		encoded, _ := json.Marshal(response)
+		_, _ = connection.Write(append(encoded, '\n'))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.PrepareHandoffAll(ctx, "thr-a"); err == nil {
+		t.Fatal("PrepareHandoffAll() error = nil with legacy peer")
+	}
+	select {
+	case method := <-methodSeen:
+		if method != "prepareHandoff" {
+			t.Fatalf("legacy peer method = %q", method)
+		}
+	case <-ctx.Done():
+		t.Fatal("legacy peer did not receive capability probe")
+	}
+}
+
 func TestUnsubscribeAllContactsEveryLivePeer(t *testing.T) {
 	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
 	handlers := []*testHandler{
@@ -82,6 +133,30 @@ func TestUnsubscribeAllContactsEveryLivePeer(t *testing.T) {
 	for index, handler := range handlers {
 		if got := handler.unsubscribeCalls(); got != 1 {
 			t.Fatalf("handler %d unsubscribe calls = %d", index, got)
+		}
+	}
+}
+
+func TestResubscribeAllRestoresEveryDetachedPeerWithEffectiveProvider(t *testing.T) {
+	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
+	handlers := []*testHandler{
+		{prepare: StatusReady, resubscribe: StatusResubscribed},
+		{prepare: StatusReady, resubscribe: StatusNotSubscribed},
+	}
+	coordinators := make([]*Coordinator, 0, len(handlers))
+	for _, handler := range handlers {
+		coordinators = append(coordinators, openTestCoordinatorForSocket(t, appSocket, handler))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinators[0].ResubscribeAll(ctx, "thr-a", "sub2api"); err != nil {
+		t.Fatalf("ResubscribeAll() error = %v", err)
+	}
+	for index, handler := range handlers {
+		calls, provider := handler.resubscribeResult()
+		if calls != 1 || provider != "sub2api" {
+			t.Fatalf("handler %d resubscribe = %d, %q", index, calls, provider)
 		}
 	}
 }
@@ -119,7 +194,10 @@ type testHandler struct {
 	mu          sync.Mutex
 	prepare     PeerStatus
 	unsubscribe PeerStatus
+	resubscribe PeerStatus
 	calls       int
+	resumeCalls int
+	provider    string
 }
 
 func (handler *testHandler) Prepare(string) PeerStatus {
@@ -135,10 +213,24 @@ func (handler *testHandler) Unsubscribe(context.Context, string) (PeerStatus, er
 	return handler.unsubscribe, nil
 }
 
+func (handler *testHandler) Resubscribe(_ context.Context, _, provider string) (PeerStatus, error) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.resumeCalls++
+	handler.provider = provider
+	return handler.resubscribe, nil
+}
+
 func (handler *testHandler) unsubscribeCalls() int {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	return handler.calls
+}
+
+func (handler *testHandler) resubscribeResult() (int, string) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.resumeCalls, handler.provider
 }
 
 func openTestCoordinator(t *testing.T, handler Handler) *Coordinator {

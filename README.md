@@ -200,17 +200,28 @@ message:
 
 ```text
 open in sub2api alias -> view only, no provider change
-send next message     -> unsubscribe idle peers -> resume with sub2api -> start turn
+send next message     -> unsubscribe idle peers -> resume with sub2api
+                      -> resubscribe detached peers -> start turn
 ```
 
 The handoff keeps the same thread id and persisted history. It does not restart
 the shared daemon, create another daemon, edit SQLite, fork the task, or change
 either daemon PID.
 
+Peers that had the task open are detached only long enough to replace the idle
+runtime. The switcher internally resumes those peers with the newly verified
+provider before forwarding the original turn. Their internal resume responses
+remain hidden, but previously open Desktop views receive the new turn's normal
+item and lifecycle notifications and stay synchronized. A Desktop connection
+that explicitly unsubscribed is not reattached.
+
 An active turn is never interrupted or stolen. If another alias is still
 running a turn, a client bypassed the switcher, or app-server cannot confirm the
 requested provider, the new `turn/start` is not forwarded. Desktop receives a
 JSON-RPC `-32090` error and can retry after the active turn finishes.
+The same peer activity check also runs on the same-provider path, closing the
+window where two aliases could submit before the second received
+`turn/started`.
 
 Automatic handoff requires Codex CLI 0.146.0 or newer. Older app-server
 versions do not provide the idle zero-subscriber replacement behavior needed

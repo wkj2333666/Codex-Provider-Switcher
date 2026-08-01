@@ -25,7 +25,9 @@ const (
 type handoffCoordinator interface {
 	LockThread(context.Context, string) (func(), error)
 	PrepareAll(context.Context, string) error
+	PrepareHandoffAll(context.Context, string) error
 	UnsubscribeAll(context.Context, string) error
+	ResubscribeAll(context.Context, string, string) error
 	Close() error
 }
 
@@ -51,6 +53,7 @@ type session struct {
 	desktop           map[string]*desktopRequest
 	resumeTemplates   map[string]map[string]json.RawMessage
 	effective         map[string]string
+	detached          map[string]bool
 	active            map[string]bool
 	internalPrefix    string
 	sequence          atomic.Uint64
@@ -76,6 +79,7 @@ func newSessionState(provider, appServerSocket string, upstreamWrite, downstream
 		desktop:         make(map[string]*desktopRequest),
 		resumeTemplates: make(map[string]map[string]json.RawMessage),
 		effective:       make(map[string]string),
+		detached:        make(map[string]bool),
 		active:          make(map[string]bool),
 		internalPrefix:  "cps-" + hex.EncodeToString(prefixBytes),
 		closed:          make(chan struct{}),
@@ -119,6 +123,7 @@ func (current *session) handleThreadUnsubscribe(ctx context.Context, message rpc
 	seen := make(chan struct{})
 	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
 	current.clearEffectiveProvider(threadID)
+	current.setDetached(threadID, false)
 	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
 		current.removeDesktopRequest(message.idKey)
 		return err
@@ -146,6 +151,9 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	defer release()
 
 	if current.isActive(threadID) {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
 	if current.effectiveProvider(threadID) != current.provider {
@@ -182,6 +190,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	seen := make(chan struct{})
 	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
 	current.clearEffectiveProvider(threadID)
+	current.setDetached(threadID, false)
 	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
 		current.removeDesktopRequest(message.idKey)
 		return err
@@ -198,35 +207,50 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 }
 
 func (current *session) handoff(ctx context.Context, threadID string) error {
-	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
-		return errors.New("provider handoff prepare failed")
+	if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
+		return errors.New("provider handoff capability check failed")
 	}
 	if err := current.coordinator.UnsubscribeAll(ctx, threadID); err != nil {
 		return errors.New("provider handoff unsubscribe failed")
 	}
-	return current.internalResume(ctx, threadID)
+	if err := current.internalResume(ctx, threadID); err != nil {
+		return err
+	}
+	if err := current.coordinator.ResubscribeAll(ctx, threadID, current.provider); err != nil {
+		current.clearEffectiveProvider(threadID)
+		return errors.New("provider handoff resubscribe failed")
+	}
+	return nil
 }
 
 func (current *session) internalResume(ctx context.Context, threadID string) error {
-	current.stateMu.Lock()
-	params := cloneRawMap(current.resumeTemplates[threadID])
-	current.stateMu.Unlock()
+	return current.internalResumeWithProvider(ctx, threadID, current.provider, true)
+}
+
+func (current *session) internalResumeWithProvider(ctx context.Context, threadID, expectedProvider string, reuseTemplate bool) error {
+	var params map[string]json.RawMessage
+	if reuseTemplate {
+		current.stateMu.Lock()
+		params = cloneRawMap(current.resumeTemplates[threadID])
+		current.stateMu.Unlock()
+	}
 	if params == nil {
 		params = make(map[string]json.RawMessage)
 	}
 	params["threadId"] = rawJSONString(threadID)
-	params["modelProvider"] = rawJSONString(current.provider)
+	params["modelProvider"] = rawJSONString(expectedProvider)
 
 	response, err := current.callUpstream(ctx, "thread/resume", params)
 	if err != nil {
 		return err
 	}
 	responseThreadID, provider, ok := responseThreadProvider(response)
-	if !ok || responseThreadID != threadID || provider != current.provider {
+	if !ok || responseThreadID != threadID || provider != expectedProvider {
 		return errors.New("provider handoff verification failed")
 	}
 	current.stateMu.Lock()
 	current.effective[threadID] = provider
+	delete(current.detached, threadID)
 	current.stateMu.Unlock()
 	return nil
 }
@@ -271,10 +295,14 @@ func (current *session) Unsubscribe(ctx context.Context, threadID string) (hando
 	if current.isActive(threadID) {
 		return handoff.StatusBusy, nil
 	}
+	wasSubscribed := current.effectiveProvider(threadID) != "" || current.isDetached(threadID)
 	response, err := current.callUpstream(ctx, "thread/unsubscribe", map[string]json.RawMessage{
 		"threadId": rawJSONString(threadID),
 	})
 	current.clearEffectiveProvider(threadID)
+	if wasSubscribed {
+		current.setDetached(threadID, true)
+	}
 	if err != nil || response.result == nil {
 		return "", errors.New("unsubscribe app-server thread")
 	}
@@ -285,7 +313,25 @@ func (current *session) Unsubscribe(ctx context.Context, threadID string) (hando
 	if status != handoff.StatusUnsubscribed && status != handoff.StatusNotSubscribed && status != handoff.StatusNotLoaded {
 		return "", errors.New("unsupported thread unsubscribe status")
 	}
+	if status == handoff.StatusUnsubscribed {
+		current.setDetached(threadID, true)
+	}
 	return status, nil
+}
+
+// Resubscribe implements handoff.Handler for a connection detached during the
+// coordinated provider transition.
+func (current *session) Resubscribe(ctx context.Context, threadID, provider string) (handoff.PeerStatus, error) {
+	if !current.isDetached(threadID) {
+		return handoff.StatusNotSubscribed, nil
+	}
+	if provider == "" {
+		return "", errors.New("invalid provider handoff resubscribe")
+	}
+	if err := current.internalResumeWithProvider(ctx, threadID, provider, false); err != nil {
+		return "", errors.New("resubscribe app-server thread")
+	}
+	return handoff.StatusResubscribed, nil
 }
 
 func (current *session) writeHandoffError(ctx context.Context, id json.RawMessage) error {
@@ -364,12 +410,14 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 			if threadID, provider, ok := responseThreadProvider(message); ok &&
 				(request.method == "thread/start" || request.method == "thread/resume" || request.method == "thread/fork") {
 				current.effective[threadID] = provider
+				delete(current.detached, threadID)
 			}
 			if request.method == "turn/start" && message.hasError {
 				delete(current.active, request.threadID)
 			}
 			if request.method == "thread/unsubscribe" && !message.hasError {
 				delete(current.effective, request.threadID)
+				delete(current.detached, request.threadID)
 			}
 		}
 		current.stateMu.Unlock()
@@ -390,7 +438,7 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 			}
 		case "thread/closed":
 			if message.threadID != "" {
-				current.clearEffectiveProvider(message.threadID)
+				current.clearThreadRoutingState(message.threadID)
 			}
 		}
 	}
@@ -456,6 +504,29 @@ func (current *session) clearEffectiveProvider(threadID string) {
 	current.stateMu.Lock()
 	defer current.stateMu.Unlock()
 	delete(current.effective, threadID)
+}
+
+func (current *session) clearThreadRoutingState(threadID string) {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	delete(current.effective, threadID)
+	delete(current.detached, threadID)
+}
+
+func (current *session) setDetached(threadID string, detached bool) {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	if detached {
+		current.detached[threadID] = true
+	} else {
+		delete(current.detached, threadID)
+	}
+}
+
+func (current *session) isDetached(threadID string) bool {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	return current.detached[threadID]
 }
 
 func (current *session) setActive(threadID string, active bool) {
