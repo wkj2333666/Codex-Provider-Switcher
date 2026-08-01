@@ -39,6 +39,36 @@ func TestSessionConsumesInternalResponse(t *testing.T) {
 	}
 }
 
+func TestSessionConsumesLateInternalResponseAfterCallerTimeout(t *testing.T) {
+	t.Parallel()
+	var upstream, downstream messageRecorder
+	session := newTestSession(t, upstream.write, downstream.write)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := session.callUpstream(ctx, "thread/resume", map[string]json.RawMessage{
+		"threadId": json.RawMessage(`"thr-a"`),
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("callUpstream() error = %v", err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 1 {
+		t.Fatalf("upstream messages = %q", messages)
+	}
+	request, err := parseRPCMessage(messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := []byte(fmt.Sprintf(`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, request.idKey))
+	if err := session.handleUpstreamText(context.Background(), response); err != nil {
+		t.Fatal(err)
+	}
+	if got := downstream.messages(); len(got) != 0 {
+		t.Fatalf("late internal response leaked downstream: %q", got)
+	}
+}
+
 func TestSessionForwardsDesktopResponseByteForByte(t *testing.T) {
 	t.Parallel()
 	var downstream messageRecorder
@@ -142,6 +172,45 @@ func TestSessionClearsProviderAfterDesktopUnsubscribeAndThreadClose(t *testing.T
 	}
 }
 
+func TestSessionClearsProviderWhenDesktopSubscriptionResponseIsUncertain(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		request []byte
+	}{
+		{
+			name:    "resume",
+			request: []byte(`{"id":5,"method":"thread/resume","params":{"threadId":"thr-a"}}`),
+		},
+		{
+			name:    "unsubscribe",
+			request: []byte(`{"id":6,"method":"thread/unsubscribe","params":{"threadId":"thr-a"}}`),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var upstream messageRecorder
+			current := newTestSession(t, upstream.write, nil)
+			current.coordinator = &fakeHandoffCoordinator{}
+			current.stateMu.Lock()
+			current.effective["thr-a"] = "sub2api"
+			current.stateMu.Unlock()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := current.handleDownstreamText(ctx, test.request); !errors.Is(err, context.Canceled) {
+				t.Fatalf("handleDownstreamText() error = %v", err)
+			}
+			if len(upstream.messages()) != 1 {
+				t.Fatalf("upstream messages = %q", upstream.messages())
+			}
+			if got := current.effectiveProvider("thr-a"); got != "" {
+				t.Fatalf("effective provider after uncertain response = %q", got)
+			}
+		})
+	}
+}
+
 func TestSessionUnsubscribeConsumesResponseAndClearsProvider(t *testing.T) {
 	t.Parallel()
 	var current *session
@@ -176,6 +245,27 @@ func TestSessionUnsubscribeConsumesResponseAndClearsProvider(t *testing.T) {
 	request, err := parseRPCMessage(messages[0])
 	if err != nil || request.method != "thread/unsubscribe" || request.threadID != "thr-a" {
 		t.Fatalf("unsubscribe request = %#v, %v", request, err)
+	}
+}
+
+func TestSessionUnsubscribeClearsProviderWhenResponseIsUncertain(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.stateMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := current.Unsubscribe(ctx, "thr-a"); err == nil {
+		t.Fatal("Unsubscribe() unexpectedly succeeded")
+	}
+	if len(upstream.messages()) != 1 {
+		t.Fatalf("upstream messages = %q", upstream.messages())
+	}
+	if got := current.effectiveProvider("thr-a"); got != "" {
+		t.Fatalf("effective provider after uncertain unsubscribe = %q", got)
 	}
 }
 
@@ -275,6 +365,35 @@ func TestSessionReturnsStaticErrorWhenHandoffFails(t *testing.T) {
 	}
 	if bytes.Contains(messages[0], []byte("secret prompt")) || bytes.Contains(messages[0], []byte("secret peer")) {
 		t.Fatalf("handoff error leaked details: %s", messages[0])
+	}
+}
+
+func TestSessionRejectsDuplicateTurnStartWithoutClearingActiveState(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	var upstream, downstream messageRecorder
+	current := newTestSession(t, upstream.write, downstream.write)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.active["thr-a"] = true
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":10,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(upstream.messages()) != 0 {
+		t.Fatalf("duplicate turn was forwarded upstream: %q", upstream.messages())
+	}
+	if len(downstream.messages()) != 1 {
+		t.Fatalf("downstream messages = %q", downstream.messages())
+	}
+	if !current.isActive("thr-a") {
+		t.Fatal("duplicate turn cleared active state")
+	}
+	if status := current.Prepare("thr-a"); status != handoff.StatusBusy {
+		t.Fatalf("Prepare() after duplicate turn = %q", status)
 	}
 }
 

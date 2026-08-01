@@ -118,6 +118,7 @@ func (current *session) handleThreadUnsubscribe(ctx context.Context, message rpc
 
 	seen := make(chan struct{})
 	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
+	current.clearEffectiveProvider(threadID)
 	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
 		current.removeDesktopRequest(message.idKey)
 		return err
@@ -144,6 +145,9 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	}
 	defer release()
 
+	if current.isActive(threadID) {
+		return current.writeHandoffError(ctx, message.id)
+	}
 	if current.effectiveProvider(threadID) != current.provider {
 		if err := current.handoff(ctx, threadID); err != nil {
 			return current.writeHandoffError(ctx, message.id)
@@ -177,6 +181,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 
 	seen := make(chan struct{})
 	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
+	current.clearEffectiveProvider(threadID)
 	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
 		current.removeDesktopRequest(message.idKey)
 		return err
@@ -243,7 +248,7 @@ func (current *session) callUpstream(ctx context.Context, method string, params 
 		return rpcMessage{}, err
 	}
 	if err := current.writeUpstream(callCtx, websocket.MessageText, payload); err != nil {
-		current.removeInternalRequest(idKey)
+		current.abandonInternalRequest(idKey)
 		return rpcMessage{}, err
 	}
 	select {
@@ -253,10 +258,10 @@ func (current *session) callUpstream(ctx context.Context, method string, params 
 		}
 		return response, nil
 	case <-callCtx.Done():
-		current.removeInternalRequest(idKey)
+		current.abandonInternalRequest(idKey)
 		return rpcMessage{}, callCtx.Err()
 	case <-current.closed:
-		current.removeInternalRequest(idKey)
+		current.abandonInternalRequest(idKey)
 		return rpcMessage{}, errors.New("provider handoff session closed")
 	}
 }
@@ -269,6 +274,7 @@ func (current *session) Unsubscribe(ctx context.Context, threadID string) (hando
 	response, err := current.callUpstream(ctx, "thread/unsubscribe", map[string]json.RawMessage{
 		"threadId": rawJSONString(threadID),
 	})
+	current.clearEffectiveProvider(threadID)
 	if err != nil || response.result == nil {
 		return "", errors.New("unsubscribe app-server thread")
 	}
@@ -279,9 +285,6 @@ func (current *session) Unsubscribe(ctx context.Context, threadID string) (hando
 	if status != handoff.StatusUnsubscribed && status != handoff.StatusNotSubscribed && status != handoff.StatusNotLoaded {
 		return "", errors.New("unsupported thread unsubscribe status")
 	}
-	current.stateMu.Lock()
-	delete(current.effective, threadID)
-	current.stateMu.Unlock()
 	return status, nil
 }
 
@@ -314,6 +317,14 @@ func (current *session) removeInternalRequest(idKey string) {
 	current.stateMu.Unlock()
 }
 
+func (current *session) abandonInternalRequest(idKey string) {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	if _, ok := current.internal[idKey]; ok {
+		current.internal[idKey] = nil
+	}
+}
+
 func cloneRawMap(source map[string]json.RawMessage) map[string]json.RawMessage {
 	if source == nil {
 		return nil
@@ -341,7 +352,9 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 		if waiter, ok := current.internal[message.idKey]; ok {
 			delete(current.internal, message.idKey)
 			current.stateMu.Unlock()
-			waiter <- message
+			if waiter != nil {
+				waiter <- message
+			}
 			return nil
 		}
 
