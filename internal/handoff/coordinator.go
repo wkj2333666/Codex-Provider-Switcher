@@ -36,6 +36,7 @@ const (
 	StatusNotSubscribed PeerStatus = "notSubscribed"
 	StatusNotLoaded     PeerStatus = "notLoaded"
 	StatusResubscribed  PeerStatus = "resubscribed"
+	StatusRestored      PeerStatus = "restored"
 )
 
 // Handler applies peer requests to one proxy connection.
@@ -43,6 +44,7 @@ type Handler interface {
 	Prepare(threadID string) PeerStatus
 	Unsubscribe(context.Context, string) (PeerStatus, error)
 	Resubscribe(context.Context, string, string) (PeerStatus, error)
+	Restore(context.Context, string) (PeerStatus, error)
 }
 
 // Coordinator exposes one peer endpoint and discovers other live endpoints in
@@ -104,8 +106,7 @@ func (coordinator *Coordinator) LockThread(ctx context.Context, threadID string)
 	if threadID == "" {
 		return nil, errors.New("invalid thread handoff lock")
 	}
-	digest := sha256.Sum256([]byte(threadID))
-	path := filepath.Join(coordinator.directory, "lock-"+hex.EncodeToString(digest[:16])+".lock")
+	path := coordinator.threadStatePath("lock", threadID, ".lock")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, errors.New("open thread handoff lock")
@@ -151,9 +152,48 @@ func (coordinator *Coordinator) PrepareAll(ctx context.Context, threadID string)
 // PrepareHandoffAll verifies that every peer supports subscription restoration
 // before the first unsubscribe mutates app-server state.
 func (coordinator *Coordinator) PrepareHandoffAll(ctx context.Context, threadID string) error {
-	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareHandoff", ThreadID: threadID}, func(status PeerStatus) bool {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareHandoffV2", ThreadID: threadID}, func(status PeerStatus) bool {
 		return status == StatusReady
 	})
+}
+
+// MarkDirty persists incomplete handoff state across every live proxy process.
+func (coordinator *Coordinator) MarkDirty(threadID string) error {
+	if threadID == "" {
+		return errors.New("invalid dirty handoff thread")
+	}
+	file, err := os.OpenFile(coordinator.threadStatePath("dirty", threadID, ".state"), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return errors.New("mark dirty handoff thread")
+	}
+	if err := file.Close(); err != nil {
+		return errors.New("close dirty handoff marker")
+	}
+	return nil
+}
+
+// IsDirty reports whether a prior handoff may have left peer state divergent.
+func (coordinator *Coordinator) IsDirty(threadID string) bool {
+	if threadID == "" {
+		return true
+	}
+	_, err := os.Lstat(coordinator.threadStatePath("dirty", threadID, ".state"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return true
+}
+
+// ClearDirty removes the marker only after every handoff phase succeeds.
+func (coordinator *Coordinator) ClearDirty(threadID string) error {
+	if threadID == "" {
+		return errors.New("invalid dirty handoff thread")
+	}
+	err := os.Remove(coordinator.threadStatePath("dirty", threadID, ".state"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.New("clear dirty handoff thread")
+	}
+	return nil
 }
 
 // UnsubscribeAll removes every cooperating connection's subscription.
@@ -174,6 +214,13 @@ func (coordinator *Coordinator) ResubscribeAll(ctx context.Context, threadID, pr
 	}, func(status PeerStatus) bool {
 		return status == StatusResubscribed || status == StatusNotSubscribed
 	})
+}
+
+// RestoreAll attempts every peer even when one restore fails.
+func (coordinator *Coordinator) RestoreAll(ctx context.Context, threadID string) error {
+	return coordinator.visitPeersMode(ctx, controlRequest{Method: "restore", ThreadID: threadID}, func(status PeerStatus) bool {
+		return status == StatusRestored || status == StatusNotSubscribed
+	}, true)
 }
 
 // Close removes this peer endpoint.
@@ -216,7 +263,7 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 	switch request.Method {
 	case "prepare":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
-	case "prepareHandoff":
+	case "prepareHandoffV2":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
 	case "unsubscribe":
 		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
@@ -240,6 +287,15 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 		} else {
 			response.Status = status
 		}
+	case "restore":
+		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+		defer cancel()
+		status, err := coordinator.handler.Restore(ctx, request.ThreadID)
+		if err != nil {
+			response.Error = true
+		} else {
+			response.Status = status
+		}
 	default:
 		response.Error = true
 	}
@@ -255,6 +311,10 @@ func (coordinator *Coordinator) writeControlResponse(connection net.Conn, respon
 }
 
 func (coordinator *Coordinator) visitPeers(ctx context.Context, request controlRequest, accept func(PeerStatus) bool) error {
+	return coordinator.visitPeersMode(ctx, request, accept, false)
+}
+
+func (coordinator *Coordinator) visitPeersMode(ctx context.Context, request controlRequest, accept func(PeerStatus) bool, bestEffort bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -263,6 +323,7 @@ func (coordinator *Coordinator) visitPeers(ctx context.Context, request controlR
 		return errors.New("list provider handoff peers")
 	}
 	sort.Strings(paths)
+	failed := false
 	for _, path := range paths {
 		status, stale, err := callPeer(ctx, path, request)
 		if stale {
@@ -270,10 +331,21 @@ func (coordinator *Coordinator) visitPeers(ctx context.Context, request controlR
 			continue
 		}
 		if err != nil || !accept(status) {
-			return errors.New("provider handoff peer unavailable")
+			failed = true
+			if !bestEffort {
+				return errors.New("provider handoff peer unavailable")
+			}
 		}
 	}
+	if failed {
+		return errors.New("provider handoff peer unavailable")
+	}
 	return nil
+}
+
+func (coordinator *Coordinator) threadStatePath(prefix, threadID, suffix string) string {
+	digest := sha256.Sum256([]byte(threadID))
+	return filepath.Join(coordinator.directory, prefix+"-"+hex.EncodeToString(digest[:16])+suffix)
 }
 
 func callPeer(ctx context.Context, path string, request controlRequest) (PeerStatus, bool, error) {

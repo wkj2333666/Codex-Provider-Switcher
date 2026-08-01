@@ -343,6 +343,42 @@ func TestSessionDoesNotResubscribeThreadThatPeerDidNotDetach(t *testing.T) {
 	}
 }
 
+func TestSessionRestoreDetachedThreadAcceptsActualProvider(t *testing.T) {
+	t.Parallel()
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if _, ok := message.params["modelProvider"]; ok {
+			return errors.New("restore requested a provider override")
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+			`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"openai"}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.setDetached("thr-a", true)
+
+	status, err := current.Restore(context.Background(), "thr-a")
+	if err != nil || status != handoff.StatusRestored {
+		t.Fatalf("Restore() = %q, %v", status, err)
+	}
+	if current.isDetached("thr-a") {
+		t.Fatal("restored thread remained detached")
+	}
+	if got := current.effectiveProvider("thr-a"); got != "openai" {
+		t.Fatalf("effective provider after restore = %q", got)
+	}
+	if len(upstream.messages()) != 1 {
+		t.Fatalf("upstream messages = %q", upstream.messages())
+	}
+}
+
 func TestSessionSwitchesProviderBeforeTurnStart(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
@@ -535,6 +571,93 @@ func TestSessionRetriesFullHandoffAfterResubscribeFailure(t *testing.T) {
 	}
 }
 
+func TestSessionRestoresPeersWhenSenderResumeFails(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	var current *session
+	var upstream, downstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"openai"}}`, message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, downstream.write)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "openai"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":15,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.markDirtyCalls != 1 || coordinator.restoreCalls != 1 || coordinator.clearDirtyCalls != 0 || !coordinator.dirty {
+		t.Fatalf("coordinator recovery state = %#v", coordinator)
+	}
+	if len(upstream.messages()) != 1 || len(downstream.messages()) != 1 {
+		t.Fatalf("upstream = %q, downstream = %q", upstream.messages(), downstream.messages())
+	}
+}
+
+func TestSessionDirtyStateForcesDifferentPeerToRepairPartialResubscribe(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{resubscribeErr: errors.New("partial peer failure")}
+	first := newResponsiveResumeSession(t, coordinator, "sub2api")
+	first.stateMu.Lock()
+	first.effective["thr-a"] = "openai"
+	first.stateMu.Unlock()
+
+	firstRequest := []byte(`{"id":16,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := first.handleDownstreamText(context.Background(), firstRequest); err != nil {
+		t.Fatal(err)
+	}
+	if !coordinator.dirty {
+		t.Fatal("partial resubscribe did not leave global dirty state")
+	}
+
+	coordinator.resubscribeErr = nil
+	second := newResponsiveResumeSession(t, coordinator, "sub2api")
+	second.stateMu.Lock()
+	second.effective["thr-a"] = "sub2api"
+	second.stateMu.Unlock()
+	secondRequest := []byte(`{"id":17,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := second.handleDownstreamText(context.Background(), secondRequest); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.unsubscribeCalls != 2 || coordinator.resubscribeCalls != 2 ||
+		coordinator.restoreCalls != 1 || coordinator.clearDirtyCalls != 1 || coordinator.dirty {
+		t.Fatalf("coordinator recovery state = %#v", coordinator)
+	}
+}
+
+func newResponsiveResumeSession(t *testing.T, coordinator handoffCoordinator, provider string) *session {
+	t.Helper()
+	var current *session
+	writer := func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":%q}}`, message.idKey, provider)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.coordinator = coordinator
+	return current
+}
+
 func TestSessionRejectsDuplicateTurnStartWithoutClearingActiveState(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
@@ -611,11 +734,16 @@ type fakeHandoffCoordinator struct {
 	prepareHandoffCalls int
 	unsubscribeCalls    int
 	resubscribeCalls    int
+	restoreCalls        int
+	markDirtyCalls      int
+	clearDirtyCalls     int
 	releaseCalls        int
 	prepareErr          error
 	prepareHandoffErr   error
 	unsubscribeErr      error
 	resubscribeErr      error
+	restoreErr          error
+	dirty               bool
 }
 
 func (coordinator *fakeHandoffCoordinator) LockThread(context.Context, string) (func(), error) {
@@ -641,6 +769,27 @@ func (coordinator *fakeHandoffCoordinator) UnsubscribeAll(context.Context, strin
 func (coordinator *fakeHandoffCoordinator) ResubscribeAll(context.Context, string, string) error {
 	coordinator.resubscribeCalls++
 	return coordinator.resubscribeErr
+}
+
+func (coordinator *fakeHandoffCoordinator) RestoreAll(context.Context, string) error {
+	coordinator.restoreCalls++
+	return coordinator.restoreErr
+}
+
+func (coordinator *fakeHandoffCoordinator) MarkDirty(string) error {
+	coordinator.markDirtyCalls++
+	coordinator.dirty = true
+	return nil
+}
+
+func (coordinator *fakeHandoffCoordinator) IsDirty(string) bool {
+	return coordinator.dirty
+}
+
+func (coordinator *fakeHandoffCoordinator) ClearDirty(string) error {
+	coordinator.clearDirtyCalls++
+	coordinator.dirty = false
+	return nil
 }
 
 func (coordinator *fakeHandoffCoordinator) Close() error { return nil }

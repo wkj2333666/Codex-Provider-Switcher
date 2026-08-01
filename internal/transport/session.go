@@ -20,6 +20,7 @@ const (
 	handoffErrorCode          = -32090
 	handoffUnavailableMessage = "provider handoff unavailable; retry after the active turn finishes"
 	internalCallTimeout       = 30 * time.Second
+	handoffRecoveryTimeout    = 5 * time.Second
 )
 
 type handoffCoordinator interface {
@@ -28,6 +29,10 @@ type handoffCoordinator interface {
 	PrepareHandoffAll(context.Context, string) error
 	UnsubscribeAll(context.Context, string) error
 	ResubscribeAll(context.Context, string, string) error
+	RestoreAll(context.Context, string) error
+	MarkDirty(string) error
+	IsDirty(string) bool
+	ClearDirty(string) error
 	Close() error
 }
 
@@ -156,7 +161,7 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	if current.effectiveProvider(threadID) != current.provider {
+	if current.coordinator.IsDirty(threadID) || current.effectiveProvider(threadID) != current.provider {
 		if err := current.handoff(ctx, threadID); err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
@@ -210,17 +215,33 @@ func (current *session) handoff(ctx context.Context, threadID string) error {
 	if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
 		return errors.New("provider handoff capability check failed")
 	}
+	if err := current.coordinator.MarkDirty(threadID); err != nil {
+		return errors.New("provider handoff dirty marker failed")
+	}
 	if err := current.coordinator.UnsubscribeAll(ctx, threadID); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff unsubscribe failed")
 	}
 	if err := current.internalResume(ctx, threadID); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
 		return err
 	}
 	if err := current.coordinator.ResubscribeAll(ctx, threadID, current.provider); err != nil {
 		current.clearEffectiveProvider(threadID)
+		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff resubscribe failed")
 	}
+	if err := current.coordinator.ClearDirty(threadID); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
+		return errors.New("provider handoff dirty marker clear failed")
+	}
 	return nil
+}
+
+func (current *session) restoreAfterHandoffFailure(threadID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), handoffRecoveryTimeout)
+	defer cancel()
+	_ = current.coordinator.RestoreAll(ctx, threadID)
 }
 
 func (current *session) internalResume(ctx context.Context, threadID string) error {
@@ -332,6 +353,29 @@ func (current *session) Resubscribe(ctx context.Context, threadID, provider stri
 		return "", errors.New("resubscribe app-server thread")
 	}
 	return handoff.StatusResubscribed, nil
+}
+
+// Restore implements handoff.Handler by reattaching without requesting a
+// provider change.
+func (current *session) Restore(ctx context.Context, threadID string) (handoff.PeerStatus, error) {
+	if !current.isDetached(threadID) {
+		return handoff.StatusNotSubscribed, nil
+	}
+	response, err := current.callUpstream(ctx, "thread/resume", map[string]json.RawMessage{
+		"threadId": rawJSONString(threadID),
+	})
+	if err != nil {
+		return "", errors.New("restore app-server thread")
+	}
+	responseThreadID, provider, ok := responseThreadProvider(response)
+	if !ok || responseThreadID != threadID {
+		return "", errors.New("verify restored app-server thread")
+	}
+	current.stateMu.Lock()
+	current.effective[threadID] = provider
+	delete(current.detached, threadID)
+	current.stateMu.Unlock()
+	return handoff.StatusRestored, nil
 }
 
 func (current *session) writeHandoffError(ctx context.Context, id json.RawMessage) error {

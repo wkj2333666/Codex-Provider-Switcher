@@ -102,11 +102,33 @@ func TestPrepareHandoffAllRejectsLegacyPeerBeforeMutation(t *testing.T) {
 	}
 	select {
 	case method := <-methodSeen:
-		if method != "prepareHandoff" {
+		if method != "prepareHandoffV2" {
 			t.Fatalf("legacy peer method = %q", method)
 		}
 	case <-ctx.Done():
 		t.Fatal("legacy peer did not receive capability probe")
+	}
+}
+
+func TestDirtyStateIsSharedAcrossCoordinators(t *testing.T) {
+	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
+	first := openTestCoordinatorForSocket(t, appSocket, &testHandler{prepare: StatusReady})
+	second := openTestCoordinatorForSocket(t, appSocket, &testHandler{prepare: StatusReady})
+
+	if first.IsDirty("thr-a") || second.IsDirty("thr-a") {
+		t.Fatal("new thread unexpectedly dirty")
+	}
+	if err := first.MarkDirty("thr-a"); err != nil {
+		t.Fatal(err)
+	}
+	if !second.IsDirty("thr-a") {
+		t.Fatal("dirty marker not visible to second coordinator")
+	}
+	if err := second.ClearDirty("thr-a"); err != nil {
+		t.Fatal(err)
+	}
+	if first.IsDirty("thr-a") {
+		t.Fatal("cleared dirty marker still visible")
 	}
 }
 
@@ -161,6 +183,30 @@ func TestResubscribeAllRestoresEveryDetachedPeerWithEffectiveProvider(t *testing
 	}
 }
 
+func TestRestoreAllVisitsEveryPeerAfterFailure(t *testing.T) {
+	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
+	handlers := []*testHandler{
+		{prepare: StatusReady, restore: StatusRestored},
+		{prepare: StatusReady, restoreErr: errors.New("unavailable")},
+		{prepare: StatusReady, restore: StatusNotSubscribed},
+	}
+	coordinators := make([]*Coordinator, 0, len(handlers))
+	for _, handler := range handlers {
+		coordinators = append(coordinators, openTestCoordinatorForSocket(t, appSocket, handler))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinators[0].RestoreAll(ctx, "thr-a"); err == nil {
+		t.Fatal("RestoreAll() error = nil")
+	}
+	for index, handler := range handlers {
+		if calls := handler.restoreCallCount(); calls != 1 {
+			t.Fatalf("handler %d restore calls = %d", index, calls)
+		}
+	}
+}
+
 func TestPrepareAllRemovesStaleSocket(t *testing.T) {
 	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
 	stalePath := filepath.Join(coordinator.directory, "session-stale.sock")
@@ -191,13 +237,16 @@ func TestPrepareAllRemovesStaleSocket(t *testing.T) {
 }
 
 type testHandler struct {
-	mu          sync.Mutex
-	prepare     PeerStatus
-	unsubscribe PeerStatus
-	resubscribe PeerStatus
-	calls       int
-	resumeCalls int
-	provider    string
+	mu           sync.Mutex
+	prepare      PeerStatus
+	unsubscribe  PeerStatus
+	resubscribe  PeerStatus
+	restore      PeerStatus
+	calls        int
+	resumeCalls  int
+	restoreCalls int
+	provider     string
+	restoreErr   error
 }
 
 func (handler *testHandler) Prepare(string) PeerStatus {
@@ -221,6 +270,13 @@ func (handler *testHandler) Resubscribe(_ context.Context, _, provider string) (
 	return handler.resubscribe, nil
 }
 
+func (handler *testHandler) Restore(context.Context, string) (PeerStatus, error) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.restoreCalls++
+	return handler.restore, handler.restoreErr
+}
+
 func (handler *testHandler) unsubscribeCalls() int {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
@@ -231,6 +287,12 @@ func (handler *testHandler) resubscribeResult() (int, string) {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	return handler.resumeCalls, handler.provider
+}
+
+func (handler *testHandler) restoreCallCount() int {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.restoreCalls
 }
 
 func openTestCoordinator(t *testing.T, handler Handler) *Coordinator {
