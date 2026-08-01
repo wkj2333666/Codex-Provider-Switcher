@@ -267,3 +267,24 @@ The deployment check compares `/proc/<daemon-pid>/exe`, its digest, and the
 installed real Codex binary. On the reference host the running daemon is
 Codex 0.146.0; the 0.144.5 binary belongs to the outer Codex agent sandbox and
 is not the app-server behind the switcher socket.
+
+## Failure Recovery Amendment
+
+The runtime namespace contains a per-thread dirty marker using the same digest
+as the handoff lock. A cross-provider transition probes `prepareHandoffV2`,
+creates the marker before the first unsubscribe, and removes it only after the
+sender resume and every peer resubscribe succeed. Every `turn/start` treats a
+dirty thread as requiring a complete handoff even when the local effective
+provider already matches the selected provider.
+
+Every failure after the marker is created runs a best-effort `restore` control
+operation against all live peers. A detached peer sends a minimal
+`thread/resume` containing only `threadId`, accepts the app-server's actual
+effective provider, restores its listener, and updates its local provider
+state. Restore does not request a provider change. One unavailable peer does
+not prevent restore attempts for later peers, and the dirty marker remains so
+the next sender retries the full transition.
+
+`prepareHandoffV2` is a protocol capability boundary. Older peers reject it
+before subscription state changes, so a mixed v0.3.1/v0.3.2 deployment cannot
+enter a handoff that lacks global dirty and restore support.
