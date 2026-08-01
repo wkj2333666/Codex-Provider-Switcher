@@ -49,6 +49,11 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 		`bash scripts/validate-release-tag.sh "$GITHUB_REF_NAME"`,
 		`cp README.md LICENSE THIRD_PARTY_NOTICES "$root/"`,
 		`tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/THIRD_PARTY_NOTICES"`,
+		"Validate provider plugin",
+		"python3 -m json.tool plugins/codex-provider-switcher/.codex-plugin/plugin.json",
+		"allow_implicit_invocation: false",
+		`cp -R plugins/codex-provider-switcher "$root/plugins/"`,
+		`tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/plugins/codex-provider-switcher/skills/provider/SKILL.md"`,
 	} {
 		if !strings.Contains(content, required) {
 			t.Errorf("release.yml missing %q", required)
@@ -134,7 +139,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 
 	for _, required := range []string{
 		"WebSocket", "ln -s", "CODEX_PROVIDER_SWITCHER_PROVIDER",
-		"AcceptEnv", "v0.1.0", "Uninstall", "64 MiB",
+		"v0.1.0", "Uninstall", "64 MiB",
 		"v0.2.0 is also incompatible with stock Desktop Remote SSH",
 		"`codex app-server proxy` without `--sock`",
 		"CODEX_PROVIDER_SWITCHER_SOCKET", "--strict-config",
@@ -144,6 +149,10 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"previously open Desktop views", "same-provider",
 		"prepareHandoff",
 		"dirty marker", "best-effort `restore`", "prepareHandoffV2",
+		"one SSH alias", "`/provider openai`", "`/provider sub2api`",
+		"$HOME/.agents/skills/provider", "Provider switched to sub2api.",
+		"does not invoke a model", "disappears after reopening",
+		"CODEX_PROVIDER_SWITCHER_STATE_DIR",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("documentation missing %q", required)
@@ -154,6 +163,7 @@ func TestDocumentationDescribesStockDesktopWrapper(t *testing.T) {
 		"Server output is copied byte-for-byte",
 		"Configure each Desktop Remote SSH entry point to launch the switcher as its stdio proxy",
 		"The upstream Host is the fixed local URL placeholder `localhost`",
+		"AcceptEnv CODEX_PROVIDER_SWITCHER_PROVIDER",
 	} {
 		if strings.Contains(combined, obsolete) {
 			t.Errorf("documentation retains obsolete claim %q", obsolete)
