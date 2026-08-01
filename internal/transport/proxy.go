@@ -16,7 +16,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
-	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rewrite"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
 )
 
 const maxMessageSize int64 = 64 << 20
@@ -120,7 +120,7 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	}
 	downstream.SetReadLimit(limit)
 	upstream.SetReadLimit(limit)
-	return bridge(ctx, downstream, upstream, options.Config.Provider)
+	return bridge(ctx, downstream, upstream, options.Config.Provider, options.Config.Socket)
 }
 
 func writeHTTPError(writer http.ResponseWriter, status int) {
@@ -175,9 +175,30 @@ func dialUpstream(ctx context.Context, request *http.Request, socket string) (*w
 	})
 }
 
-func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider string) error {
+func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider, socket string) error {
 	bridgeContext, cancel := context.WithCancel(ctx)
 	defer cancel()
+	current, err := newSessionState(
+		provider,
+		socket,
+		func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+			return upstream.Write(ctx, messageType, payload)
+		},
+		func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+			return downstream.Write(ctx, messageType, payload)
+		},
+	)
+	if err != nil {
+		return errors.New("initialize provider handoff session")
+	}
+	coordinator, err := handoff.Open(socket, current)
+	if err != nil {
+		current.closeState()
+		return errors.New("initialize provider handoff coordinator")
+	}
+	current.coordinator = coordinator
+	defer current.closeState()
+	defer coordinator.Close()
 
 	type pumpResult struct {
 		err         error
@@ -185,13 +206,11 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider 
 	}
 	results := make(chan pumpResult, 2)
 	go func() {
-		err := pump(bridgeContext, upstream, downstream, func(payload []byte) ([]byte, error) {
-			return rewrite.Line(payload, provider)
-		})
+		err := current.pumpDownstream(bridgeContext, downstream)
 		results <- pumpResult{destination: upstream, err: err}
 	}()
 	go func() {
-		err := pump(bridgeContext, downstream, upstream, nil)
+		err := current.pumpUpstream(bridgeContext, upstream)
 		results <- pumpResult{destination: downstream, err: err}
 	}()
 
@@ -242,24 +261,6 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider 
 		return errors.New("WebSocket message forwarding failed")
 	}
 	return nil
-}
-
-func pump(ctx context.Context, destination, source *websocket.Conn, transformText func([]byte) ([]byte, error)) error {
-	for {
-		messageType, payload, err := source.Read(ctx)
-		if err != nil {
-			return err
-		}
-		if messageType == websocket.MessageText && transformText != nil {
-			payload, err = transformText(payload)
-			if err != nil {
-				return errRoutingPolicy
-			}
-		}
-		if err := destination.Write(ctx, messageType, payload); err != nil {
-			return err
-		}
-	}
 }
 
 func closeConnections(status websocket.StatusCode, reason string, connections ...*websocket.Conn) {

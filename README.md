@@ -31,6 +31,11 @@ Desktop B -> switcher(provider-b) --+
 All other `codex` commands are delegated unchanged to the real Codex
 executable. The switcher does not start a second daemon or access SQLite.
 
+Live wrapper processes connected to the same app-server also form a local
+send-time provider handoff group. Opening a task only loads it for viewing. The
+SSH alias that sends the next `turn/start` becomes the requested provider for
+that task before the turn reaches app-server.
+
 ## Requirements
 
 - Linux or macOS on amd64 or arm64
@@ -189,8 +194,41 @@ resume with provider-b -> continue from the same persisted history
 ```
 
 Different tasks can be active through different providers at the same time.
-Operating the same loaded task concurrently through different providers is not
-supported because provider selection belongs to the loaded thread runtime.
+For one task, opening or viewing it through another SSH alias does not switch
+the loaded runtime. Provider handoff occurs when that alias sends the next
+message:
+
+```text
+open in sub2api alias -> view only, no provider change
+send next message     -> unsubscribe idle peers -> resume with sub2api -> start turn
+```
+
+The handoff keeps the same thread id and persisted history. It does not restart
+the shared daemon, create another daemon, edit SQLite, fork the task, or change
+either daemon PID.
+
+An active turn is never interrupted or stolen. If another alias is still
+running a turn, a client bypassed the switcher, or app-server cannot confirm the
+requested provider, the new `turn/start` is not forwarded. Desktop receives a
+JSON-RPC `-32090` error and can retry after the active turn finishes.
+
+Automatic handoff requires Codex CLI 0.146.0 or newer. Older app-server
+versions do not provide the idle zero-subscriber replacement behavior needed
+for an immediate provider change; the switcher detects the unchanged provider
+and fails closed.
+
+### Handoff Runtime Files
+
+Each live proxy exposes a mode-0700 local control socket below a short runtime
+namespace derived from the Unix account and app-server socket:
+
+```text
+/tmp/cps-<uid>-<socket-hash>/
+```
+
+These sockets coordinate only wrapper processes for the same daemon. Per-task
+file locks serialize resume/send transitions and are released automatically if
+a process exits. Stale control sockets are removed after a failed local connect.
 
 ## Security Boundaries
 
@@ -209,6 +247,8 @@ supported because provider selection belongs to the loaded thread runtime.
   values, or candidate executable paths.
 - Delegation uses an argument vector and `exec`; no shell evaluates arguments.
 - Symlink and hard-link identity checks prevent recursive wrapper execution.
+- Handoff control sockets are local, mode-protected, length-bounded, and never
+  carry prompts or credentials. Thread ids are not included in diagnostics.
 
 ## Uninstall
 
