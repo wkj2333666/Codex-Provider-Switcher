@@ -262,9 +262,9 @@ repeat the quality gate and package:
 - `darwin/amd64`
 - `darwin/arm64`
 
-Each archive includes the binary, README, MIT license,
-`THIRD_PARTY_NOTICES`, and the explicit-only provider skill plugin. The quality
-job validates the manifest and skill policy. The build job lists each completed
-archive and rejects it unless both the third-party notice and provider skill are
-present. The publication job is the only job granted `contents: write` and
-attaches one SHA-256 file per archive.
+Each archive includes the binary, English and Simplified Chinese user guides,
+MIT license, `THIRD_PARTY_NOTICES`, and the explicit-only provider skill plugin.
+The quality job validates the manifest and skill policy. The build job lists
+each completed archive and rejects it unless the Chinese guide, third-party
+notice, and provider skill are present. The publication job is the only job
+granted `contents: write` and attaches one SHA-256 file per archive.

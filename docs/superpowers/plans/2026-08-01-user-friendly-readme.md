@@ -148,9 +148,11 @@ export CODEX_PROVIDER_SWITCHER_CODEX="/absolute/path/to/real/codex"
 export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 ```
 
-The upgrade section reuses the verified release package and runs only the
-binary install plus exact skill replacement. It explicitly says not to replace
-`CODEX_PROVIDER_SWITCHER_CODEX` with the wrapper path.
+The upgrade section reuses the verified release package, installs the new
+binary to a `mktemp` staging path under the install root, atomically renames it
+over the live binary, and replaces the skill without keeping an old-version
+backup. It explicitly says not to replace `CODEX_PROVIDER_SWITCHER_CODEX` with
+the wrapper path.
 
 - [ ] **Step 2: Preserve advanced facts in architecture.md**
 

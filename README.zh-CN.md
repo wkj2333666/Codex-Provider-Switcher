@@ -163,7 +163,9 @@ Host pi
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"
-install -m 0755 codex-provider-switcher "$INSTALL_ROOT/codex-provider-switcher"
+BINARY_STAGE="$(mktemp "$INSTALL_ROOT/.codex-provider-switcher.XXXXXX")"
+install -m 0755 codex-provider-switcher "$BINARY_STAGE"
+mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
 
 rm -rf "$HOME/.agents/skills/provider"
 cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
