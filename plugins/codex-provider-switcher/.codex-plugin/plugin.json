@@ -1,7 +1,7 @@
 {
   "name": "codex-provider-switcher",
-  "version": "0.4.1",
-  "description": "Switch the active model provider for a Codex task without invoking a model.",
+  "version": "0.5.0",
+  "description": "Inspect or switch the active model provider for a Codex task without invoking a model.",
   "author": {
     "name": "wkj2333666",
     "url": "https://github.com/wkj2333666"
@@ -17,8 +17,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Provider Switcher",
-    "shortDescription": "Switch the provider for the current Codex task.",
-    "longDescription": "Adds an explicit provider command for switching one task between model providers through Codex Provider Switcher.",
+    "shortDescription": "Inspect or switch the provider for the current Codex task.",
+    "longDescription": "Adds explicit provider status and switch commands for one Codex task through Codex Provider Switcher.",
     "developerName": "wkj2333666",
     "category": "Productivity",
     "capabilities": [
@@ -26,8 +26,8 @@
     ],
     "websiteURL": "https://github.com/wkj2333666/Codex-Provider-Switcher",
     "defaultPrompt": [
-      "Use $provider to switch this task to openai.",
-      "Use $provider to switch this task to sub2api."
+      "Use $provider status to show this task's current provider.",
+      "Use $provider switch sub2api to switch this task to sub2api."
     ]
   }
 }

@@ -747,6 +747,111 @@ func TestSessionRejectsDuplicateTurnStartWithoutClearingActiveState(t *testing.T
 	}
 }
 
+func TestSessionProviderStatusReportsRuntimeAndSelectionWithoutMutation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		runtime   string
+		selection map[string]string
+		want      string
+	}{
+		{
+			name:      "verified runtime matches selection",
+			runtime:   "sub2api",
+			selection: map[string]string{"thr-a": "sub2api"},
+			want:      "Runtime provider: sub2api (verified).\nSelected provider: sub2api.",
+		},
+		{
+			name:      "verified runtime differs from selection",
+			runtime:   "openai",
+			selection: map[string]string{"thr-a": "sub2api"},
+			want:      "Runtime provider: openai (verified).\nSelected provider: sub2api (will be applied before the next model turn).",
+		},
+		{
+			name:      "runtime unknown with selection",
+			selection: map[string]string{"thr-a": "sub2api"},
+			want:      "Runtime provider: unknown.\nSelected provider: sub2api (will be applied before the next model turn).",
+		},
+		{
+			name:      "invalid runtime is not reported as verified",
+			runtime:   "invalid/provider",
+			selection: map[string]string{"thr-a": "sub2api"},
+			want:      "Runtime provider: unknown.\nSelected provider: sub2api (will be applied before the next model turn).",
+		},
+		{
+			name:      "runtime and selection unknown",
+			selection: map[string]string{},
+			want:      "Runtime provider: unknown.\nSelected provider: app-server configuration.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			coordinator := &fakeHandoffCoordinator{}
+			selections := &fakeProviderSelections{values: tt.selection}
+			var upstream, downstream messageRecorder
+			current := newTestSession(t, upstream.write, downstream.write)
+			current.provider = ""
+			current.selections = selections
+			current.coordinator = coordinator
+			if tt.runtime != "" {
+				current.stateMu.Lock()
+				current.effective["thr-a"] = tt.runtime
+				current.stateMu.Unlock()
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			request := []byte(`{"id":20,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider status"}]}}`)
+			if err := current.handleDownstreamText(ctx, request); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := upstream.messages(); len(got) != 0 {
+				t.Fatalf("status wrote to app-server: %q", got)
+			}
+			if got := syntheticAgentFeedback(t, downstream.messages()); got != tt.want {
+				t.Fatalf("status feedback = %q, want %q", got, tt.want)
+			}
+			if selections.setCalls != 0 {
+				t.Fatalf("status persisted selection %d times", selections.setCalls)
+			}
+			if coordinator.prepareCalls != 1 || coordinator.prepareHandoffCalls != 0 ||
+				coordinator.unsubscribeCalls != 0 || coordinator.resubscribeCalls != 0 ||
+				coordinator.markDirtyCalls != 0 || coordinator.clearDirtyCalls != 0 {
+				t.Fatalf("status coordinator calls = %#v", coordinator)
+			}
+		})
+	}
+}
+
+func TestSessionProviderStatusFailsClosedWhenSelectionCannotBeRead(t *testing.T) {
+	t.Parallel()
+	var upstream, downstream messageRecorder
+	current := newTestSession(t, upstream.write, downstream.write)
+	current.provider = ""
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.selections = &fakeProviderSelections{getErr: errors.New("secret state path")}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "openai"
+	current.stateMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := []byte(`{"id":20,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status"}]}}`)
+	if err := current.handleDownstreamText(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if got := upstream.messages(); len(got) != 0 {
+		t.Fatalf("failed status wrote to app-server: %q", got)
+	}
+	messages := downstream.messages()
+	if len(messages) != 1 || bytes.Contains(messages[0], []byte("secret")) || bytes.Contains(messages[0], []byte("Runtime provider")) {
+		t.Fatalf("failed status response = %q", messages)
+	}
+}
+
 func TestSessionProviderCommandSwitchesWithoutForwardingModelTurn(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
@@ -778,7 +883,7 @@ func TestSessionProviderCommandSwitchesWithoutForwardingModelTurn(t *testing.T) 
 	current.stateMu.Unlock()
 
 	request := []byte(`{"id":21,"method":"turn/start","params":{"threadId":"thr-a","input":[` +
-		`{"type":"text","text":"$provider openai"},` +
+		`{"type":"text","text":"$provider switch openai"},` +
 		`{"type":"skill","name":"provider","path":"/home/user/.agents/skills/provider/SKILL.md"}]}}`)
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -806,6 +911,12 @@ func TestSessionProviderCommandSwitchesWithoutForwardingModelTurn(t *testing.T) 
 	if got := downstream.messages(); len(got) != 8 {
 		t.Fatalf("synthetic downstream count = %d, want 8", len(got))
 	}
+	if got := syntheticUserCommand(t, downstream.messages()); got != "/provider switch openai" {
+		t.Fatalf("synthetic provider command = %q", got)
+	}
+	if got := syntheticAgentFeedback(t, downstream.messages()); got != "Provider switched to openai." {
+		t.Fatalf("synthetic provider feedback = %q", got)
+	}
 	if coordinator.prepareCalls != 1 || coordinator.prepareHandoffCalls != 1 ||
 		coordinator.unsubscribeCalls != 1 || coordinator.resubscribeCalls != 1 ||
 		coordinator.clearDirtyCalls != 1 {
@@ -820,7 +931,7 @@ func TestSessionProviderCommandRejectsMalformedInputWithoutForwarding(t *testing
 	current.coordinator = &fakeHandoffCoordinator{}
 	current.selections = &fakeProviderSelections{values: map[string]string{}}
 
-	request := []byte(`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider secret/bad"}]}}`)
+	request := []byte(`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch secret/bad"}]}}`)
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -869,7 +980,7 @@ func TestSessionProviderCommandDoesNotFakeSuccessWhenPersistenceFails(t *testing
 	current.effective["thr-a"] = "sub2api"
 	current.stateMu.Unlock()
 
-	request := []byte(`{"id":23,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"}]}}`)
+	request := []byte(`{"id":23,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch openai"}]}}`)
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -994,9 +1105,10 @@ type messageRecorder struct {
 }
 
 type fakeProviderSelections struct {
-	values map[string]string
-	getErr error
-	setErr error
+	values   map[string]string
+	getErr   error
+	setErr   error
+	setCalls int
 }
 
 func (selections *fakeProviderSelections) Get(threadID string) (string, bool, error) {
@@ -1008,6 +1120,7 @@ func (selections *fakeProviderSelections) Get(threadID string) (string, bool, er
 }
 
 func (selections *fakeProviderSelections) Set(threadID, provider string) error {
+	selections.setCalls++
 	if selections.setErr != nil {
 		return selections.setErr
 	}
@@ -1016,6 +1129,45 @@ func (selections *fakeProviderSelections) Set(threadID, provider string) error {
 	}
 	selections.values[threadID] = provider
 	return nil
+}
+
+func syntheticAgentFeedback(t *testing.T, messages [][]byte) string {
+	t.Helper()
+	for _, payload := range messages {
+		message, err := parseRPCMessage(payload)
+		if err != nil || message.method != "item/agentMessage/delta" {
+			continue
+		}
+		var feedback string
+		if json.Unmarshal(message.params["delta"], &feedback) != nil {
+			t.Fatalf("invalid synthetic feedback: %s", message.params["delta"])
+		}
+		return feedback
+	}
+	return ""
+}
+
+func syntheticUserCommand(t *testing.T, messages [][]byte) string {
+	t.Helper()
+	for _, payload := range messages {
+		message, err := parseRPCMessage(payload)
+		if err != nil || message.method != "item/started" {
+			continue
+		}
+		var item struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if json.Unmarshal(message.params["item"], &item) != nil {
+			continue
+		}
+		if item.Type == "userMessage" && len(item.Content) == 1 {
+			return item.Content[0].Text
+		}
+	}
+	return ""
 }
 
 func (recorder *messageRecorder) write(_ context.Context, messageType websocket.MessageType, payload []byte) error {

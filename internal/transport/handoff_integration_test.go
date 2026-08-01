@@ -70,33 +70,28 @@ func TestProviderSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
 	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
 		"threadId": "thr-shared",
 		"input": []any{
-			map[string]any{"type": "text", "text": "$provider sub2api", "text_elements": []any{}},
+			map[string]any{"type": "text", "text": "$provider status", "text_elements": []any{}},
 			map[string]any{"type": "skill", "name": "provider", "path": "/home/user/.agents/skills/provider/SKILL.md"},
 		},
 	})
+	statusResponseSeen, statusMethods, statusFeedback := readProviderControlLifecycle(t, ctx, connection, "3")
+	if !statusResponseSeen || statusFeedback != "Runtime provider: openai (verified).\nSelected provider: openai." {
+		t.Fatalf("status lifecycle response=%v methods=%v feedback=%q", statusResponseSeen, statusMethods, statusFeedback)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("provider status app-server turn/start calls = %d, want 0", calls)
+	}
 
-	methods := make([]string, 0, 7)
-	responseSeen := false
-	for len(methods) < 7 {
-		message := readVisibleRPC(t, ctx, connection)
-		if message.id == "3" {
-			responseSeen = true
-		}
-		if message.method != "" {
-			methods = append(methods, message.method)
-		}
-	}
-	wantMethods := []string{
-		"turn/started",
-		"item/started",
-		"item/completed",
-		"item/started",
-		"item/agentMessage/delta",
-		"item/completed",
-		"turn/completed",
-	}
-	if !responseSeen || fmt.Sprint(methods) != fmt.Sprint(wantMethods) {
-		t.Fatalf("synthetic lifecycle response=%v methods=%v", responseSeen, methods)
+	sendRPC(t, ctx, connection, 4, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{
+			map[string]any{"type": "text", "text": "$provider switch sub2api", "text_elements": []any{}},
+			map[string]any{"type": "skill", "name": "provider", "path": "/home/user/.agents/skills/provider/SKILL.md"},
+		},
+	})
+	responseSeen, methods, feedback := readProviderControlLifecycle(t, ctx, connection, "4")
+	if !responseSeen || feedback != "Provider switched to sub2api." {
+		t.Fatalf("switch lifecycle response=%v methods=%v feedback=%q", responseSeen, methods, feedback)
 	}
 	if calls := server.turnStartCallCount(); calls != 0 {
 		t.Fatalf("provider command app-server turn/start calls = %d, want 0", calls)
@@ -107,7 +102,7 @@ func TestProviderSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	visible := sendTestTurnAndCollect(t, ctx, connection, 4)
+	visible := sendTestTurnAndCollect(t, ctx, connection, 5)
 	assertNoInternalMessages(t, visible)
 	if record := <-server.turns; record.threadID != "thr-shared" || record.provider != "sub2api" {
 		t.Fatalf("ordinary turn after command = %#v", record)
@@ -463,6 +458,7 @@ func (server *handoffAppServer) writeJSON(connection *websocket.Conn, value any)
 type visibleRPC struct {
 	id           string
 	method       string
+	delta        string
 	errorCode    int
 	errorMessage string
 }
@@ -538,6 +534,43 @@ func sendTestTurnAndCollect(t *testing.T, ctx context.Context, connection *webso
 	}
 }
 
+func readProviderControlLifecycle(
+	t *testing.T,
+	ctx context.Context,
+	connection *websocket.Conn,
+	id string,
+) (bool, []string, string) {
+	t.Helper()
+	methods := make([]string, 0, 7)
+	responseSeen := false
+	feedback := ""
+	for len(methods) < 7 {
+		message := readVisibleRPC(t, ctx, connection)
+		if message.id == id {
+			responseSeen = true
+		}
+		if message.method != "" {
+			methods = append(methods, message.method)
+		}
+		if message.method == "item/agentMessage/delta" {
+			feedback = message.delta
+		}
+	}
+	wantMethods := []string{
+		"turn/started",
+		"item/started",
+		"item/completed",
+		"item/started",
+		"item/agentMessage/delta",
+		"item/completed",
+		"turn/completed",
+	}
+	if fmt.Sprint(methods) != fmt.Sprint(wantMethods) {
+		t.Fatalf("synthetic lifecycle methods=%v, want %v", methods, wantMethods)
+	}
+	return responseSeen, methods, feedback
+}
+
 func sendRPC(t *testing.T, ctx context.Context, connection *websocket.Conn, id int, method string, params any) {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
@@ -608,6 +641,9 @@ func readVisibleRPC(t *testing.T, ctx context.Context, connection *websocket.Con
 			continue
 		}
 		visible := visibleRPC{id: parsed.idKey, method: parsed.method}
+		if parsed.method == "item/agentMessage/delta" {
+			_ = json.Unmarshal(parsed.params["delta"], &visible.delta)
+		}
 		if parsed.hasError {
 			var envelope struct {
 				Error struct {

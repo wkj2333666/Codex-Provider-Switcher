@@ -11,7 +11,20 @@ import (
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
-const invalidProviderCommandMessage = "invalid provider command; use /provider <name>"
+const invalidProviderCommandMessage = "invalid provider command; use /provider status or /provider switch <name>"
+
+type providerCommandAction uint8
+
+const (
+	providerCommandNone providerCommandAction = iota
+	providerCommandStatus
+	providerCommandSwitch
+)
+
+type providerCommand struct {
+	action   providerCommandAction
+	provider string
+}
 
 type commandInputItem struct {
 	Type string `json:"type"`
@@ -20,13 +33,13 @@ type commandInputItem struct {
 	Path string `json:"path"`
 }
 
-func parseProviderCommand(message rpcMessage) (string, bool, error) {
+func parseProviderCommand(message rpcMessage) (providerCommand, bool, error) {
 	if message.method != "turn/start" || message.params == nil {
-		return "", false, nil
+		return providerCommand{}, false, nil
 	}
 	var rawItems []json.RawMessage
 	if json.Unmarshal(message.params["input"], &rawItems) != nil || len(rawItems) == 0 {
-		return "", false, nil
+		return providerCommand{}, false, nil
 	}
 
 	items := make([]commandInputItem, 0, len(rawItems))
@@ -46,36 +59,50 @@ func parseProviderCommand(message rpcMessage) (string, bool, error) {
 
 	commandIndex := -1
 	commandMarker := ""
+	var commandArguments []string
 	for index, item := range items {
 		if item.Type != "text" {
 			continue
 		}
 		fields := strings.Fields(item.Text)
-		if len(fields) == 0 || (fields[0] != "/provider" && fields[0] != "$provider") {
+		if len(fields) == 0 {
+			continue
+		}
+		marker := ""
+		arguments := []string(nil)
+		switch {
+		case fields[0] == "/provider" || fields[0] == "$provider":
+			marker = fields[0]
+			arguments = fields[1:]
+		case len(fields) >= 2 && fields[0] == "/" && fields[1] == "provider":
+			marker = "/provider"
+			arguments = fields[2:]
+		default:
 			continue
 		}
 		if commandIndex != -1 {
-			return "", true, errors.New(invalidProviderCommandMessage)
+			return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 		}
 		commandIndex = index
-		commandMarker = fields[0]
+		commandMarker = marker
+		commandArguments = arguments
 	}
 
 	if commandIndex == -1 {
 		if providerSkills != 0 {
-			return "", true, errors.New(invalidProviderCommandMessage)
+			return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 		}
-		return "", false, nil
+		return providerCommand{}, false, nil
 	}
 	if malformedItems {
-		return "", true, errors.New(invalidProviderCommandMessage)
+		return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 	}
 	if commandMarker == "$provider" {
 		if providerSkills == 0 {
-			return "", false, nil
+			return providerCommand{}, false, nil
 		}
 		if providerSkills != 1 || len(items) != 2 {
-			return "", true, errors.New(invalidProviderCommandMessage)
+			return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 		}
 		skillValid := false
 		for _, item := range items {
@@ -84,17 +111,20 @@ func parseProviderCommand(message rpcMessage) (string, bool, error) {
 			}
 		}
 		if !skillValid {
-			return "", true, errors.New(invalidProviderCommandMessage)
+			return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 		}
 	} else if len(items) != 1 {
-		return "", true, errors.New(invalidProviderCommandMessage)
+		return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 	}
 
-	fields := strings.Fields(items[commandIndex].Text)
-	if len(fields) != 2 || !providerid.Valid(fields[1]) {
-		return "", true, errors.New(invalidProviderCommandMessage)
+	switch {
+	case len(commandArguments) == 1 && commandArguments[0] == "status":
+		return providerCommand{action: providerCommandStatus}, true, nil
+	case len(commandArguments) == 2 && commandArguments[0] == "switch" && providerid.Valid(commandArguments[1]):
+		return providerCommand{action: providerCommandSwitch, provider: commandArguments[1]}, true, nil
+	default:
+		return providerCommand{}, true, errors.New(invalidProviderCommandMessage)
 	}
-	return fields[1], true, nil
 }
 
 type syntheticTurn struct {
@@ -141,8 +171,8 @@ type syntheticNotification struct {
 	Params  any    `json:"params"`
 }
 
-func encodeProviderSwitchTurn(id json.RawMessage, threadID, provider string, now time.Time) ([][]byte, error) {
-	if len(id) == 0 || threadID == "" || !providerid.Valid(provider) {
+func encodeProviderControlTurn(id json.RawMessage, threadID, commandText, feedback string, now time.Time) ([][]byte, error) {
+	if len(id) == 0 || threadID == "" || commandText == "" || feedback == "" {
 		return nil, errors.New("invalid synthetic provider turn")
 	}
 	turnID, err := syntheticID("turn")
@@ -160,14 +190,13 @@ func encodeProviderSwitchTurn(id json.RawMessage, threadID, provider string, now
 
 	startedAt := now.Unix()
 	startedAtMS := now.UnixMilli()
-	feedback := "Provider switched to " + provider + "."
 	userItem := syntheticUserItem{
 		Type:     "userMessage",
 		ID:       userItemID,
 		ClientID: nil,
 		Content: []syntheticUserInput{{
 			Type:         "text",
-			Text:         "/provider " + provider,
+			Text:         commandText,
 			TextElements: []any{},
 		}},
 	}

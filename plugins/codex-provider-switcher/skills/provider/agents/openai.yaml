@@ -1,6 +1,6 @@
 interface:
   display_name: "Provider"
-  short_description: "Switch the provider for this Codex task"
-  default_prompt: "Use $provider to switch this task to a configured provider."
+  short_description: "Inspect or switch this Codex task's provider"
+  default_prompt: "Use $provider status or $provider switch <name>."
 policy:
   allow_implicit_invocation: false

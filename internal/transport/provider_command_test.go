@@ -12,26 +12,45 @@ func TestParseProviderCommandRecognizesStrictControlInputs(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
+		action   providerCommandAction
 		provider string
 	}{
 		{
-			name: "skill invocation",
+			name: "skill status",
 			input: `{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[` +
-				`{"type":"text","text":"$provider sub2api","text_elements":[]},` +
+				`{"type":"text","text":"$provider status","text_elements":[]},` +
 				`{"type":"skill","name":"provider","path":"/home/user/.agents/skills/provider/SKILL.md"}]}}`,
-			provider: "sub2api",
+			action: providerCommandStatus,
 		},
 		{
-			name: "skill item before text",
+			name: "skill switch with item before text",
 			input: `{"id":2,"method":"turn/start","params":{"threadId":"thr-a","input":[` +
 				`{"type":"skill","name":"provider","path":"/skill/SKILL.md"},` +
-				`{"type":"text","text":"  $provider openai  "}]}}`,
+				`{"type":"text","text":"  $provider switch openai  "}]}}`,
+			action:   providerCommandSwitch,
 			provider: "openai",
 		},
 		{
-			name:     "plain slash form",
-			input:    `{"id":3,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider provider_1.test"}]}}`,
+			name:   "plain compact status",
+			input:  `{"id":3,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status"}]}}`,
+			action: providerCommandStatus,
+		},
+		{
+			name:     "plain compact switch",
+			input:    `{"id":4,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch provider_1.test"}]}}`,
+			action:   providerCommandSwitch,
 			provider: "provider_1.test",
+		},
+		{
+			name:   "plain spaced status",
+			input:  `{"id":5,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider status"}]}}`,
+			action: providerCommandStatus,
+		},
+		{
+			name:     "plain spaced switch",
+			input:    `{"id":6,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider switch sub2api"}]}}`,
+			action:   providerCommandSwitch,
+			provider: "sub2api",
 		},
 	}
 
@@ -43,8 +62,8 @@ func TestParseProviderCommandRecognizesStrictControlInputs(t *testing.T) {
 				t.Fatal(err)
 			}
 			got, recognized, err := parseProviderCommand(message)
-			if err != nil || !recognized || got != tt.provider {
-				t.Fatalf("parseProviderCommand() = %q, %v, %v", got, recognized, err)
+			if err != nil || !recognized || got.action != tt.action || got.provider != tt.provider {
+				t.Fatalf("parseProviderCommand() = %#v, %v, %v", got, recognized, err)
 			}
 		})
 	}
@@ -54,12 +73,15 @@ func TestParseProviderCommandRejectsMalformedControlsWithoutLeaking(t *testing.T
 	t.Parallel()
 	inputs := []string{
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider"}]}}`,
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider secret/bad"}]}}`,
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai trailing secret"}]}}`,
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"},{"type":"image","url":"secret-url"}]}}`,
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"},"secret-invalid-item"]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/ provider openai"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider switch secret/bad"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status trailing secret"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status"},{"type":"image","url":"secret-url"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider status"},"secret-invalid-item"]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider"},{"type":"skill","name":"provider","path":"/secret/SKILL.md"}]}}`,
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider openai"},{"type":"text","text":"secret"},{"type":"skill","name":"provider","path":"/skill/SKILL.md"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider status"},{"type":"text","text":"secret"},{"type":"skill","name":"provider","path":"/skill/SKILL.md"}]}}`,
 	}
 	for _, input := range inputs {
 		message, err := parseRPCMessage([]byte(input))
@@ -79,8 +101,8 @@ func TestParseProviderCommandRejectsMalformedControlsWithoutLeaking(t *testing.T
 func TestParseProviderCommandForwardsOrdinaryMessages(t *testing.T) {
 	t.Parallel()
 	inputs := []string{
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"Explain /provider openai to me"}]}}`,
-		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider openai"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"Explain /provider switch openai to me"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider status"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$other openai"},{"type":"skill","name":"other","path":"/skill/SKILL.md"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`,
 	}
@@ -89,17 +111,20 @@ func TestParseProviderCommandForwardsOrdinaryMessages(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		provider, recognized, err := parseProviderCommand(message)
-		if err != nil || recognized || provider != "" {
-			t.Fatalf("parseProviderCommand(%q) = %q, %v, %v", input, provider, recognized, err)
+		command, recognized, err := parseProviderCommand(message)
+		if err != nil || recognized || command != (providerCommand{}) {
+			t.Fatalf("parseProviderCommand(%q) = %#v, %v, %v", input, command, recognized, err)
 		}
 	}
 }
 
-func TestEncodeProviderSwitchTurnMatchesAppServerV2Lifecycle(t *testing.T) {
+func TestEncodeProviderControlTurnMatchesAppServerV2Lifecycle(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_800_000_000, 123_000_000)
-	messages, err := encodeProviderSwitchTurn(json.RawMessage(`9`), "thr-a", "sub2api", now)
+	messages, err := encodeProviderControlTurn(
+		json.RawMessage(`9`), "thr-a", "/provider status",
+		"Runtime provider: sub2api (verified).\nSelected provider: sub2api.", now,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +188,9 @@ func TestEncodeProviderSwitchTurnMatchesAppServerV2Lifecycle(t *testing.T) {
 			if json.Unmarshal(item["content"], &content) != nil || len(content) != 1 || string(content[0]["text_elements"]) != "[]" {
 				t.Fatalf("user content = %s", item["content"])
 			}
+			if string(content[0]["text"]) != `"/provider status"` {
+				t.Fatalf("user command text = %s", content[0]["text"])
+			}
 		case 4:
 			item := decodeObject(params["item"])
 			_ = json.Unmarshal(item["id"], &agentItemID)
@@ -173,7 +201,7 @@ func TestEncodeProviderSwitchTurnMatchesAppServerV2Lifecycle(t *testing.T) {
 			var itemID, delta string
 			_ = json.Unmarshal(params["itemId"], &itemID)
 			_ = json.Unmarshal(params["delta"], &delta)
-			if itemID != agentItemID || delta != "Provider switched to sub2api." {
+			if itemID != agentItemID || delta != "Runtime provider: sub2api (verified).\nSelected provider: sub2api." {
 				t.Fatalf("agent delta = %q, %q", itemID, delta)
 			}
 		case 6:
@@ -181,7 +209,7 @@ func TestEncodeProviderSwitchTurnMatchesAppServerV2Lifecycle(t *testing.T) {
 			var itemID, text string
 			_ = json.Unmarshal(item["id"], &itemID)
 			_ = json.Unmarshal(item["text"], &text)
-			if itemID != agentItemID || text != "Provider switched to sub2api." {
+			if itemID != agentItemID || text != "Runtime provider: sub2api (verified).\nSelected provider: sub2api." {
 				t.Fatalf("completed agent item = %q, %q", itemID, text)
 			}
 		case 7:
