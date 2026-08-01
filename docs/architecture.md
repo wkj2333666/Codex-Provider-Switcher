@@ -53,6 +53,16 @@ query, negotiated subprotocol, and downstream `request.Host` are preserved.
 `thread/start`, `thread/resume`, `thread/fork`, and `thread/list`. Unknown valid
 messages are returned byte-for-byte.
 
+`internal/handoff` provides send-time provider handoff across live switcher
+processes for one app-server socket. It derives a short `/tmp/cps-*` runtime
+namespace, exposes one bounded Unix control socket per proxy connection, and
+uses per-thread `flock` files to serialize transitions.
+
+`internal/transport/session` multiplexes Desktop and switcher-internal JSON-RPC
+requests on one upstream WebSocket. It correlates and hides internal responses,
+tracks effective providers and active turns, and preserves ordinary Desktop
+messages byte-for-byte after routing policy is applied.
+
 `cmd/codex-provider-switcher` owns mode selection, signal cancellation, help,
 version output, diagnostics, and process exit codes. Delegated commands replace
 the wrapper process with `syscall.Exec`.
@@ -80,6 +90,22 @@ Desktop text   -> decode complete message -> rewrite targets -> UDS text
 Desktop binary -> no parsing                              -> UDS binary
 Desktop        <- no parsing or rewriting                 <- app-server
 ```
+
+For an idle cross-provider send, the downstream pump pauses the original
+`turn/start` while the session performs:
+
+```text
+thread flock
+  -> prepare every live peer (no mutation)
+  -> unsubscribe every ready peer
+  -> internal thread/resume with requested modelProvider
+  -> verify returned thread id and modelProvider
+  -> forward original turn/start
+```
+
+Ordinary `thread/resume` uses the same lock and holds it through the app-server
+response, so a new subscriber cannot appear midway through handoff. Internal
+request ids and their responses never reach Desktop.
 
 The WebSocket library handles client masking, 7/16/64-bit payload lengths,
 fragment reassembly, ping, pong, and close control frames. Message frame
@@ -117,6 +143,12 @@ A missing provider or unsafe target `params` shape fails closed. Diagnostics
 never format message bodies, prompts, handshake values, environment contents,
 or credentials.
 
+Provider handoff is also fail closed. A peer reporting an active turn aborts in
+the prepare phase before any unsubscribe occurs. A second-phase failure, a
+non-switcher subscriber, an older server, or a returned provider mismatch keeps
+the original turn from reaching app-server and produces static JSON-RPC error
+`-32090`.
+
 The remote SSH account and every process running as the same Unix user are
 trusted at the account-authority level. Such a caller can already bypass the
 wrapper, connect to the control socket, or replace its own environment. The
@@ -131,9 +163,15 @@ The project neither starts an app-server nor reads its SQLite database. This
 keeps one daemon and one writer for one `CODEX_HOME` and task store.
 
 Different tasks can use different providers concurrently. One loaded task must
-not be operated concurrently through different providers. Sequential resume
-through another provider remains supported because context comes from the
-shared persisted thread history.
+not be operated concurrently through different providers. With Codex CLI
+0.146.0 or newer, a loaded idle task can move providers on the next send: after
+the final subscriber leaves, a resume with different overrides causes
+app-server to shut down the cached runtime and cold-resume the same persisted
+thread immediately. No daemon restart or 30-minute inactivity wait is needed.
+
+Opening a task through another alias can subscribe that connection without
+changing the loaded provider. The next `turn/start` triggers the coordinated
+handoff. An active turn remains owned by its current provider until completion.
 
 ## Release Model
 
