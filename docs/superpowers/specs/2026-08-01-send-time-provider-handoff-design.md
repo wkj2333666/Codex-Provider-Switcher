@@ -235,3 +235,35 @@ the turn instead of silently routing it incorrectly.
 
 The feature is enabled by default because it only changes `turn/start` when a
 provider mismatch is observed. No new installation service is required.
+
+## Post-Release Peer Resynchronization Amendment
+
+Every `turn/start`, including the same-provider fast path, runs `PrepareAll`
+while holding the per-thread lock. The sending session marks the thread active
+before its upstream write, so another cooperating session that acquires the
+lock next observes `busy` even before app-server broadcasts `turn/started`.
+
+Provider changes use a three-phase subscription transition:
+
+```text
+prepare all -> unsubscribe all -> sender cold resume
+            -> resubscribe detached peers -> forward turn/start
+```
+
+Each peer remembers whether the coordinator actually detached its app-server
+connection. After the sender establishes the new effective provider, a
+`resubscribe` control request makes only those detached peers issue an internal
+`thread/resume` using that effective provider. Codex 0.146.0 automatically
+reattaches the requesting connection's thread listener. Internal resume
+responses remain hidden from Desktop, but all previously open Desktop views
+are subscribed again before any new turn starts, so none miss turn events.
+
+Explicit Desktop unsubscribe is not treated as coordinator detachment and is
+never undone. A failed or uncertain coordinator unsubscribe retains detached
+state for repair on the next successful handoff. Failure to resubscribe any
+detached peer aborts the original turn before it reaches app-server.
+
+The deployment check compares `/proc/<daemon-pid>/exe`, its digest, and the
+installed real Codex binary. On the reference host the running daemon is
+Codex 0.146.0; the 0.144.5 binary belongs to the outer Codex agent sandbox and
+is not the app-server behind the switcher socket.
