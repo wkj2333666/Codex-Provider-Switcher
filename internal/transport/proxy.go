@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
 const maxMessageSize int64 = 64 << 20
@@ -92,6 +94,15 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 		writeHTTPError(writer, http.StatusBadRequest)
 		return errors.New("invalid downstream WebSocket upgrade")
 	}
+	stateDirectory := options.Config.StateDir
+	if stateDirectory == "" {
+		stateDirectory = filepath.Join(filepath.Dir(options.Config.Socket), ".codex-provider-switcher")
+	}
+	selections, err := selection.Open(stateDirectory)
+	if err != nil {
+		writeHTTPError(writer, http.StatusInternalServerError)
+		return errors.New("provider selection state unavailable")
+	}
 
 	upstream, _, err := dialUpstream(ctx, request, options.Config.Socket)
 	if err != nil {
@@ -120,7 +131,7 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	}
 	downstream.SetReadLimit(limit)
 	upstream.SetReadLimit(limit)
-	return bridge(ctx, downstream, upstream, options.Config.Provider, options.Config.Socket)
+	return bridge(ctx, downstream, upstream, options.Config.Provider, options.Config.Socket, selections)
 }
 
 func writeHTTPError(writer http.ResponseWriter, status int) {
@@ -175,7 +186,7 @@ func dialUpstream(ctx context.Context, request *http.Request, socket string) (*w
 	})
 }
 
-func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider, socket string) error {
+func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider, socket string, selections providerSelections) error {
 	bridgeContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 	current, err := newSessionState(
@@ -191,6 +202,7 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider,
 	if err != nil {
 		return errors.New("initialize provider handoff session")
 	}
+	current.selections = selections
 	coordinator, err := handoff.Open(socket, current)
 	if err != nil {
 		current.closeState()

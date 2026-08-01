@@ -31,9 +31,11 @@ func parseProviderCommand(message rpcMessage) (string, bool, error) {
 
 	items := make([]commandInputItem, 0, len(rawItems))
 	providerSkills := 0
+	malformedItems := false
 	for _, raw := range rawItems {
 		var item commandInputItem
 		if json.Unmarshal(raw, &item) != nil || item.Type == "" {
+			malformedItems = true
 			continue
 		}
 		items = append(items, item)
@@ -64,6 +66,9 @@ func parseProviderCommand(message rpcMessage) (string, bool, error) {
 			return "", true, errors.New(invalidProviderCommandMessage)
 		}
 		return "", false, nil
+	}
+	if malformedItems {
+		return "", true, errors.New(invalidProviderCommandMessage)
 	}
 	if commandMarker == "$provider" {
 		if providerSkills == 0 {

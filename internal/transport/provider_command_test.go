@@ -57,6 +57,7 @@ func TestParseProviderCommandRejectsMalformedControlsWithoutLeaking(t *testing.T
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider secret/bad"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai trailing secret"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"},{"type":"image","url":"secret-url"}]}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"},"secret-invalid-item"]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider"},{"type":"skill","name":"provider","path":"/secret/SKILL.md"}]}}`,
 		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"$provider openai"},{"type":"text","text":"secret"},{"type":"skill","name":"provider","path":"/skill/SKILL.md"}]}}`,
 	}

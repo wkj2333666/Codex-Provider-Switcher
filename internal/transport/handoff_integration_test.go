@@ -56,6 +56,68 @@ func TestRunSwitchesProviderOnNextTurn(t *testing.T) {
 	waitProxyDone(t, sub2apiDone)
 }
 
+func TestProviderSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	connection, done := dialProviderProxy(t, ctx, server.socket, "openai")
+	defer connection.CloseNow()
+
+	initializeTestClient(t, ctx, connection)
+	if provider := resumeTestThread(t, ctx, connection, 2); provider != "openai" {
+		t.Fatalf("initial provider = %q", provider)
+	}
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{
+			map[string]any{"type": "text", "text": "$provider sub2api", "text_elements": []any{}},
+			map[string]any{"type": "skill", "name": "provider", "path": "/home/user/.agents/skills/provider/SKILL.md"},
+		},
+	})
+
+	methods := make([]string, 0, 7)
+	responseSeen := false
+	for len(methods) < 7 {
+		message := readVisibleRPC(t, ctx, connection)
+		if message.id == "3" {
+			responseSeen = true
+		}
+		if message.method != "" {
+			methods = append(methods, message.method)
+		}
+	}
+	wantMethods := []string{
+		"turn/started",
+		"item/started",
+		"item/completed",
+		"item/started",
+		"item/agentMessage/delta",
+		"item/completed",
+		"turn/completed",
+	}
+	if !responseSeen || fmt.Sprint(methods) != fmt.Sprint(wantMethods) {
+		t.Fatalf("synthetic lifecycle response=%v methods=%v", responseSeen, methods)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("provider command app-server turn/start calls = %d, want 0", calls)
+	}
+	select {
+	case unexpected := <-server.turns:
+		t.Fatalf("provider command reached model turn: %#v", unexpected)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	visible := sendTestTurnAndCollect(t, ctx, connection, 4)
+	assertNoInternalMessages(t, visible)
+	if record := <-server.turns; record.threadID != "thr-shared" || record.provider != "sub2api" {
+		t.Fatalf("ordinary turn after command = %#v", record)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
 func TestRunRejectsConcurrentSameProviderTurnBeforePeerNotification(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

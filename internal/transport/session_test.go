@@ -687,9 +687,275 @@ func TestSessionRejectsDuplicateTurnStartWithoutClearingActiveState(t *testing.T
 	}
 }
 
+func TestSessionProviderCommandSwitchesWithoutForwardingModelTurn(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	selections := &fakeProviderSelections{values: map[string]string{}}
+	var current *session
+	var upstream, downstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			var requestedProvider string
+			_ = json.Unmarshal(message.params["modelProvider"], &requestedProvider)
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":%q}}`, message.idKey, requestedProvider)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, downstream.write)
+	current.provider = "sub2api"
+	current.selections = selections
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":21,"method":"turn/start","params":{"threadId":"thr-a","input":[` +
+		`{"type":"text","text":"$provider openai"},` +
+		`{"type":"skill","name":"provider","path":"/home/user/.agents/skills/provider/SKILL.md"}]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	upstreamMessages := upstream.messages()
+	if len(upstreamMessages) != 1 {
+		t.Fatalf("upstream message count = %d, want one internal resume", len(upstreamMessages))
+	}
+	resume, err := parseRPCMessage(upstreamMessages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestedProvider string
+	_ = json.Unmarshal(resume.params["modelProvider"], &requestedProvider)
+	if resume.method != "thread/resume" || requestedProvider != "openai" {
+		t.Fatalf("internal resume = %#v", resume)
+	}
+	if got := selections.values["thr-a"]; got != "openai" {
+		t.Fatalf("persisted provider = %q", got)
+	}
+	if current.isActive("thr-a") {
+		t.Fatal("synthetic command left thread active")
+	}
+	if got := downstream.messages(); len(got) != 8 {
+		t.Fatalf("synthetic downstream count = %d, want 8", len(got))
+	}
+	if coordinator.prepareCalls != 1 || coordinator.prepareHandoffCalls != 1 ||
+		coordinator.unsubscribeCalls != 1 || coordinator.resubscribeCalls != 1 ||
+		coordinator.clearDirtyCalls != 1 {
+		t.Fatalf("coordinator calls = %#v", coordinator)
+	}
+}
+
+func TestSessionProviderCommandRejectsMalformedInputWithoutForwarding(t *testing.T) {
+	t.Parallel()
+	var upstream, downstream messageRecorder
+	current := newTestSession(t, upstream.write, downstream.write)
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.selections = &fakeProviderSelections{values: map[string]string{}}
+
+	request := []byte(`{"id":22,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider secret/bad"}]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(upstream.messages()) != 0 {
+		t.Fatalf("malformed command reached upstream: %q", upstream.messages())
+	}
+	messages := downstream.messages()
+	if len(messages) != 1 || bytes.Contains(messages[0], []byte("secret")) {
+		t.Fatalf("malformed command response = %q", messages)
+	}
+	var response struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(messages[0], &response) != nil || response.Error.Code != -32602 || response.Error.Message != invalidProviderCommandMessage {
+		t.Fatalf("malformed command error = %#v", response)
+	}
+}
+
+func TestSessionProviderCommandDoesNotFakeSuccessWhenPersistenceFails(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	selections := &fakeProviderSelections{values: map[string]string{}, setErr: errors.New("secret disk path")}
+	var current *session
+	var upstream, downstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"openai"}}`, message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, downstream.write)
+	current.selections = selections
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":23,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"/provider openai"}]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(upstream.messages()) != 1 {
+		t.Fatalf("upstream messages = %q", upstream.messages())
+	}
+	messages := downstream.messages()
+	if len(messages) != 1 || bytes.Contains(messages[0], []byte("secret")) || bytes.Contains(messages[0], []byte("Provider switched")) {
+		t.Fatalf("persistence failure response = %q", messages)
+	}
+}
+
+func TestSessionUsesStoredProviderForNormalTurn(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	selections := &fakeProviderSelections{values: map[string]string{"thr-a": "sub2api"}}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = "openai"
+	current.selections = selections
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "openai"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":24,"method":"turn/start","params":{"threadId":"thr-a","input":[{"type":"text","text":"ordinary prompt"}]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 2 {
+		t.Fatalf("upstream messages = %q", messages)
+	}
+	resume, _ := parseRPCMessage(messages[0])
+	var requestedProvider string
+	_ = json.Unmarshal(resume.params["modelProvider"], &requestedProvider)
+	turn, _ := parseRPCMessage(messages[1])
+	if requestedProvider != "sub2api" || turn.method != "turn/start" || turn.idKey != "24" {
+		t.Fatalf("resume provider = %q, turn = %#v", requestedProvider, turn)
+	}
+}
+
+func TestSessionResumeUsesStoredProvider(t *testing.T) {
+	t.Parallel()
+	selections := &fakeProviderSelections{values: map[string]string{"thr-a": "sub2api"}}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+			`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = "openai"
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":25,"method":"thread/resume","params":{"threadId":"thr-a","modelProvider":"openai"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 1 {
+		t.Fatalf("upstream messages = %q", messages)
+	}
+	resume, err := parseRPCMessage(messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestedProvider string
+	_ = json.Unmarshal(resume.params["modelProvider"], &requestedProvider)
+	if requestedProvider != "sub2api" {
+		t.Fatalf("resume provider = %q", requestedProvider)
+	}
+}
+
+func TestSessionStoredProviderReadFailureFailsClosed(t *testing.T) {
+	t.Parallel()
+	var upstream, downstream messageRecorder
+	current := newTestSession(t, upstream.write, downstream.write)
+	current.provider = "openai"
+	current.selections = &fakeProviderSelections{getErr: errors.New("secret state")}
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":26,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if len(upstream.messages()) != 0 {
+		t.Fatalf("state read failure reached upstream: %q", upstream.messages())
+	}
+	messages := downstream.messages()
+	if len(messages) != 1 || bytes.Contains(messages[0], []byte("secret")) {
+		t.Fatalf("state read failure response = %q", messages)
+	}
+}
+
 type messageRecorder struct {
 	mu       sync.Mutex
 	payloads [][]byte
+}
+
+type fakeProviderSelections struct {
+	values map[string]string
+	getErr error
+	setErr error
+}
+
+func (selections *fakeProviderSelections) Get(threadID string) (string, bool, error) {
+	if selections.getErr != nil {
+		return "", false, selections.getErr
+	}
+	value, ok := selections.values[threadID]
+	return value, ok, nil
+}
+
+func (selections *fakeProviderSelections) Set(threadID, provider string) error {
+	if selections.setErr != nil {
+		return selections.setErr
+	}
+	if selections.values == nil {
+		selections.values = make(map[string]string)
+	}
+	selections.values[threadID] = provider
+	return nil
 }
 
 func (recorder *messageRecorder) write(_ context.Context, messageType websocket.MessageType, payload []byte) error {
