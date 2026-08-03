@@ -1,5 +1,6 @@
 /bin/
 /dist/
+/.worktrees/
 /codex-provider-switcher
 *.out
 coverage.*
