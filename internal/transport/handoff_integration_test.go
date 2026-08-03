@@ -129,7 +129,7 @@ func TestRunRecoversSystemErrorProviderWithoutModelTurn(t *testing.T) {
 	server.history = []string{"failed-turn-fixture"}
 	server.descendants = []string{"thr-child"}
 	server.mu.Unlock()
-	connection, done := dialProviderProxyWithRecovery(t, ctx, server.socket, "openai")
+	connection, done := dialProviderProxy(t, ctx, server.socket, "openai")
 	defer connection.CloseNow()
 
 	initializeTestClient(t, ctx, connection)
@@ -478,7 +478,7 @@ func TestRunDoesNotRecoverIdleMismatchWithNonCooperatingSubscriber(t *testing.T)
 	initializeTestClient(t, ctx, raw)
 	resumeTestThread(t, ctx, raw, 2)
 
-	connection, done := dialProviderProxyWithRecovery(t, ctx, server.socket, "sub2api")
+	connection, done := dialProviderProxy(t, ctx, server.socket, "sub2api")
 	defer connection.CloseNow()
 	initializeTestClient(t, ctx, connection)
 	resumeTestThread(t, ctx, connection, 2)
@@ -821,12 +821,6 @@ type visibleRPC struct {
 
 func dialProviderProxy(t *testing.T, ctx context.Context, socket, provider string) (*websocket.Conn, <-chan error) {
 	return dialProviderProxyOptions(t, ctx, config.Config{Provider: provider, Socket: socket})
-}
-
-func dialProviderProxyWithRecovery(t *testing.T, ctx context.Context, socket, provider string) (*websocket.Conn, <-chan error) {
-	return dialProviderProxyOptions(t, ctx, config.Config{
-		Provider: provider, Socket: socket, ExclusiveRecovery: true,
-	})
 }
 
 func dialProviderProxyOptions(t *testing.T, ctx context.Context, configuration config.Config) (*websocket.Conn, <-chan error) {

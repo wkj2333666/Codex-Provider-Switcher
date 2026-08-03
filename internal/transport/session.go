@@ -86,7 +86,6 @@ type session struct {
 	closeOnce         sync.Once
 	coordinator       handoffCoordinator
 	selections        providerSelections
-	exclusiveRecovery bool
 	recoveries        recoveryJournals
 }
 
@@ -330,10 +329,8 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 	if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
 		return errors.New("provider handoff capability check failed")
 	}
-	if current.exclusiveRecovery {
-		if err := current.coordinator.PrepareRecoveryAll(ctx, threadID); err != nil {
-			return errors.New("provider recovery capability check failed")
-		}
+	if err := current.coordinator.PrepareRecoveryAll(ctx, threadID); err != nil {
+		return errors.New("provider recovery capability check failed")
 	}
 	if err := current.coordinator.MarkDirty(threadID); err != nil {
 		return errors.New("provider handoff dirty marker failed")
@@ -343,7 +340,7 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 		return errors.New("provider handoff unsubscribe failed")
 	}
 	if err := current.internalResume(ctx, threadID, targetProvider); err != nil {
-		if !errors.Is(err, errProviderMismatch) || !current.exclusiveRecovery || current.recoveries == nil {
+		if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
 		}

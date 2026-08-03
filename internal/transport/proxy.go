@@ -139,7 +139,7 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	upstream.SetReadLimit(limit)
 	return bridge(
 		ctx, downstream, upstream, options.Config.Provider, options.Config.Socket,
-		options.Config.ExclusiveRecovery, selections, recoveryStore,
+		selections, recoveryStore,
 	)
 }
 
@@ -199,7 +199,6 @@ func bridge(
 	ctx context.Context,
 	downstream, upstream *websocket.Conn,
 	provider, socket string,
-	exclusiveRecovery bool,
 	selections providerSelections,
 	recoveries recoveryJournals,
 ) error {
@@ -219,7 +218,6 @@ func bridge(
 		return errors.New("initialize provider handoff session")
 	}
 	current.selections = selections
-	current.exclusiveRecovery = exclusiveRecovery
 	current.recoveries = recoveries
 	coordinator, err := handoff.Open(socket, current)
 	if err != nil {
