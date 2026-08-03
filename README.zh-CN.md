@@ -107,6 +107,17 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 
 普通 Bash 登录通常使用 `~/.profile`。
 
+如果所有会订阅这些 app-server 任务的客户端都经过本 switcher，还可以启用
+`systemError` 终止状态的恢复：
+
+```bash
+export CODEX_PROVIDER_SWITCHER_RECOVERY="exclusive"
+```
+
+如果另一个项目会直接连接同一 app-server 中的这些任务，请不要启用此设置。
+恢复过程会短暂归档并还原受影响的任务，以卸载失败的运行时；任务 ID 和历史
+保持不变，也不会重新发送失败的消息。
+
 ### 4. 验证并重新连接 Desktop
 
 启动一个新的登录 Shell，然后运行：
@@ -187,7 +198,8 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 Codex 可执行文件的绝对路径。
 
 **切换被拒绝：** 先等待当前 turn 结束，同时确认 app-server 已配置目标供应商，
-并且 Codex CLI 不低于 0.146.0。
+并且 Codex CLI 不低于 0.146.0。如果上一个 turn 以 `systemError` 结束，请检查
+上面的 exclusive recovery 设置。
 
 **app-server socket 不可用：** 重新连接或重启 Codex Desktop 的远程主机，让
 它正常启动 app-server。Switcher 会按设计关闭失败，不会自行启动第二个 daemon。
@@ -197,13 +209,14 @@ Codex 可执行文件的绝对路径。
 
 ## 卸载
 
-先从远程登录 Shell 配置文件中删除安装时加入的两个 export，然后删除 wrapper
+先从远程登录 Shell 配置文件中删除安装时加入的 switcher export，然后删除 wrapper
 和 skill：
 
 ```bash
 rm -rf "$HOME/.local/lib/codex-provider-switcher"
 rm -rf "$HOME/.agents/skills/provider"
 unset CODEX_PROVIDER_SWITCHER_CODEX
+unset CODEX_PROVIDER_SWITCHER_RECOVERY
 hash -r 2>/dev/null || true
 command -v codex
 codex --version

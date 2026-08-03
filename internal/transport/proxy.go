@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
@@ -103,6 +104,11 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 		writeHTTPError(writer, http.StatusInternalServerError)
 		return errors.New("provider selection state unavailable")
 	}
+	recoveryStore, err := recovery.Open(stateDirectory)
+	if err != nil {
+		writeHTTPError(writer, http.StatusInternalServerError)
+		return errors.New("provider recovery state unavailable")
+	}
 
 	upstream, _, err := dialUpstream(ctx, request, options.Config.Socket)
 	if err != nil {
@@ -131,7 +137,10 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	}
 	downstream.SetReadLimit(limit)
 	upstream.SetReadLimit(limit)
-	return bridge(ctx, downstream, upstream, options.Config.Provider, options.Config.Socket, selections)
+	return bridge(
+		ctx, downstream, upstream, options.Config.Provider, options.Config.Socket,
+		options.Config.ExclusiveRecovery, selections, recoveryStore,
+	)
 }
 
 func writeHTTPError(writer http.ResponseWriter, status int) {
@@ -186,7 +195,14 @@ func dialUpstream(ctx context.Context, request *http.Request, socket string) (*w
 	})
 }
 
-func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider, socket string, selections providerSelections) error {
+func bridge(
+	ctx context.Context,
+	downstream, upstream *websocket.Conn,
+	provider, socket string,
+	exclusiveRecovery bool,
+	selections providerSelections,
+	recoveries recoveryJournals,
+) error {
 	bridgeContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 	current, err := newSessionState(
@@ -203,6 +219,8 @@ func bridge(ctx context.Context, downstream, upstream *websocket.Conn, provider,
 		return errors.New("initialize provider handoff session")
 	}
 	current.selections = selections
+	current.exclusiveRecovery = exclusiveRecovery
+	current.recoveries = recoveries
 	coordinator, err := handoff.Open(socket, current)
 	if err != nil {
 		current.closeState()

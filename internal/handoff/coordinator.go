@@ -37,11 +37,15 @@ const (
 	StatusNotLoaded     PeerStatus = "notLoaded"
 	StatusResubscribed  PeerStatus = "resubscribed"
 	StatusRestored      PeerStatus = "restored"
+	StatusRecoveryReady PeerStatus = "recoveryReady"
+	StatusRecoveryEnded PeerStatus = "recoveryEnded"
 )
 
 // Handler applies peer requests to one proxy connection.
 type Handler interface {
 	Prepare(threadID string) PeerStatus
+	BeginRecovery(threadID string, ids []string) PeerStatus
+	EndRecovery(threadID string) PeerStatus
 	Unsubscribe(context.Context, string) (PeerStatus, error)
 	Resubscribe(context.Context, string, string) (PeerStatus, error)
 	Restore(context.Context, string) (PeerStatus, error)
@@ -59,9 +63,10 @@ type Coordinator struct {
 }
 
 type controlRequest struct {
-	Method   string `json:"method"`
-	ThreadID string `json:"threadId"`
-	Provider string `json:"provider,omitempty"`
+	Method   string   `json:"method"`
+	ThreadID string   `json:"threadId"`
+	Provider string   `json:"provider,omitempty"`
+	IDs      []string `json:"ids,omitempty"`
 }
 
 type controlResponse struct {
@@ -157,6 +162,13 @@ func (coordinator *Coordinator) PrepareHandoffAll(ctx context.Context, threadID 
 	})
 }
 
+// PrepareRecoveryAll verifies recovery protocol support without changing state.
+func (coordinator *Coordinator) PrepareRecoveryAll(ctx context.Context, threadID string) error {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareRecoveryV1", ThreadID: threadID}, func(status PeerStatus) bool {
+		return status == StatusReady
+	})
+}
+
 // MarkDirty persists incomplete handoff state across every live proxy process.
 func (coordinator *Coordinator) MarkDirty(threadID string) error {
 	if threadID == "" {
@@ -223,6 +235,35 @@ func (coordinator *Coordinator) RestoreAll(ctx context.Context, threadID string)
 	}, true)
 }
 
+// BeginRecoveryAll installs bounded notification suppression on every peer.
+func (coordinator *Coordinator) BeginRecoveryAll(ctx context.Context, threadID string, ids []string) error {
+	if !validRecoveryIDs(threadID, ids) {
+		return errors.New("invalid provider recovery threads")
+	}
+	err := coordinator.visitPeers(ctx, controlRequest{
+		Method: "beginRecoveryV1", ThreadID: threadID, IDs: append([]string(nil), ids...),
+	}, func(status PeerStatus) bool {
+		return status == StatusRecoveryReady
+	})
+	if err != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+		defer cancel()
+		_ = coordinator.visitPeersMode(rollbackCtx, controlRequest{
+			Method: "endRecoveryV1", ThreadID: threadID,
+		}, func(status PeerStatus) bool {
+			return status == StatusRecoveryEnded
+		}, true)
+	}
+	return err
+}
+
+// EndRecoveryAll removes notification suppression from every peer.
+func (coordinator *Coordinator) EndRecoveryAll(ctx context.Context, threadID string) error {
+	return coordinator.visitPeersMode(ctx, controlRequest{Method: "endRecoveryV1", ThreadID: threadID}, func(status PeerStatus) bool {
+		return status == StatusRecoveryEnded
+	}, true)
+}
+
 // Close removes this peer endpoint.
 func (coordinator *Coordinator) Close() error {
 	var closeErr error
@@ -265,6 +306,16 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
 	case "prepareHandoffV2":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
+	case "prepareRecoveryV1":
+		response.Status = coordinator.handler.Prepare(request.ThreadID)
+	case "beginRecoveryV1":
+		if !validRecoveryIDs(request.ThreadID, request.IDs) {
+			response.Error = true
+			break
+		}
+		response.Status = coordinator.handler.BeginRecovery(request.ThreadID, request.IDs)
+	case "endRecoveryV1":
+		response.Status = coordinator.handler.EndRecovery(request.ThreadID)
 	case "unsubscribe":
 		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 		defer cancel()
@@ -300,6 +351,20 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 		response.Error = true
 	}
 	coordinator.writeControlResponse(connection, response)
+}
+
+func validRecoveryIDs(rootID string, ids []string) bool {
+	if rootID == "" || len(ids) == 0 || len(ids) > 64 {
+		return false
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	return seen[rootID]
 }
 
 func (coordinator *Coordinator) writeControlResponse(connection net.Conn, response controlResponse) {

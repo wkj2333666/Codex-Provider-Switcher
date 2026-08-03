@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rewrite"
 )
 
@@ -25,16 +26,21 @@ const (
 	providerCommandErrorCode  = -32602
 )
 
+var errProviderMismatch = errors.New("provider handoff verification mismatch")
+
 type handoffCoordinator interface {
 	LockThread(context.Context, string) (func(), error)
 	PrepareAll(context.Context, string) error
 	PrepareHandoffAll(context.Context, string) error
+	PrepareRecoveryAll(context.Context, string) error
 	UnsubscribeAll(context.Context, string) error
 	ResubscribeAll(context.Context, string, string) error
 	RestoreAll(context.Context, string) error
 	MarkDirty(string) error
 	IsDirty(string) bool
 	ClearDirty(string) error
+	BeginRecoveryAll(context.Context, string, []string) error
+	EndRecoveryAll(context.Context, string) error
 	Close() error
 }
 
@@ -43,6 +49,12 @@ type websocketWriteFunc func(context.Context, websocket.MessageType, []byte) err
 type providerSelections interface {
 	Get(string) (string, bool, error)
 	Set(string, string) error
+}
+
+type recoveryJournals interface {
+	Load(string) (recovery.Journal, bool, error)
+	Save(recovery.Journal) error
+	Clear(string) error
 }
 
 type desktopRequest struct {
@@ -67,12 +79,15 @@ type session struct {
 	effective         map[string]string
 	detached          map[string]bool
 	active            map[string]bool
+	recovery          map[string]map[string]bool
 	internalPrefix    string
 	sequence          atomic.Uint64
 	closed            chan struct{}
 	closeOnce         sync.Once
 	coordinator       handoffCoordinator
 	selections        providerSelections
+	exclusiveRecovery bool
+	recoveries        recoveryJournals
 }
 
 func newSessionState(provider, appServerSocket string, upstreamWrite, downstreamWrite websocketWriteFunc) (*session, error) {
@@ -94,6 +109,7 @@ func newSessionState(provider, appServerSocket string, upstreamWrite, downstream
 		effective:       make(map[string]string),
 		detached:        make(map[string]bool),
 		active:          make(map[string]bool),
+		recovery:        make(map[string]map[string]bool),
 		internalPrefix:  "cps-" + hex.EncodeToString(prefixBytes),
 		closed:          make(chan struct{}),
 	}, nil
@@ -173,6 +189,9 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return current.writeHandoffError(ctx, message.id)
 	}
 	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	if err := current.repairRecoveryJournal(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
 	if commandRecognized && command.action == providerCommandStatus {
@@ -276,6 +295,9 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		return current.writeHandoffError(ctx, message.id)
 	}
 	defer release()
+	if err := current.repairRecoveryJournal(ctx, threadID); err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
 	targetProvider, _, err := current.selectedProvider(threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
@@ -308,6 +330,11 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 	if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
 		return errors.New("provider handoff capability check failed")
 	}
+	if current.exclusiveRecovery {
+		if err := current.coordinator.PrepareRecoveryAll(ctx, threadID); err != nil {
+			return errors.New("provider recovery capability check failed")
+		}
+	}
 	if err := current.coordinator.MarkDirty(threadID); err != nil {
 		return errors.New("provider handoff dirty marker failed")
 	}
@@ -316,8 +343,14 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 		return errors.New("provider handoff unsubscribe failed")
 	}
 	if err := current.internalResume(ctx, threadID, targetProvider); err != nil {
-		current.restoreAfterHandoffFailure(threadID)
-		return err
+		if !errors.Is(err, errProviderMismatch) || !current.exclusiveRecovery || current.recoveries == nil {
+			current.restoreAfterHandoffFailure(threadID)
+			return err
+		}
+		if err := current.recoverSystemError(ctx, threadID, targetProvider); err != nil {
+			current.restoreAfterHandoffFailure(threadID)
+			return err
+		}
 	}
 	if err := current.coordinator.ResubscribeAll(ctx, threadID, targetProvider); err != nil {
 		current.clearEffectiveProvider(threadID)
@@ -339,6 +372,130 @@ func (current *session) restoreAfterHandoffFailure(threadID string) {
 
 func (current *session) internalResume(ctx context.Context, threadID, targetProvider string) error {
 	return current.internalResumeWithProvider(ctx, threadID, targetProvider, true)
+}
+
+func (current *session) recoverSystemError(ctx context.Context, threadID, targetProvider string) error {
+	client, err := newRecoveryClient(ctx, current.appServerSocket)
+	if err != nil {
+		return err
+	}
+	defer client.close()
+	ids, err := client.inspectSystemErrorSubtree(ctx, threadID)
+	if err != nil {
+		return err
+	}
+	journal := recovery.Journal{
+		Version: 1, RootID: threadID, Provider: targetProvider, Phase: "prepared",
+		Threads: append([]string(nil), ids...), Remaining: append([]string(nil), ids...),
+	}
+	if err := current.recoveries.Save(journal); err != nil {
+		return errors.New("persist provider recovery journal")
+	}
+	if err := current.coordinator.BeginRecoveryAll(ctx, threadID, ids); err != nil {
+		return errors.New("provider recovery peer preparation failed")
+	}
+	suppressionActive := true
+	defer func() {
+		if suppressionActive {
+			repairCtx, cancel := context.WithTimeout(context.Background(), handoffRecoveryTimeout)
+			defer cancel()
+			_ = current.coordinator.EndRecoveryAll(repairCtx, threadID)
+		}
+	}()
+	if err := client.archive(ctx, threadID); err != nil {
+		return err
+	}
+	journal.Phase = "restoring"
+	if err := current.recoveries.Save(journal); err != nil {
+		return errors.New("update provider recovery journal")
+	}
+	for len(journal.Remaining) > 0 {
+		if err := client.unarchive(ctx, journal.Remaining[0]); err != nil {
+			return err
+		}
+		journal.Remaining = append([]string(nil), journal.Remaining[1:]...)
+		if err := current.recoveries.Save(journal); err != nil {
+			return errors.New("update provider recovery journal")
+		}
+	}
+	if err := current.internalResume(ctx, threadID, targetProvider); err != nil {
+		return err
+	}
+	if err := current.coordinator.EndRecoveryAll(ctx, threadID); err != nil {
+		return errors.New("end provider recovery peer isolation")
+	}
+	suppressionActive = false
+	if err := current.recoveries.Clear(threadID); err != nil {
+		return errors.New("clear provider recovery journal")
+	}
+	return nil
+}
+
+func (current *session) repairRecoveryJournal(ctx context.Context, threadID string) error {
+	if current.recoveries == nil {
+		return nil
+	}
+	journal, found, err := current.recoveries.Load(threadID)
+	if err != nil {
+		return errors.New("read provider recovery journal")
+	}
+	if !found {
+		return nil
+	}
+	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
+		return errors.New("prepare provider recovery repair")
+	}
+	client, err := newRecoveryClient(ctx, current.appServerSocket)
+	if err != nil {
+		return err
+	}
+	defer client.close()
+	if err := current.coordinator.BeginRecoveryAll(ctx, threadID, journal.Threads); err != nil {
+		return errors.New("prepare provider recovery repair")
+	}
+	suppressionActive := true
+	defer func() {
+		if suppressionActive {
+			repairCtx, cancel := context.WithTimeout(context.Background(), handoffRecoveryTimeout)
+			defer cancel()
+			_ = current.coordinator.EndRecoveryAll(repairCtx, threadID)
+		}
+	}()
+
+	for len(journal.Remaining) > 0 {
+		id := journal.Remaining[0]
+		if err := client.unarchive(ctx, id); err != nil {
+			if !alreadyUnarchivedError(err, id) {
+				return errors.New("repair provider recovery thread")
+			}
+			if thread, readErr := client.readThread(ctx, id); readErr != nil || thread.ID != id {
+				return errors.New("repair provider recovery thread")
+			}
+		}
+		journal.Remaining = append([]string(nil), journal.Remaining[1:]...)
+		journal.Phase = "restoring"
+		if err := current.recoveries.Save(journal); err != nil {
+			return errors.New("update provider recovery repair journal")
+		}
+	}
+	provider, err := client.resume(ctx, threadID)
+	if err != nil {
+		return err
+	}
+	if err := client.unsubscribe(ctx, threadID); err != nil {
+		return err
+	}
+	current.stateMu.Lock()
+	current.effective[threadID] = provider
+	current.stateMu.Unlock()
+	if err := current.coordinator.EndRecoveryAll(ctx, threadID); err != nil {
+		return errors.New("end provider recovery repair isolation")
+	}
+	suppressionActive = false
+	if err := current.recoveries.Clear(threadID); err != nil {
+		return errors.New("clear provider recovery repair journal")
+	}
+	return nil
 }
 
 func (current *session) selectedProvider(threadID string) (string, bool, error) {
@@ -376,8 +533,11 @@ func (current *session) internalResumeWithProvider(ctx context.Context, threadID
 		return err
 	}
 	responseThreadID, provider, ok := responseThreadProvider(response)
-	if !ok || responseThreadID != threadID || provider != expectedProvider {
+	if !ok || responseThreadID != threadID {
 		return errors.New("provider handoff verification failed")
+	}
+	if provider != expectedProvider {
+		return errProviderMismatch
 	}
 	current.stateMu.Lock()
 	current.effective[threadID] = provider
@@ -554,6 +714,9 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 	if err != nil {
 		return current.writeDownstream(ctx, websocket.MessageText, payload)
 	}
+	if current.suppressRecoveryNotification(message) {
+		return nil
+	}
 
 	if message.kind == rpcResponse {
 		current.stateMu.Lock()
@@ -712,6 +875,54 @@ func (current *session) Prepare(threadID string) handoff.PeerStatus {
 		return handoff.StatusBusy
 	}
 	return handoff.StatusReady
+}
+
+// BeginRecovery installs exact notification suppression for one transaction.
+func (current *session) BeginRecovery(threadID string, ids []string) handoff.PeerStatus {
+	if threadID == "" || len(ids) == 0 || len(ids) > maxRecoveryThreads || current.isActive(threadID) {
+		return handoff.StatusBusy
+	}
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" || set[id] {
+			return handoff.StatusBusy
+		}
+		set[id] = true
+	}
+	if !set[threadID] {
+		return handoff.StatusBusy
+	}
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	current.recovery[threadID] = set
+	return handoff.StatusRecoveryReady
+}
+
+// EndRecovery removes exact notification suppression for one transaction.
+func (current *session) EndRecovery(threadID string) handoff.PeerStatus {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	delete(current.recovery, threadID)
+	return handoff.StatusRecoveryEnded
+}
+
+func (current *session) suppressRecoveryNotification(message rpcMessage) bool {
+	if message.kind != rpcNotification || message.threadID == "" {
+		return false
+	}
+	switch message.method {
+	case "thread/archived", "thread/unarchived", "thread/closed", "thread/status/changed":
+	default:
+		return false
+	}
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	for _, ids := range current.recovery {
+		if ids[message.threadID] {
+			return true
+		}
+	}
+	return false
 }
 
 func (current *session) closeState() {

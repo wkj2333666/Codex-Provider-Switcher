@@ -35,16 +35,28 @@ transactional soft unload before retrying the existing verified handoff.
 
 ## Activation Gate
 
-The switcher records `thread/status/changed` notifications per thread. Soft
-reload is eligible only when all of the following are true:
+Soft reload is disabled by default. It is enabled only when the proxy process
+receives `CODEX_PROVIDER_SWITCHER_RECOVERY=exclusive`. This is an operator
+contract that every app-server connection which may subscribe to the same
+threads is routed through this switcher deployment. The stock app-server does
+not expose a subscriber census, so the switcher cannot infer this guarantee
+from peer sockets or protocol responses. An unset or invalid value preserves
+the existing fail-closed handoff behavior.
 
-1. The requested provider differs from the verified effective provider.
-2. Every cooperating peer reports the thread is not active.
-3. The normal unsubscribe and `thread/resume` handoff returns the same thread
+The setting affects only intercepted `app-server proxy` processes. Delegated
+Codex CLI commands retain their original argv and environment, and the
+switcher does not modify or supervise the Codex binary or app-server daemon.
+
+Soft reload is eligible only when all of the following are true:
+
+1. Exclusive recovery is explicitly enabled.
+2. The requested provider differs from the verified effective provider.
+3. Every cooperating peer reports the thread is not active.
+4. The normal unsubscribe and `thread/resume` handoff returns the same thread
    id but a different provider.
-4. At least one cooperating peer has observed the thread status as
-   `systemError`.
-5. The app-server supports every RPC used by a disposable compatibility probe.
+5. A fresh internal `thread/read` confirms the root status is `systemError`.
+6. The app-server supports every RPC used by the disposable compatibility
+   probe.
 
 Other resume failures, malformed responses, unknown status, and version drift
 retain the existing static fail-closed error.
@@ -58,14 +70,16 @@ stock app-server must establish that:
 - `thread/unarchive` restores the same thread id and persisted turns;
 - a following `thread/resume` applies a different `modelProvider`;
 - no `turn/start` or model request is required;
-- archive notifications enumerate every active descendant moved with the root;
-- each moved descendant can be restored;
 - reconnecting and reading the thread shows unchanged history;
 - internal archive notifications can be consumed without leaking to Desktop.
 
-The probe uses a disposable thread and deletes no user thread. If any gate
-cannot be demonstrated, production soft reload is not implemented and the
-switcher keeps the current fail-closed behavior with a clearer diagnostic.
+The probe uses a disposable thread and deletes no user thread. A true spawned
+agent descendant cannot be created through the public protocol without a model
+turn, so subtree behavior is verified separately against the generated
+protocol schema, the upstream archive implementation, and the integration fake.
+If any root-thread gate cannot be demonstrated, production soft reload is not
+implemented and the switcher keeps the current fail-closed behavior with a
+clearer diagnostic.
 
 ## Recovery Transaction
 
@@ -78,12 +92,12 @@ prepare all peers
   -> unsubscribe all peers
   -> normal resume and provider verification
   -> on verified SystemError mismatch only:
-       begin notification suppression on all peers
+       open an initialized internal control connection
+       enumerate spawned descendants with ancestorThreadId
        persist recovery journal
-       read the root and active descendant set
+       begin notification suppression on all peers
        archive the root subtree
-       record every archived thread id
-       unarchive every recorded thread id
+       unarchive the pre-enumerated root and descendant ids
        resume the root with the target provider
        verify root id and provider
        end notification suppression
@@ -92,19 +106,29 @@ prepare all peers
   -> clear recovery journal and handoff dirty marker
 ```
 
+The control connection enables `experimentalApi` only for internal requests;
+the switcher does not alter Desktop's initialize capabilities. Enumeration
+pages `thread/list` with `ancestorThreadId`, rejects duplicate or malformed
+ids, and caps a recovery subtree at 64 threads so the peer-control protocol
+remains below its 4 KiB message limit. Failure or truncation occurs before
+archive mutation and fails closed.
+
 The first normal resume remains important: it preserves the fast path for
 future Codex versions and distinguishes the known stuck-runtime case from
 other compatibility failures.
 
 ## Recovery Journal
 
-Recovery state lives in the existing private runtime namespace and uses a
-per-thread file beside the handoff lock and dirty marker. It contains only:
+Recovery state lives in the configured persistent `StateDir` and uses a
+per-thread file in a private recovery subdirectory. The `/tmp` peer namespace
+is deliberately not used because a reboot must not erase repair state while a
+thread remains archived. The journal contains only:
 
 - schema version;
 - root thread id;
 - requested provider;
 - phase;
+- the complete bounded thread id set used for peer notification isolation;
 - thread ids confirmed archived but not yet confirmed unarchived.
 
 Writes use a mode-0600 temporary file, file sync, atomic rename, and directory
@@ -112,17 +136,20 @@ sync. The journal never contains prompts, history, credentials, paths from
 messages, or provider configuration.
 
 Before accepting another provider command or model turn for a journaled
-thread, the lock holder repairs it by unarchiving every recorded id, then
-resumes the root without a provider override to discover the actual runtime.
-It clears the journal only after the app-server confirms the root is available.
-An uncertain repair remains dirty and fails closed.
+thread, the lock holder repairs it by unarchiving every recorded id. It treats
+an id as already unarchived only when app-server returns the exact stock
+`-32600` "no archived rollout found" error for that id and `thread/read`
+confirms the same id exists. It then resumes the root without a provider
+override to discover the actual runtime. It clears the journal only after the
+app-server confirms the root is available. An uncertain repair remains dirty
+and fails closed.
 
 ## Notification Isolation
 
 `thread/archive` and `thread/unarchive` broadcast lifecycle notifications to
 all app-server connections. The coordinator therefore gains a recovery mode
-for one thread. Every peer acknowledges that mode before archive mutation and
-suppresses only matching internal notifications:
+for one bounded root-and-descendant id set. Every peer acknowledges that mode
+before archive mutation and suppresses only matching internal notifications:
 
 - `thread/archived` for ids recorded by the transaction;
 - `thread/unarchived` for the same ids;
@@ -135,10 +162,13 @@ is removed after successful reload or best-effort repair.
 ## Descendant Threads
 
 Codex archives the spawned subtree with a root. The switcher must not assume
-that unarchiving the root restores descendants. The probe determines the
-observable enumeration and ordering contract. Production recovery records and
-restores every thread id reported as archived. If the complete moved set
-cannot be established, recovery stops and leaves the journal for repair.
+that unarchiving the root restores descendants. Before mutation, the internal
+control connection queries every spawned descendant with `ancestorThreadId`
+and journals the complete set. Recovery restores descendants before the root,
+matching Codex's subtree archive preparation order. If the complete moved set
+cannot be established, recovery stops before archive. If a later archive or
+restore response is uncertain, the journal retains the pre-enumerated set for
+idempotent repair.
 
 ## Failure Semantics
 
@@ -148,7 +178,10 @@ cannot be established, recovery stops and leaves the journal for repair.
 - Best-effort repair never hides uncertainty by clearing dirty state.
 - Existing subscriptions are restored with the actual verified provider.
 - The switcher never archives a thread unless all known peers are quiescent
-  and participating in the recovery protocol.
+  and participating in the recovery protocol, and the operator has enabled
+  the exclusive-subscriber contract.
+- A non-switcher subscriber continues to make ordinary handoff fail closed;
+  recovery is never attempted unless exclusive mode was explicitly enabled.
 
 ## Testing
 
@@ -169,3 +202,22 @@ Coverage includes:
 
 The release gate also runs the disposable real app-server probe, `go test
 ./...`, `go test -race ./...` where supported, and `go vet ./...`.
+
+## Probe Result
+
+Probe date: 2026-08-03. Installed Codex: `codex-cli 0.146.0`.
+
+- SystemError reproduced: pass.
+- Normal resume provider mismatch reproduced: pass.
+- Root archive notification observed on both initialized clients: pass.
+- Root restored with the same id: pass.
+- Same root id resumed with `probe-alt`: pass.
+- History digest and turn count unchanged: pass in two fresh temporary homes.
+- No additional `turn/started` notification: pass; count remained one.
+- Spawned descendant restoration: not claimed by the zero-model probe. A
+  normal `thread/fork` was rejected as a surrogate because it is a history
+  branch, not a spawned agent descendant.
+
+The root soft-reload mechanism passes the implementation gate. Production
+work remains gated on pre-mutation descendant enumeration and integration tests
+for subtree restore, notification suppression, and crash repair.

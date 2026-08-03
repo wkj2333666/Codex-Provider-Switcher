@@ -31,6 +31,7 @@ Proxy options:
 Environment:
   CODEX_PROVIDER_SWITCHER_SOCKET
   CODEX_PROVIDER_SWITCHER_CODEX
+  CODEX_PROVIDER_SWITCHER_RECOVERY=exclusive
 
 When --provider is omitted, app-server configuration selects the provider.
 When installed under the name codex, app-server proxy is intercepted and all

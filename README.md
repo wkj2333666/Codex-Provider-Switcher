@@ -108,6 +108,18 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 
 For a normal Bash login this is usually `~/.profile`.
 
+If every client that subscribes to these app-server tasks goes through this
+switcher, you may also enable recovery from a terminal `systemError`:
+
+```bash
+export CODEX_PROVIDER_SWITCHER_RECOVERY="exclusive"
+```
+
+Do not enable this setting when another project connects directly to the same
+app-server threads. Recovery briefly archives and restores the affected thread
+to unload its failed runtime. It keeps the thread ID and history and never
+resends the failed message.
+
 ### 4. Verify and reconnect Desktop
 
 Start a fresh login shell and run:
@@ -197,7 +209,9 @@ directory appears before the real Codex directory in the remote login-shell
 is an absolute path to the real Codex executable.
 
 **A switch is rejected:** finish any active turn first. Also confirm the
-provider is configured in the app-server and Codex CLI is 0.146.0 or newer.
+provider is configured in the app-server and Codex CLI is 0.146.0 or newer. If
+the previous turn ended in `systemError`, check the exclusive recovery setting
+above.
 
 **The app-server socket is unavailable:** connect or restart Codex Desktop's
 remote host so its normal app-server is running. The switcher intentionally
@@ -208,13 +222,14 @@ For transport and handoff details, see
 
 ## Uninstall
 
-Remove the two exports from the remote login-shell profile, then remove the
+Remove the switcher exports from the remote login-shell profile, then remove the
 wrapper and skill:
 
 ```bash
 rm -rf "$HOME/.local/lib/codex-provider-switcher"
 rm -rf "$HOME/.agents/skills/provider"
 unset CODEX_PROVIDER_SWITCHER_CODEX
+unset CODEX_PROVIDER_SWITCHER_RECOVERY
 hash -r 2>/dev/null || true
 command -v codex
 codex --version

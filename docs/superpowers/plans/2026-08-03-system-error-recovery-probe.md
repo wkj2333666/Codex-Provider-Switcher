@@ -135,33 +135,35 @@ Assert the response still reports `modelProvider == "probe"`; if it reports
 `probe-alt`, the installed Codex already recovers the state and the production
 workaround is unnecessary.
 
-### Task 3: Archive/Unarchive Recovery Gate
+### Task 3: Root Archive/Unarchive Recovery Gate
 
 **Files:**
 - Modify temporarily: `/tmp/cps-system-error-recovery-probe.go`
 
 **Interfaces:**
 - Consumes: the stuck disposable thread and pre-recovery history digest from Task 2.
-- Produces: pass/fail evidence for same-id reload, history preservation, descendant enumeration, and zero extra model turns.
+- Produces: pass/fail evidence for same-id reload, history preservation, broadcast lifecycle visibility, and zero extra model turns.
 
-- [ ] **Step 1: Create and identify a disposable descendant**
+- [ ] **Step 1: Confirm the descendant boundary**
 
-Fork the root before recovery using `thread/fork` with `modelProvider: "probe"`
-and record the returned child id. Do not start a turn on the child. Read both
-threads and require the child reports the root through its parent/fork
-metadata.
+Use the generated 0.146.0 schema to confirm that `thread/fork` creates a
+history branch (`forkedFromId`) rather than a spawned agent descendant
+(`parentThreadId`). A true spawned descendant requires agent runtime behavior
+and cannot be manufactured by this zero-model probe. Production planning must
+therefore use an experimental control connection with `thread/list`
+`ancestorThreadId` plus fake-server subtree tests; this probe does not claim to
+validate descendant restoration.
 
 - [ ] **Step 2: Archive the root and collect lifecycle notifications**
 
-Send `thread/archive` for the root. Read notifications until both recorded ids
-have emitted `thread/archived`, and call `thread/loaded/list` to verify neither
-id is loaded. Fail if an unrecorded id is archived.
+Send `thread/archive` for the root. Require a matching `thread/archived`
+notification on both initialized clients, and call `thread/loaded/list` to
+verify the root is no longer loaded.
 
 - [ ] **Step 3: Restore every archived id**
 
-Send `thread/unarchive` for the root and child, accepting either order only if
-both calls return their original ids. Require one `thread/unarchived`
-notification per id.
+Send `thread/unarchive` for the root and require the response and one
+`thread/unarchived` notification to contain the original root id.
 
 - [ ] **Step 4: Resume with the alternate provider**
 
@@ -203,8 +205,8 @@ Add a dated `Probe Result` section to the design spec listing:
 Codex version
 SystemError reproduced
 Normal resume mismatch reproduced
-Root and descendant archive notifications observed
-Every archived id restored
+Root archive notification observed on both clients
+Root restored with the same id
 Same root id resumed with probe-alt
 History digest and turn count unchanged
 No additional turn started

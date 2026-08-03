@@ -14,16 +14,18 @@ import (
 )
 
 const (
-	socketEnvironment = "CODEX_PROVIDER_SWITCHER_SOCKET"
-	stateEnvironment  = "CODEX_PROVIDER_SWITCHER_STATE_DIR"
+	socketEnvironment   = "CODEX_PROVIDER_SWITCHER_SOCKET"
+	stateEnvironment    = "CODEX_PROVIDER_SWITCHER_STATE_DIR"
+	recoveryEnvironment = "CODEX_PROVIDER_SWITCHER_RECOVERY"
 )
 
 // Config contains fully resolved values for one proxied connection. Provider
 // is empty when app-server should apply its own effective configuration.
 type Config struct {
-	Provider string
-	Socket   string
-	StateDir string
+	Provider          string
+	Socket            string
+	StateDir          string
+	ExclusiveRecovery bool
 }
 
 // Result contains either a runnable configuration or a control action.
@@ -76,9 +78,10 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 	}
 
 	return Result{Config: Config{
-		Provider: provider,
-		Socket:   resolvedSocket,
-		StateDir: resolvedStateDirectory,
+		Provider:          provider,
+		Socket:            resolvedSocket,
+		StateDir:          resolvedStateDirectory,
+		ExclusiveRecovery: getenv(recoveryEnvironment) == "exclusive",
 	}}, nil
 }
 

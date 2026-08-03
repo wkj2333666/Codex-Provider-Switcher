@@ -1108,6 +1108,40 @@ func TestSessionStoredProviderReadFailureFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSessionSuppressesOnlyMatchingRecoveryLifecycle(t *testing.T) {
+	t.Parallel()
+	var downstream messageRecorder
+	current := newTestSession(t, nil, downstream.write)
+	if status := current.BeginRecovery("root", []string{"child", "root"}); status != handoff.StatusRecoveryReady {
+		t.Fatalf("BeginRecovery() status = %q", status)
+	}
+	messages := [][]byte{
+		[]byte(`{"method":"thread/archived","params":{"threadId":"root"}}`),
+		[]byte(`{"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"idle"}}}`),
+		[]byte(`{"method":"thread/archived","params":{"threadId":"other"}}`),
+		[]byte(`{"method":"turn/started","params":{"threadId":"root","turn":{"id":"turn-a"}}}`),
+	}
+	for _, message := range messages {
+		if err := current.handleUpstreamText(context.Background(), message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := downstream.messages(); len(got) != 2 || !bytes.Equal(got[0], messages[2]) || !bytes.Equal(got[1], messages[3]) {
+		t.Fatalf("visible messages = %q", got)
+	}
+	if status := current.EndRecovery("root"); status != handoff.StatusRecoveryEnded {
+		t.Fatalf("EndRecovery() status = %q", status)
+	}
+	after := []byte(`{"method":"thread/unarchived","params":{"threadId":"root"}}`)
+	if err := current.handleUpstreamText(context.Background(), after); err != nil {
+		t.Fatal(err)
+	}
+	got := downstream.messages()
+	if len(got) != 3 || !bytes.Equal(got[2], after) {
+		t.Fatalf("messages after end = %q", got)
+	}
+}
+
 type messageRecorder struct {
 	mu       sync.Mutex
 	payloads [][]byte
@@ -1233,6 +1267,14 @@ type fakeHandoffCoordinator struct {
 	dirty               bool
 }
 
+func (coordinator *fakeHandoffCoordinator) BeginRecoveryAll(context.Context, string, []string) error {
+	return nil
+}
+
+func (coordinator *fakeHandoffCoordinator) EndRecoveryAll(context.Context, string) error {
+	return nil
+}
+
 func (coordinator *fakeHandoffCoordinator) LockThread(context.Context, string) (func(), error) {
 	coordinator.lockCalls++
 	return func() { coordinator.releaseCalls++ }, nil
@@ -1246,6 +1288,10 @@ func (coordinator *fakeHandoffCoordinator) PrepareAll(context.Context, string) e
 func (coordinator *fakeHandoffCoordinator) PrepareHandoffAll(context.Context, string) error {
 	coordinator.prepareHandoffCalls++
 	return coordinator.prepareHandoffErr
+}
+
+func (coordinator *fakeHandoffCoordinator) PrepareRecoveryAll(context.Context, string) error {
+	return nil
 }
 
 func (coordinator *fakeHandoffCoordinator) UnsubscribeAll(context.Context, string) error {

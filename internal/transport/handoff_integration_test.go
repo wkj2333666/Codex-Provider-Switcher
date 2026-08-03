@@ -12,6 +12,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 )
 
 func TestRunSwitchesProviderOnNextTurn(t *testing.T) {
@@ -112,6 +113,214 @@ func TestProviderDesktopMarkdownSkillCommandSwitchesWithoutModelTurn(t *testing.
 	assertNoInternalMessages(t, visible)
 	if record := <-server.turns; record.threadID != "thr-shared" || record.provider != "sub2api" {
 		t.Fatalf("ordinary turn after command = %#v", record)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestRunRecoversSystemErrorProviderWithoutModelTurn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	server.mu.Lock()
+	server.systemError = true
+	server.history = []string{"failed-turn-fixture"}
+	server.descendants = []string{"thr-child"}
+	server.mu.Unlock()
+	connection, done := dialProviderProxyWithRecovery(t, ctx, server.socket, "openai")
+	defer connection.CloseNow()
+
+	initializeTestClient(t, ctx, connection)
+	if provider := resumeTestThread(t, ctx, connection, 2); provider != "openai" {
+		t.Fatalf("initial provider = %q", provider)
+	}
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{map[string]any{
+			"type": "text", "text": "[$provider](/home/user/.agents/skills/provider/SKILL.md) switch sub2api",
+		}},
+	})
+	response := readResponse(t, ctx, connection, "3")
+	if response.errorCode != 0 {
+		t.Fatalf("recovery response = %#v", response)
+	}
+	feedback := ""
+	for range 7 {
+		message := readVisibleRPC(t, ctx, connection)
+		if message.method == "item/agentMessage/delta" {
+			feedback = message.delta
+		}
+	}
+	if feedback != "Provider switched to sub2api." {
+		t.Fatalf("recovery feedback=%q", feedback)
+	}
+
+	server.mu.Lock()
+	provider := server.provider
+	archiveCalls := server.archiveCalls
+	unarchived := append([]string(nil), server.unarchived...)
+	history := append([]string(nil), server.history...)
+	server.mu.Unlock()
+	if provider != "sub2api" || archiveCalls != 1 {
+		t.Fatalf("recovered provider=%q archive calls=%d", provider, archiveCalls)
+	}
+	if fmt.Sprint(unarchived) != fmt.Sprint([]string{"thr-child", "thr-shared"}) {
+		t.Fatalf("unarchived = %v", unarchived)
+	}
+	if fmt.Sprint(history) != fmt.Sprint([]string{"failed-turn-fixture"}) {
+		t.Fatalf("history = %v", history)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("recovery turn/start calls = %d, want 0", calls)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestRunRepairsPersistedRecoveryBeforeProviderSwitch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	stateDir := t.TempDir()
+	store, err := recovery.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := recovery.Journal{
+		Version: 1, RootID: "thr-shared", Provider: "sub2api", Phase: "restoring",
+		Threads: []string{"thr-child", "thr-shared"}, Remaining: []string{"thr-child", "thr-shared"},
+	}
+	if err := store.Save(journal); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.archived["thr-child"] = true
+	server.archived["thr-shared"] = true
+	server.mu.Unlock()
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Provider: "openai", Socket: server.socket, StateDir: stateDir,
+	})
+	defer connection.CloseNow()
+	initializeTestClient(t, ctx, connection)
+	if provider := resumeTestThread(t, ctx, connection, 2); provider != "openai" {
+		t.Fatalf("provider after resume repair = %q", provider)
+	}
+	if _, ok, err := store.Load("thr-shared"); err != nil || ok {
+		t.Fatalf("journal after resume repair = ok %v, err %v", ok, err)
+	}
+
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{map[string]any{
+			"type": "text", "text": "[$provider](/home/user/.agents/skills/provider/SKILL.md) switch sub2api",
+		}},
+	})
+	response := readResponse(t, ctx, connection, "3")
+	if response.errorCode != 0 {
+		t.Fatalf("repair response = %#v", response)
+	}
+	for range 7 {
+		_ = readVisibleRPC(t, ctx, connection)
+	}
+	server.mu.Lock()
+	unarchived := append([]string(nil), server.unarchived...)
+	server.mu.Unlock()
+	if fmt.Sprint(unarchived) != fmt.Sprint([]string{"thr-child", "thr-shared"}) {
+		t.Fatalf("repair unarchived = %v", unarchived)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("repair turn/start calls = %d", calls)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestRunRetainsJournalWhenRecoveryRepairIsUncertain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	stateDir := t.TempDir()
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Provider: "openai", Socket: server.socket, StateDir: stateDir,
+	})
+	defer connection.CloseNow()
+	initializeTestClient(t, ctx, connection)
+	resumeTestThread(t, ctx, connection, 2)
+
+	store, err := recovery.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := recovery.Journal{
+		Version: 1, RootID: "thr-shared", Provider: "sub2api", Phase: "restoring",
+		Threads: []string{"thr-child", "thr-shared"}, Remaining: []string{"thr-child", "thr-shared"},
+	}
+	if err := store.Save(journal); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.archived["thr-child"] = true
+	server.archived["thr-shared"] = true
+	server.failUnarchive = "thr-child"
+	server.mu.Unlock()
+
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared", "input": []any{},
+	})
+	response := readResponse(t, ctx, connection, "3")
+	if response.errorCode != handoffErrorCode {
+		t.Fatalf("uncertain repair response = %#v", response)
+	}
+	if _, ok, err := store.Load("thr-shared"); err != nil || !ok {
+		t.Fatalf("journal after uncertain repair = ok %v, err %v", ok, err)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("uncertain repair turn/start calls = %d", calls)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestRunRepairsJournalWrittenBeforeArchive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	stateDir := t.TempDir()
+	store, err := recovery.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := recovery.Journal{
+		Version: 1, RootID: "thr-shared", Provider: "sub2api", Phase: "prepared",
+		Threads: []string{"thr-child", "thr-shared"}, Remaining: []string{"thr-child", "thr-shared"},
+	}
+	if err := store.Save(journal); err != nil {
+		t.Fatal(err)
+	}
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Provider: "openai", Socket: server.socket, StateDir: stateDir,
+	})
+	defer connection.CloseNow()
+	initializeTestClient(t, ctx, connection)
+	if provider := resumeTestThread(t, ctx, connection, 2); provider != "openai" {
+		t.Fatalf("provider after pre-archive repair = %q", provider)
+	}
+	if _, ok, err := store.Load("thr-shared"); err != nil || ok {
+		t.Fatalf("pre-archive journal after repair = ok %v, err %v", ok, err)
+	}
+	server.mu.Lock()
+	unarchived := append([]string(nil), server.unarchived...)
+	server.mu.Unlock()
+	if len(unarchived) != 0 {
+		t.Fatalf("pre-archive repair moved threads = %v", unarchived)
 	}
 
 	cancel()
@@ -260,20 +469,67 @@ func TestRunRejectsHandoffWithNonCooperatingSubscriber(t *testing.T) {
 	waitProxyDone(t, sub2apiDone)
 }
 
+func TestRunDoesNotRecoverIdleMismatchWithNonCooperatingSubscriber(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	raw := dialRawAppServer(t, ctx, server.socket)
+	defer raw.CloseNow()
+	initializeTestClient(t, ctx, raw)
+	resumeTestThread(t, ctx, raw, 2)
+
+	connection, done := dialProviderProxyWithRecovery(t, ctx, server.socket, "sub2api")
+	defer connection.CloseNow()
+	initializeTestClient(t, ctx, connection)
+	resumeTestThread(t, ctx, connection, 2)
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{map[string]any{
+			"type": "text", "text": "[$provider](/home/user/.agents/skills/provider/SKILL.md) switch sub2api",
+		}},
+	})
+	response := readResponse(t, ctx, connection, "3")
+	if response.errorCode != handoffErrorCode {
+		t.Fatalf("idle mismatch response = %#v", response)
+	}
+	server.mu.Lock()
+	archiveCalls := server.archiveCalls
+	server.mu.Unlock()
+	if archiveCalls != 0 {
+		t.Fatalf("idle mismatch archive calls = %d, want 0", archiveCalls)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("idle mismatch turn/start calls = %d", calls)
+	}
+
+	cancel()
+	_ = raw.CloseNow()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
 type handoffAppServer struct {
 	socket       string
 	ctx          context.Context
 	autoComplete bool
 
-	mu          sync.Mutex
-	writeMu     sync.Mutex
-	nextClient  int
-	provider    string
-	active      bool
-	subscribers map[int]*websocket.Conn
-	startedGate chan struct{}
-	turnStarts  int
-	turns       chan handoffTurnRecord
+	mu            sync.Mutex
+	writeMu       sync.Mutex
+	nextClient    int
+	provider      string
+	active        bool
+	subscribers   map[int]*websocket.Conn
+	clients       map[int]*websocket.Conn
+	startedGate   chan struct{}
+	turnStarts    int
+	turns         chan handoffTurnRecord
+	systemError   bool
+	descendants   []string
+	history       []string
+	archiveCalls  int
+	unarchived    []string
+	archived      map[string]bool
+	failUnarchive string
 }
 
 type handoffTurnRecord struct {
@@ -288,7 +544,9 @@ func newHandoffAppServer(t *testing.T, ctx context.Context, autoComplete bool) *
 		autoComplete: autoComplete,
 		provider:     "openai",
 		subscribers:  make(map[int]*websocket.Conn),
+		clients:      make(map[int]*websocket.Conn),
 		turns:        make(chan handoffTurnRecord, 8),
+		archived:     make(map[string]bool),
 	}
 	server.socket = startUnixHTTPServer(t, http.HandlerFunc(server.handleUpgrade))
 	return server
@@ -306,10 +564,12 @@ func (server *handoffAppServer) handleUpgrade(writer http.ResponseWriter, reques
 	server.mu.Lock()
 	server.nextClient++
 	clientID := server.nextClient
+	server.clients[clientID] = connection
 	server.mu.Unlock()
 	defer func() {
 		server.mu.Lock()
 		delete(server.subscribers, clientID)
+		delete(server.clients, clientID)
 		server.mu.Unlock()
 	}()
 
@@ -332,6 +592,14 @@ func (server *handoffAppServer) handleUpgrade(writer http.ResponseWriter, reques
 			server.handleResume(connection, clientID, message)
 		case "thread/unsubscribe":
 			server.handleUnsubscribe(connection, clientID, message)
+		case "thread/read":
+			server.handleRead(connection, message)
+		case "thread/list":
+			server.handleList(connection, message)
+		case "thread/archive":
+			server.handleArchive(connection, message)
+		case "thread/unarchive":
+			server.handleUnarchive(connection, message)
 		case "turn/start":
 			server.handleTurnStart(connection, message)
 		default:
@@ -344,16 +612,90 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 	requestedProvider := ""
 	_ = json.Unmarshal(message.params["modelProvider"], &requestedProvider)
 	server.mu.Lock()
-	if requestedProvider != "" && requestedProvider != server.provider && len(server.subscribers) == 0 && !server.active {
+	if server.archived["thr-shared"] {
+		server.mu.Unlock()
+		server.writeError(connection, message.id, -32001, "thread archived")
+		return
+	}
+	if requestedProvider != "" && requestedProvider != server.provider && len(server.subscribers) == 0 && !server.active && !server.systemError {
 		server.provider = requestedProvider
 	}
 	server.subscribers[clientID] = connection
 	provider := server.provider
+	status := "idle"
+	if server.systemError {
+		status = "systemError"
+	}
+	history := append([]string(nil), server.history...)
 	server.mu.Unlock()
 	server.writeResult(connection, message.id, map[string]any{
-		"thread":        map[string]any{"id": "thr-shared", "turns": []any{}},
+		"thread":        map[string]any{"id": "thr-shared", "turns": history, "status": map[string]any{"type": status}},
 		"modelProvider": provider,
 	})
+}
+
+func (server *handoffAppServer) handleRead(connection *websocket.Conn, message rpcMessage) {
+	threadID, _ := requireThreadID(message)
+	server.mu.Lock()
+	status := "idle"
+	if server.systemError && threadID == "thr-shared" {
+		status = "systemError"
+	}
+	history := append([]string(nil), server.history...)
+	server.mu.Unlock()
+	server.writeResult(connection, message.id, map[string]any{"thread": map[string]any{
+		"id": threadID, "status": map[string]any{"type": status}, "turns": history,
+	}})
+}
+
+func (server *handoffAppServer) handleList(connection *websocket.Conn, message rpcMessage) {
+	server.mu.Lock()
+	descendants := append([]string(nil), server.descendants...)
+	server.mu.Unlock()
+	data := make([]map[string]any, 0, len(descendants))
+	for _, id := range descendants {
+		data = append(data, map[string]any{"id": id, "parentThreadId": "thr-shared"})
+	}
+	server.writeResult(connection, message.id, map[string]any{"data": data, "nextCursor": nil})
+}
+
+func (server *handoffAppServer) handleArchive(connection *websocket.Conn, message rpcMessage) {
+	server.mu.Lock()
+	server.archiveCalls++
+	server.systemError = false
+	server.subscribers = make(map[int]*websocket.Conn)
+	clients := server.clientConnectionsLocked()
+	ids := append([]string(nil), server.descendants...)
+	ids = append(ids, "thr-shared")
+	for _, id := range ids {
+		server.archived[id] = true
+	}
+	server.mu.Unlock()
+	for _, id := range ids {
+		server.broadcastNotification(clients, "thread/archived", map[string]any{"threadId": id})
+	}
+	server.writeResult(connection, message.id, map[string]any{})
+}
+
+func (server *handoffAppServer) handleUnarchive(connection *websocket.Conn, message rpcMessage) {
+	threadID, _ := requireThreadID(message)
+	server.mu.Lock()
+	if server.failUnarchive == threadID {
+		server.mu.Unlock()
+		server.writeError(connection, message.id, -32002, "unarchive failed")
+		return
+	}
+	if !server.archived[threadID] {
+		server.mu.Unlock()
+		server.writeError(connection, message.id, -32600, "no archived rollout found for thread id "+threadID)
+		return
+	}
+	delete(server.archived, threadID)
+	server.unarchived = append(server.unarchived, threadID)
+	clients := server.clientConnectionsLocked()
+	server.mu.Unlock()
+	server.broadcastNotification(clients, "thread/unarchived", map[string]any{"threadId": threadID})
+	server.writeResult(connection, message.id, map[string]any{"thread": map[string]any{"id": threadID}})
 }
 
 func (server *handoffAppServer) handleUnsubscribe(connection *websocket.Conn, clientID int, message rpcMessage) {
@@ -429,6 +771,14 @@ func (server *handoffAppServer) subscriberConnectionsLocked() []*websocket.Conn 
 	return connections
 }
 
+func (server *handoffAppServer) clientConnectionsLocked() []*websocket.Conn {
+	connections := make([]*websocket.Conn, 0, len(server.clients))
+	for _, connection := range server.clients {
+		connections = append(connections, connection)
+	}
+	return connections
+}
+
 func (server *handoffAppServer) writeResult(connection *websocket.Conn, id json.RawMessage, result any) {
 	server.writeJSON(connection, map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -470,12 +820,22 @@ type visibleRPC struct {
 }
 
 func dialProviderProxy(t *testing.T, ctx context.Context, socket, provider string) (*websocket.Conn, <-chan error) {
+	return dialProviderProxyOptions(t, ctx, config.Config{Provider: provider, Socket: socket})
+}
+
+func dialProviderProxyWithRecovery(t *testing.T, ctx context.Context, socket, provider string) (*websocket.Conn, <-chan error) {
+	return dialProviderProxyOptions(t, ctx, config.Config{
+		Provider: provider, Socket: socket, ExclusiveRecovery: true,
+	})
+}
+
+func dialProviderProxyOptions(t *testing.T, ctx context.Context, configuration config.Config) (*websocket.Conn, <-chan error) {
 	t.Helper()
 	clientStream, switcherStream := net.Pipe()
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(ctx, Options{
-			Config: config.Config{Provider: provider, Socket: socket},
+			Config: configuration,
 			Stdin:  switcherStream,
 			Stdout: switcherStream,
 		})

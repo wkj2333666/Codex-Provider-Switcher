@@ -100,6 +100,7 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	}, dependencies{
 		getenv: env(map[string]string{
 			"CODEX_PROVIDER_SWITCHER_PROVIDER": "legacy-provider",
+			"CODEX_PROVIDER_SWITCHER_RECOVERY": "exclusive",
 		}),
 		stdin:  strings.NewReader("input"),
 		stdout: io.Discard,
@@ -116,7 +117,7 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	if code != 0 || delegated {
 		t.Fatalf("run(wrapper proxy) = %d, delegated %v", code, delegated)
 	}
-	if got.Config.Provider != "" || got.Config.Socket != socket {
+	if got.Config.Provider != "" || got.Config.Socket != socket || !got.Config.ExclusiveRecovery {
 		t.Fatalf("proxy config = %#v", got.Config)
 	}
 }

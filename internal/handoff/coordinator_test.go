@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -110,6 +112,41 @@ func TestPrepareHandoffAllRejectsLegacyPeerBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestPrepareRecoveryAllRequiresRecoveryCapablePeer(t *testing.T) {
+	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
+	legacyPath := filepath.Join(coordinator.directory, "session-handoff-v2.sock")
+	listener, err := net.Listen("unix", legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(legacyPath)
+	})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		data, readErr := readControlMessage(connection)
+		if readErr != nil {
+			return
+		}
+		var request controlRequest
+		_ = json.Unmarshal(data, &request)
+		response := controlResponse{Error: request.Method == "prepareRecoveryV1", Status: StatusReady}
+		encoded, _ := json.Marshal(response)
+		_, _ = connection.Write(append(encoded, '\n'))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.PrepareRecoveryAll(ctx, "thr-a"); err == nil {
+		t.Fatal("PrepareRecoveryAll() error = nil with handoff-v2 peer")
+	}
+}
+
 func TestDirtyStateIsSharedAcrossCoordinators(t *testing.T) {
 	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
 	first := openTestCoordinatorForSocket(t, appSocket, &testHandler{prepare: StatusReady})
@@ -207,6 +244,78 @@ func TestRestoreAllVisitsEveryPeerAfterFailure(t *testing.T) {
 	}
 }
 
+func TestRecoveryModeIsAcknowledgedAndClearedByEveryPeer(t *testing.T) {
+	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
+	handlers := []*testHandler{
+		{prepare: StatusReady},
+		{prepare: StatusReady},
+	}
+	coordinators := []*Coordinator{
+		openTestCoordinatorForSocket(t, appSocket, handlers[0]),
+		openTestCoordinatorForSocket(t, appSocket, handlers[1]),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ids := []string{"child-a", "thr-a"}
+	if err := coordinators[0].BeginRecoveryAll(ctx, "thr-a", ids); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinators[0].EndRecoveryAll(ctx, "thr-a"); err != nil {
+		t.Fatal(err)
+	}
+	for index, handler := range handlers {
+		begin, end, gotIDs := handler.recoveryResult()
+		if begin != 1 || end != 1 || !reflect.DeepEqual(gotIDs, ids) {
+			t.Fatalf("handler %d recovery = %d, %d, %v", index, begin, end, gotIDs)
+		}
+	}
+}
+
+func TestRecoveryModeRejectsInvalidIDSetBeforeContactingPeers(t *testing.T) {
+	handler := &testHandler{prepare: StatusReady}
+	coordinator := openTestCoordinator(t, handler)
+	ctx := context.Background()
+	invalid := [][]string{nil, {"other"}, {"thr-a", "thr-a"}}
+	oversized := make([]string, 65)
+	for index := range oversized {
+		oversized[index] = fmt.Sprintf("thr-%d", index)
+	}
+	invalid = append(invalid, oversized)
+	for _, ids := range invalid {
+		if err := coordinator.BeginRecoveryAll(ctx, "thr-a", ids); err == nil {
+			t.Fatalf("BeginRecoveryAll(%v) error = nil", ids)
+		}
+	}
+	begin, _, _ := handler.recoveryResult()
+	if begin != 0 {
+		t.Fatalf("invalid recovery contacted peer %d times", begin)
+	}
+}
+
+func TestBeginRecoveryRollsBackEveryPeerAfterPartialFailure(t *testing.T) {
+	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
+	handlers := []*testHandler{
+		{prepare: StatusReady},
+		{prepare: StatusReady, recoveryBeginStatus: StatusBusy},
+		{prepare: StatusReady},
+	}
+	coordinators := make([]*Coordinator, 0, len(handlers))
+	for _, handler := range handlers {
+		coordinators = append(coordinators, openTestCoordinatorForSocket(t, appSocket, handler))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinators[0].BeginRecoveryAll(ctx, "thr-a", []string{"thr-a"}); err == nil {
+		t.Fatal("BeginRecoveryAll() error = nil after peer rejection")
+	}
+	for index, handler := range handlers {
+		_, end, _ := handler.recoveryResult()
+		if end != 1 {
+			t.Fatalf("handler %d rollback end calls = %d, want 1", index, end)
+		}
+	}
+}
+
 func TestPrepareAllRemovesStaleSocket(t *testing.T) {
 	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
 	stalePath := filepath.Join(coordinator.directory, "session-stale.sock")
@@ -237,16 +346,38 @@ func TestPrepareAllRemovesStaleSocket(t *testing.T) {
 }
 
 type testHandler struct {
-	mu           sync.Mutex
-	prepare      PeerStatus
-	unsubscribe  PeerStatus
-	resubscribe  PeerStatus
-	restore      PeerStatus
-	calls        int
-	resumeCalls  int
-	restoreCalls int
-	provider     string
-	restoreErr   error
+	mu                  sync.Mutex
+	prepare             PeerStatus
+	unsubscribe         PeerStatus
+	resubscribe         PeerStatus
+	restore             PeerStatus
+	calls               int
+	resumeCalls         int
+	restoreCalls        int
+	provider            string
+	restoreErr          error
+	recoveryBegin       int
+	recoveryEnd         int
+	recoveryIDs         []string
+	recoveryBeginStatus PeerStatus
+}
+
+func (handler *testHandler) BeginRecovery(_ string, ids []string) PeerStatus {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.recoveryBegin++
+	handler.recoveryIDs = append([]string(nil), ids...)
+	if handler.recoveryBeginStatus != "" {
+		return handler.recoveryBeginStatus
+	}
+	return StatusRecoveryReady
+}
+
+func (handler *testHandler) EndRecovery(string) PeerStatus {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.recoveryEnd++
+	return StatusRecoveryEnded
 }
 
 func (handler *testHandler) Prepare(string) PeerStatus {
@@ -293,6 +424,12 @@ func (handler *testHandler) restoreCallCount() int {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	return handler.restoreCalls
+}
+
+func (handler *testHandler) recoveryResult() (int, int, []string) {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.recoveryBegin, handler.recoveryEnd, append([]string(nil), handler.recoveryIDs...)
 }
 
 func openTestCoordinator(t *testing.T, handler Handler) *Coordinator {
