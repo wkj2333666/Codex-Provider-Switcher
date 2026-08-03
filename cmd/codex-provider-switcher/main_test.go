@@ -90,6 +90,17 @@ func TestRunDirectProxyMode(t *testing.T) {
 	}
 }
 
+func TestUsageDoesNotAdvertiseRemovedRecoveryEnvironment(t *testing.T) {
+	var stdout bytes.Buffer
+	code := run(context.Background(), "codex-provider-switcher", nil, dependencies{stdout: &stdout})
+	if code != 0 {
+		t.Fatalf("run(help) = %d", code)
+	}
+	if strings.Contains(stdout.String(), "CODEX_PROVIDER_SWITCHER_RECOVERY") {
+		t.Fatalf("usage advertises removed recovery environment: %q", stdout.String())
+	}
+}
+
 func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	socket := unixSocket(t)
 	var got transport.Options
@@ -100,7 +111,6 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	}, dependencies{
 		getenv: env(map[string]string{
 			"CODEX_PROVIDER_SWITCHER_PROVIDER": "legacy-provider",
-			"CODEX_PROVIDER_SWITCHER_RECOVERY": "exclusive",
 		}),
 		stdin:  strings.NewReader("input"),
 		stdout: io.Discard,
@@ -117,7 +127,7 @@ func TestRunWrapperInterceptsAppServerProxy(t *testing.T) {
 	if code != 0 || delegated {
 		t.Fatalf("run(wrapper proxy) = %d, delegated %v", code, delegated)
 	}
-	if got.Config.Provider != "" || got.Config.Socket != socket || !got.Config.ExclusiveRecovery {
+	if got.Config.Provider != "" || got.Config.Socket != socket {
 		t.Fatalf("proxy config = %#v", got.Config)
 	}
 }

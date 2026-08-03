@@ -55,31 +55,17 @@ func TestParseProxyDefersProviderToAppServerAndIgnoresLegacyEnvironment(t *testi
 	}
 }
 
-func TestParseProxyEnablesOnlyExplicitExclusiveRecovery(t *testing.T) {
+func TestParseProxyIgnoresRemovedRecoveryEnvironment(t *testing.T) {
 	socket := unixSocket(t, "app-server.sock")
-	tests := []struct {
-		name    string
-		value   string
-		enabled bool
-	}{
-		{name: "unset"},
-		{name: "exclusive", value: "exclusive", enabled: true},
-		{name: "other value", value: "enabled"},
-		{name: "different case", value: "EXCLUSIVE"},
+	result, err := ParseProxy([]string{"--socket", socket}, environment(map[string]string{
+		"CODEX_PROVIDER_SWITCHER_RECOVERY": "exclusive",
+	}))
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := ParseProxy([]string{"--socket", socket}, environment(map[string]string{
-				"CODEX_PROVIDER_SWITCHER_RECOVERY": tt.value,
-			}))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if result.Config.ExclusiveRecovery != tt.enabled {
-				t.Fatalf("ExclusiveRecovery = %v, want %v", result.Config.ExclusiveRecovery, tt.enabled)
-			}
-		})
+	want := Config{Socket: socket, StateDir: customStateDir(socket)}
+	if result.Config != want {
+		t.Fatalf("Config = %#v, want %#v", result.Config, want)
 	}
 }
 
