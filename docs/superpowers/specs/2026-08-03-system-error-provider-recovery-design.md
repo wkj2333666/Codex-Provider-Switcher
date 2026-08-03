@@ -33,25 +33,31 @@ transactional soft unload before retrying the existing verified handoff.
 - Virtualizing thread ids or replacing a thread with a fork.
 - Supporting a non-switcher subscriber during provider handoff.
 
-## Activation Gate
+## Supported Connection Boundary
 
-Soft reload is disabled by default. It is enabled only when the proxy process
-receives `CODEX_PROVIDER_SWITCHER_RECOVERY=exclusive`. This is an operator
-contract that every app-server connection which may subscribe to the same
-threads is routed through this switcher deployment. The stock app-server does
-not expose a subscriber census, so the switcher cannot infer this guarantee
-from peer sockets or protocol responses. An unset or invalid value preserves
-the existing fail-closed handoff behavior.
+Soft reload is available by default in every intercepted `app-server proxy`
+process. It has no environment variable or command-line activation gate. The
+supported deployment routes every client that subscribes to the same
+app-server threads through the switcher wrapper. Codex Desktop and
+android-ssh-codex both use the intercepted `codex app-server proxy` path in
+that deployment.
 
-The setting affects only intercepted `app-server proxy` processes. Delegated
-Codex CLI commands retain their original argv and environment, and the
+A client that directly opens the app-server socket or deliberately invokes a
+real Codex binary outside the wrapper is outside the supported provider
+handoff architecture. The stock app-server exposes no subscriber census, so
+the switcher cannot discover or coordinate such a bypassing connection.
+Requiring an environment variable would only ask the operator to restate this
+deployment fact; it would not detect or prevent a bypass and therefore would
+not add a technical safety guarantee.
+
+Delegated Codex CLI commands retain their original argv and environment. The
 switcher does not modify or supervise the Codex binary or app-server daemon.
 
 Soft reload is eligible only when all of the following are true:
 
-1. Exclusive recovery is explicitly enabled.
-2. The requested provider differs from the verified effective provider.
-3. Every cooperating peer reports the thread is not active.
+1. The requested provider differs from the verified effective provider.
+2. Every cooperating peer reports the thread is not active.
+3. Every peer supports the recovery coordination protocol before mutation.
 4. The normal unsubscribe and `thread/resume` handoff returns the same thread
    id but a different provider.
 5. A fresh internal `thread/read` confirms the root status is `systemError`.
@@ -178,10 +184,9 @@ idempotent repair.
 - Best-effort repair never hides uncertainty by clearing dirty state.
 - Existing subscriptions are restored with the actual verified provider.
 - The switcher never archives a thread unless all known peers are quiescent
-  and participating in the recovery protocol, and the operator has enabled
-  the exclusive-subscriber contract.
-- A non-switcher subscriber continues to make ordinary handoff fail closed;
-  recovery is never attempted unless exclusive mode was explicitly enabled.
+  and participating in the recovery protocol.
+- A known non-cooperating subscriber continues to make ordinary handoff fail
+  closed before recovery. Deliberately bypassing the wrapper is unsupported.
 
 ## Testing
 
@@ -195,6 +200,7 @@ Coverage includes:
 - descendant restoration;
 - crash journals at each mutation boundary;
 - idempotent repair;
+- recovery enabled without environment or command-line configuration;
 - ordinary mismatch without `systemError` still failing closed;
 - peer capability rejection before mutation;
 - selection persistence only after verified recovery;
@@ -218,6 +224,6 @@ Probe date: 2026-08-03. Installed Codex: `codex-cli 0.146.0`.
   normal `thread/fork` was rejected as a surrogate because it is a history
   branch, not a spawned agent descendant.
 
-The root soft-reload mechanism passes the implementation gate. Production
-work remains gated on pre-mutation descendant enumeration and integration tests
-for subtree restore, notification suppression, and crash repair.
+The root soft-reload mechanism passes the implementation gate. The production
+implementation includes pre-mutation descendant enumeration and integration
+coverage for subtree restore, notification suppression, and crash repair.
