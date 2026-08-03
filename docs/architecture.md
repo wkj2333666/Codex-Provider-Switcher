@@ -98,12 +98,14 @@ layout, or a socket-specific hidden directory. A missing task selection sends
 no provider override; app-server applies its own effective configuration. An
 unreadable or corrupt saved selection fails closed.
 
-`CODEX_PROVIDER_SWITCHER_RECOVERY=exclusive` enables `systemError` soft reload
-only for intercepted app-server proxy processes. All other values disable it.
-The setting is an operator assertion that no client bypasses the switcher when
-subscribing to the same app-server threads; app-server exposes no public
-subscriber census from which the switcher could infer that fact. Delegated
-Codex commands keep their native argv, environment, signals, and exit behavior.
+`systemError` soft reload is available in every intercepted app-server proxy
+process without an environment variable or command-line gate. The supported
+deployment routes every client that subscribes to the same app-server threads
+through the switcher wrapper. A direct socket subscriber or a deliberately
+bypassed wrapper is outside the supported provider handoff architecture;
+app-server exposes no public subscriber census from which the switcher could
+discover such a connection. Delegated Codex commands keep their native argv,
+environment, signals, and exit behavior.
 
 ## Message Flow
 
@@ -121,12 +123,13 @@ For an idle cross-provider send, the downstream pump pauses the original
 ```text
 thread flock
   -> prepare every live peer (no mutation)
-  -> prepareHandoffV2 capability check for recovery support
+  -> prepareHandoffV2 capability check
+  -> prepareRecoveryV1 capability check
   -> create per-thread dirty marker
   -> unsubscribe every ready peer
   -> internal thread/resume with requested modelProvider
   -> verify returned thread id and modelProvider
-  -> on a same-id mismatch in explicit exclusive mode only:
+  -> on a verified same-id mismatch only:
        confirm thread/read status is systemError
        enumerate at most 63 spawned descendants
        persist the recovery journal
@@ -242,7 +245,7 @@ Provider handoff is also fail closed. A peer reporting an active turn aborts in
 the prepare phase before any unsubscribe occurs. A second-phase failure, a
 non-switcher subscriber, an older server, or a returned provider mismatch keeps
 the original turn from reaching app-server and produces static JSON-RPC error
-`-32090`. Exclusive recovery changes only the verified same-id mismatch whose
+`-32090`. Automatic recovery changes only the verified same-id mismatch whose
 fresh `thread/read` status is exactly `systemError`; an idle or unknown mismatch
 still fails closed without archive.
 
@@ -257,7 +260,7 @@ deployment fails before any peer is unsubscribed. Reconnecting the one Desktop
 SSH alias after upgrading activates the new protocol on every live proxy for
 that host identity.
 
-Exclusive mode also probes `prepareRecoveryV1` before the dirty marker or peer
+Every handoff also probes `prepareRecoveryV1` before the dirty marker or peer
 unsubscribe. Archive starts only after every peer later accepts the bounded
 `beginRecoveryV1` id set. Partial begin failures run best-effort
 `endRecoveryV1` against every peer before returning.
