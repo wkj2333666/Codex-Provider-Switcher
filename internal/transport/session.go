@@ -353,11 +353,7 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 			current.restoreAfterHandoffFailure(threadID)
 			return errors.New("provider handoff stage update failed")
 		}
-		if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageRecovering); err != nil {
-			current.restoreAfterHandoffFailure(threadID)
-			return errors.New("provider handoff stage update failed")
-		}
-		if err := current.recoverSystemError(ctx, threadID, targetProvider); err != nil {
+		if err := current.recoverProviderMismatch(ctx, threadID, targetProvider); err != nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
 		}
@@ -388,15 +384,18 @@ func (current *session) internalResume(ctx context.Context, threadID, targetProv
 	return current.internalResumeWithProvider(ctx, threadID, targetProvider, true)
 }
 
-func (current *session) recoverSystemError(ctx context.Context, threadID, targetProvider string) error {
+func (current *session) recoverProviderMismatch(ctx context.Context, threadID, targetProvider string) error {
 	client, err := newRecoveryClient(ctx, current.appServerSocket)
 	if err != nil {
 		return err
 	}
 	defer client.close()
-	ids, err := client.inspectSystemErrorSubtree(ctx, threadID)
+	ids, _, err := client.inspectRecoverableSubtree(ctx, threadID)
 	if err != nil {
 		return err
+	}
+	if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageRecovering); err != nil {
+		return errors.New("provider handoff stage update failed")
 	}
 	journal := recovery.Journal{
 		Version: 1, RootID: threadID, Provider: targetProvider, Phase: "prepared",

@@ -82,11 +82,12 @@ func (client *recoveryClient) close() {
 	}
 }
 
-func (client *recoveryClient) inspectSystemErrorSubtree(ctx context.Context, rootID string) ([]string, error) {
+func (client *recoveryClient) inspectRecoverableSubtree(ctx context.Context, rootID string) ([]string, string, error) {
 	thread, err := client.readThread(ctx, rootID)
-	if err != nil || thread.Status != "systemError" {
-		return nil, errors.New("recovery requires system error")
+	if err != nil || (thread.Status != "idle" && thread.Status != "systemError") {
+		return nil, "", errors.New("recovery requires quiescent thread")
 	}
+	status := thread.Status
 
 	type listedThread struct {
 		ID       string  `json:"id"`
@@ -105,7 +106,7 @@ func (client *recoveryClient) inspectSystemErrorSubtree(ctx context.Context, roo
 		}
 		response, err := client.call(ctx, "thread/list", params)
 		if err != nil {
-			return nil, errors.New("enumerate recovery subtree")
+			return nil, "", errors.New("enumerate recovery subtree")
 		}
 		var page struct {
 			Data       []listedThread `json:"data"`
@@ -113,25 +114,25 @@ func (client *recoveryClient) inspectSystemErrorSubtree(ctx context.Context, roo
 		}
 		encoded, _ := json.Marshal(response.result)
 		if json.Unmarshal(encoded, &page) != nil || page.Data == nil {
-			return nil, errors.New("invalid recovery subtree")
+			return nil, "", errors.New("invalid recovery subtree")
 		}
 		for _, thread := range page.Data {
 			if thread.ID == "" || thread.ID == rootID || thread.ParentID == nil || *thread.ParentID == "" {
-				return nil, errors.New("invalid recovery subtree")
+				return nil, "", errors.New("invalid recovery subtree")
 			}
 			if _, exists := parents[thread.ID]; exists {
-				return nil, errors.New("duplicate recovery thread")
+				return nil, "", errors.New("duplicate recovery thread")
 			}
 			parents[thread.ID] = *thread.ParentID
 			if len(parents)+1 > maxRecoveryThreads {
-				return nil, errors.New("recovery subtree exceeds limit")
+				return nil, "", errors.New("recovery subtree exceeds limit")
 			}
 		}
 		if page.NextCursor == nil {
 			break
 		}
 		if *page.NextCursor == "" || seenCursors[*page.NextCursor] {
-			return nil, errors.New("invalid recovery cursor")
+			return nil, "", errors.New("invalid recovery cursor")
 		}
 		cursor = *page.NextCursor
 		seenCursors[cursor] = true
@@ -167,7 +168,7 @@ func (client *recoveryClient) inspectSystemErrorSubtree(ctx context.Context, roo
 	ids := make([]string, 0, len(parents)+1)
 	for id := range parents {
 		if _, err := depth(id); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		ids = append(ids, id)
 	}
@@ -177,7 +178,7 @@ func (client *recoveryClient) inspectSystemErrorSubtree(ctx context.Context, roo
 		}
 		return ids[left] < ids[right]
 	})
-	return append(ids, rootID), nil
+	return append(ids, rootID), status, nil
 }
 
 func (client *recoveryClient) readThread(ctx context.Context, threadID string) (recoveryThread, error) {

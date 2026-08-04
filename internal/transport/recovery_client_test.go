@@ -16,16 +16,19 @@ import (
 func TestRecoveryClientInspectsSystemErrorSubtreeAcrossPages(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	server := newRecoveryProtocolServer(t, ctx, nil)
+	server := newRecoveryProtocolServer(t, ctx, "systemError", nil)
 
 	client, err := newRecoveryClient(ctx, server.socket)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.close()
-	ids, err := client.inspectSystemErrorSubtree(ctx, "root")
+	ids, status, err := client.inspectRecoverableSubtree(ctx, "root")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if status != "systemError" {
+		t.Fatalf("subtree status = %q, want systemError", status)
 	}
 	if want := []string{"child-b", "child-a", "child-c", "root"}; !reflect.DeepEqual(ids, want) {
 		t.Fatalf("subtree ids = %v, want %v", ids, want)
@@ -47,6 +50,55 @@ func TestRecoveryClientInspectsSystemErrorSubtreeAcrossPages(t *testing.T) {
 	}
 }
 
+func TestRecoveryClientAcceptsOnlyExactRecoverableStatuses(t *testing.T) {
+	tests := []struct {
+		status string
+		wantOK bool
+	}{
+		{status: "idle", wantOK: true},
+		{status: "systemError", wantOK: true},
+		{status: "active", wantOK: false},
+		{status: "", wantOK: false},
+		{status: "mystery", wantOK: false},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("status=%q", test.status), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			server := newRecoveryProtocolServer(t, ctx, test.status, []map[string]any{
+				{"id": "child", "parentThreadId": "root"},
+			})
+
+			client, err := newRecoveryClient(ctx, server.socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.close()
+			ids, status, err := client.inspectRecoverableSubtree(ctx, "root")
+			if test.wantOK {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status != test.status {
+					t.Fatalf("subtree status = %q, want %q", status, test.status)
+				}
+				if want := []string{"child", "root"}; !reflect.DeepEqual(ids, want) {
+					t.Fatalf("subtree ids = %v, want %v", ids, want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("inspectRecoverableSubtree() error = nil for status %q", test.status)
+			}
+			for _, request := range server.requestSnapshot() {
+				if request.method == "thread/list" {
+					t.Fatalf("rejected status %q reached thread/list", test.status)
+				}
+			}
+		})
+	}
+}
+
 func TestRecoveryClientRejectsSubtreeOverLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -54,15 +106,15 @@ func TestRecoveryClientRejectsSubtreeOverLimit(t *testing.T) {
 	for index := range children {
 		children[index] = map[string]any{"id": fmt.Sprintf("child-%02d", index), "parentThreadId": "root"}
 	}
-	server := newRecoveryProtocolServer(t, ctx, children)
+	server := newRecoveryProtocolServer(t, ctx, "idle", children)
 
 	client, err := newRecoveryClient(ctx, server.socket)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.close()
-	if _, err := client.inspectSystemErrorSubtree(ctx, "root"); err == nil {
-		t.Fatal("inspectSystemErrorSubtree() error = nil for 65 ids")
+	if _, _, err := client.inspectRecoverableSubtree(ctx, "root"); err == nil {
+		t.Fatal("inspectRecoverableSubtree() error = nil for 65 ids")
 	}
 	for _, request := range server.requestSnapshot() {
 		if request.method == "thread/archive" {
@@ -79,15 +131,16 @@ type recoveryProtocolRequest struct {
 type recoveryProtocolServer struct {
 	socket   string
 	ctx      context.Context
+	status   string
 	children []map[string]any
 
 	mu       sync.Mutex
 	requests []recoveryProtocolRequest
 }
 
-func newRecoveryProtocolServer(t *testing.T, ctx context.Context, children []map[string]any) *recoveryProtocolServer {
+func newRecoveryProtocolServer(t *testing.T, ctx context.Context, status string, children []map[string]any) *recoveryProtocolServer {
 	t.Helper()
-	server := &recoveryProtocolServer{ctx: ctx, children: children}
+	server := &recoveryProtocolServer{ctx: ctx, status: status, children: children}
 	server.socket = startUnixHTTPServer(t, http.HandlerFunc(server.handleUpgrade))
 	return server
 }
@@ -132,7 +185,7 @@ func (server *recoveryProtocolServer) handleUpgrade(writer http.ResponseWriter, 
 			result = map[string]any{"userAgent": "recovery-test"}
 		case "thread/read":
 			result = map[string]any{"thread": map[string]any{
-				"id": "root", "status": map[string]any{"type": "systemError"},
+				"id": "root", "status": map[string]any{"type": server.status},
 			}}
 		case "thread/list":
 			data := server.children
