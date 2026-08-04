@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 )
 
 var providerMethods = map[string]struct{}{
@@ -17,7 +19,7 @@ var providerMethods = map[string]struct{}{
 
 // Line validates one JSON-RPC line and applies routing fields to target
 // methods. Valid non-target messages are returned unchanged.
-func Line(line []byte, provider string) ([]byte, error) {
+func Line(line []byte, route modelroute.Route) ([]byte, error) {
 	var message map[string]json.RawMessage
 	if err := json.Unmarshal(line, &message); err != nil || message == nil {
 		return nil, errors.New("invalid JSON object")
@@ -30,10 +32,11 @@ func Line(line []byte, provider string) ([]byte, error) {
 	}
 
 	_, injectProvider := providerMethods[method]
-	if !injectProvider && method != "thread/list" {
+	injectTurnModel := method == "turn/start" && route.Model != ""
+	if !injectProvider && !injectTurnModel && method != "thread/list" {
 		return line, nil
 	}
-	if injectProvider && provider == "" {
+	if injectProvider && route.Provider == "" {
 		return line, nil
 	}
 
@@ -44,11 +47,16 @@ func Line(line []byte, provider string) ([]byte, error) {
 	}
 
 	if injectProvider {
-		value, err := json.Marshal(provider)
+		value, err := json.Marshal(route.Provider)
 		if err != nil {
 			return nil, errors.New("encode provider")
 		}
 		params["modelProvider"] = value
+		if route.Model != "" {
+			params["model"] = rawJSONString(route.Model)
+		}
+	} else if injectTurnModel {
+		params["model"] = rawJSONString(route.Model)
 	} else {
 		params["modelProviders"] = json.RawMessage("[]")
 	}
@@ -64,6 +72,11 @@ func Line(line []byte, provider string) ([]byte, error) {
 		return nil, fmt.Errorf("encode method %s", method)
 	}
 	return encoded, nil
+}
+
+func rawJSONString(value string) json.RawMessage {
+	encoded, _ := json.Marshal(value)
+	return encoded
 }
 
 func objectParams(raw json.RawMessage, present bool) (map[string]json.RawMessage, error) {

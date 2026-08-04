@@ -135,7 +135,7 @@ func (current *session) handleDownstreamText(ctx context.Context, payload []byte
 		return current.handleThreadUnsubscribe(ctx, message, payload)
 	}
 
-	rewritten, err := rewrite.Line(payload, current.provider)
+	rewritten, err := rewrite.Line(payload, modelroute.Route{Provider: current.provider})
 	if err != nil {
 		return errRoutingPolicy
 	}
@@ -307,7 +307,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	rewritten, err := rewrite.Line(payload, targetProvider)
+	rewritten, err := rewrite.Line(payload, modelroute.Route{Provider: targetProvider})
 	if err != nil {
 		return errRoutingPolicy
 	}
