@@ -167,6 +167,7 @@ Host pi
 /provider status
 /provider switch openai
 /provider switch sub2api
+/provider switch glm
 ```
 
 面向用户的命令只有：
@@ -175,8 +176,9 @@ Host pi
 - `/provider switch <name>`：切换当前空闲任务并保存选择。
 
 确认消息由 switcher 在本地生成，因此不会调用模型，也不会消耗模型 token。
-切换后任务 ID 和历史记录保持不变。运行中的 turn 不会被中断；请等待它结束
-后再切换。
+成功切换到 sub2api 时，确认消息为
+`Provider switched to sub2api using model gpt-5.6-sol.`。切换后任务 ID 和历史
+记录保持不变。运行中的 turn 不会被中断；请等待它结束后再切换。
 
 `models.json` 控制发送给当前任务的 model。成功切换到 GLM 后，当前线程标签可以
 显示已验证的 `glm-5.2`；这不表示 Desktop 的 model picker 中包含 GLM。Picker 由
@@ -185,8 +187,8 @@ Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中
 
 ## 升级
 
-使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后替换已安装的
-二进制和 skill：
+使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后原子替换已安装的
+二进制、provider skill 和 model catalog：
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"
@@ -196,12 +198,20 @@ mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
 
 rm -rf "$HOME/.agents/skills/provider"
 cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
+
+STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
+install -d -m 0700 "$STATE_ROOT"
+MODELS_STAGE="$(mktemp "$STATE_ROOT/.models.json.XXXXXX")"
+install -m 0600 /dev/null "$MODELS_STAGE"
+printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+  > "$MODELS_STAGE"
+mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
 ```
 
 这些命令会直接替换当前安装，不保留旧版本备份。不要修改现有的
 `CODEX_PROVIDER_SWITCHER_CODEX`：它必须指向真正的 Codex，不能指向 wrapper。
-每次升级后都要重新连接 Desktop SSH 主机。重新连接前请保持
-`$STATE_ROOT/models.json` 为 0600，并更新全部可切换 provider 的路由。
+每次升级后都要重新连接 Desktop SSH 主机。重新连接前，暂存 catalog 的替换会以
+0600 写入精确的受支持路由。
 
 ## 常见问题
 

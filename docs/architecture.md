@@ -158,9 +158,10 @@ compatibility; neither internal wire form is a separate user-facing command.
 After provider/model verification the switcher atomically saves the task selection
 and sends Desktop a synthetic response, `turn/started`, user and agent item
 events, and `turn/completed`. The fake agent message reports `Provider switched
-to sub2api.` for that target. It does not invoke a model or enter persisted
-rollout history, so the confirmation disappears after reopening while the
-saved provider remains effective.
+to sub2api using model gpt-5.6-sol.` for that mapped target. When no model is
+mapped, the legacy confirmation remains `Provider switched to sub2api.` It does
+not invoke a model or enter persisted rollout history, so the confirmation
+disappears after reopening while the saved provider remains effective.
 
 Codex may return `thread/start` before the new thread has a rollout that can be
 resumed or archived. The creating switcher session tracks that thread as fresh
