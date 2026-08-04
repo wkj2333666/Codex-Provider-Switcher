@@ -130,16 +130,18 @@ func TestRolloutNotReadyErrorRequiresExactRPCError(t *testing.T) {
 		err  error
 		want bool
 	}{
-		{name: "exact", err: &recoveryRPCError{code: -32600, message: "no rollout found"}, want: true},
-		{name: "wrapped exact", err: fmt.Errorf("outer: %w", &recoveryRPCError{code: -32600, message: "no rollout found"}), want: true},
-		{name: "wrong code", err: &recoveryRPCError{code: -32000, message: "no rollout found"}},
-		{name: "wrong message", err: &recoveryRPCError{code: -32600, message: "no archived rollout found"}},
+		{name: "exact", err: &appServerRPCError{code: -32600, message: "no rollout found"}, want: true},
+		{name: "wrapped exact", err: fmt.Errorf("outer: %w", &appServerRPCError{code: -32600, message: "no rollout found"}), want: true},
+		{name: "exact thread", err: &appServerRPCError{code: -32600, message: "no rollout found for thread id thr-a"}, want: true},
+		{name: "wrong code", err: &appServerRPCError{code: -32000, message: "no rollout found"}},
+		{name: "wrong message", err: &appServerRPCError{code: -32600, message: "no archived rollout found"}},
+		{name: "wrong thread", err: &appServerRPCError{code: -32600, message: "no rollout found for thread id thr-b"}},
 		{name: "generic", err: fmt.Errorf("no rollout found")},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := rolloutNotReadyError(test.err); got != test.want {
+			if got := rolloutNotReadyError(test.err, "thr-a"); got != test.want {
 				t.Fatalf("rolloutNotReadyError() = %v, want %v", got, test.want)
 			}
 		})

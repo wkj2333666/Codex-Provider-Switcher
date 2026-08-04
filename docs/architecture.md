@@ -160,14 +160,18 @@ to sub2api.` for that target. It does not invoke a model or enter persisted
 rollout history, so the confirmation disappears after reopening while the
 saved provider remains effective.
 
-Codex may return `thread/start` before the new rollout's initial metadata is
-archiveable. The creating switcher session tracks that thread as fresh until
-app-server accepts its first real turn. If a provider handoff for that fresh
-thread reaches an exact `-32600 no rollout found` archive response after the
-usual idle and provider-mismatch checks, the recovery client retries archive
-every 100 milliseconds for at most 15 seconds. Existing threads and every
-other error code or message still fail immediately. The original provider
-command remains withheld from app-server throughout the wait.
+Codex may return `thread/start` before the new thread has a rollout that can be
+resumed or archived. The creating switcher session tracks that thread as fresh
+until app-server accepts its first real turn. If its first provider resume
+returns the exact `-32600 no rollout found for thread id <same-id>` response,
+the switcher uses `thread/name/set` to materialize the zero-turn rollout, then
+retries resume every 100 milliseconds for at most 15 seconds. An existing task
+name is preserved; an unnamed task receives the provider command itself, such
+as `/provider switch sub2api`, as its name. If the later archive step reports
+the exact no-rollout variant without an id, it receives the same bounded wait.
+Existing threads, a different thread id, and every other error code or message
+still fail immediately. The provider command remains withheld from the model
+throughout the operation.
 
 The exact user-facing `/provider status` command and its skill-encoded internal
 wire form, `[$provider](<absolute-path>/provider/SKILL.md) status`, take the

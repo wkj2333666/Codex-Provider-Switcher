@@ -30,24 +30,38 @@ type recoveryThread struct {
 	Status string
 }
 
-type recoveryRPCError struct {
-	code    int
-	message string
-}
-
-func (*recoveryRPCError) Error() string {
-	return "recovery app-server request failed"
-}
-
 func alreadyUnarchivedError(err error, threadID string) bool {
-	var rpcError *recoveryRPCError
+	var rpcError *appServerRPCError
 	return errors.As(err, &rpcError) && rpcError.code == -32600 &&
 		rpcError.message == "no archived rollout found for thread id "+threadID
 }
 
-func rolloutNotReadyError(err error) bool {
-	var rpcError *recoveryRPCError
-	return errors.As(err, &rpcError) && rpcError.code == -32600 && rpcError.message == "no rollout found"
+func rolloutNotReadyError(err error, threadID string) bool {
+	var rpcError *appServerRPCError
+	return errors.As(err, &rpcError) && rpcError.code == -32600 &&
+		(rpcError.message == "no rollout found" ||
+			rpcError.message == "no rollout found for thread id "+threadID)
+}
+
+func retryFreshRollout(ctx context.Context, enabled bool, threadID string, operation func(context.Context) error) error {
+	if !enabled {
+		return operation(ctx)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, freshRolloutWaitTimeout)
+	defer cancel()
+	for {
+		err := operation(waitCtx)
+		if err == nil || !rolloutNotReadyError(err, threadID) {
+			return err
+		}
+		timer := time.NewTimer(freshRolloutRetryInterval)
+		select {
+		case <-timer.C:
+		case <-waitCtx.Done():
+			timer.Stop()
+			return waitCtx.Err()
+		}
+	}
 }
 
 func newRecoveryClient(ctx context.Context, socket string) (*recoveryClient, error) {
@@ -215,29 +229,16 @@ func (client *recoveryClient) readThread(ctx context.Context, threadID string) (
 }
 
 func (client *recoveryClient) archive(ctx context.Context, threadID string, waitForFreshRollout bool) error {
-	waitCtx := ctx
-	cancel := func() {}
-	if waitForFreshRollout {
-		waitCtx, cancel = context.WithTimeout(ctx, freshRolloutWaitTimeout)
+	err := retryFreshRollout(ctx, waitForFreshRollout, threadID, func(callCtx context.Context) error {
+		_, callErr := client.call(callCtx, "thread/archive", map[string]json.RawMessage{
+			"threadId": rawJSONString(threadID),
+		})
+		return callErr
+	})
+	if err != nil {
+		return errors.New("archive recovery thread")
 	}
-	defer cancel()
-
-	for {
-		_, err := client.call(waitCtx, "thread/archive", map[string]json.RawMessage{"threadId": rawJSONString(threadID)})
-		if err == nil {
-			return nil
-		}
-		if !waitForFreshRollout || !rolloutNotReadyError(err) {
-			return errors.New("archive recovery thread")
-		}
-		timer := time.NewTimer(freshRolloutRetryInterval)
-		select {
-		case <-timer.C:
-		case <-waitCtx.Done():
-			timer.Stop()
-			return errors.New("archive recovery thread")
-		}
-	}
+	return nil
 }
 
 func (client *recoveryClient) unarchive(ctx context.Context, threadID string) error {
@@ -322,7 +323,7 @@ func (client *recoveryClient) call(ctx context.Context, method string, params ma
 			if json.Unmarshal(payload, &envelope) != nil || envelope.Error.Message == "" {
 				return rpcMessage{}, errors.New("recovery app-server request failed")
 			}
-			return rpcMessage{}, &recoveryRPCError{code: envelope.Error.Code, message: envelope.Error.Message}
+			return rpcMessage{}, &appServerRPCError{code: envelope.Error.Code, message: envelope.Error.Message}
 		}
 		if message.result == nil {
 			return rpcMessage{}, errors.New("recovery app-server request failed")

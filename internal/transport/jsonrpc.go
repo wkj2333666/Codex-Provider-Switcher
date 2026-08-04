@@ -16,14 +16,25 @@ const (
 )
 
 type rpcMessage struct {
-	kind     rpcKind
-	method   string
-	id       json.RawMessage
-	idKey    string
-	params   map[string]json.RawMessage
-	result   map[string]json.RawMessage
-	hasError bool
-	threadID string
+	kind         rpcKind
+	method       string
+	id           json.RawMessage
+	idKey        string
+	params       map[string]json.RawMessage
+	result       map[string]json.RawMessage
+	hasError     bool
+	errorCode    int
+	errorMessage string
+	threadID     string
+}
+
+type appServerRPCError struct {
+	code    int
+	message string
+}
+
+func (*appServerRPCError) Error() string {
+	return "app-server request failed"
 }
 
 func parseRPCMessage(payload []byte) (rpcMessage, error) {
@@ -55,6 +66,14 @@ func parseRPCMessage(payload []byte) (rpcMessage, error) {
 	message.result = decodeObject(envelope["result"])
 	if rawError, ok := envelope["error"]; ok && hasJSONValue(rawError) {
 		message.hasError = true
+		var rpcError struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(rawError, &rpcError) == nil {
+			message.errorCode = rpcError.Code
+			message.errorMessage = rpcError.Message
+		}
 	}
 	if message.params != nil {
 		_ = json.Unmarshal(message.params["threadId"], &message.threadID)
@@ -83,6 +102,19 @@ func responseThreadProvider(message rpcMessage) (string, string, bool) {
 		return "", "", false
 	}
 	return threadID, provider, true
+}
+
+func responseThreadName(message rpcMessage) string {
+	if message.kind != rpcResponse || message.hasError || message.result == nil {
+		return ""
+	}
+	var thread map[string]json.RawMessage
+	if json.Unmarshal(message.result["thread"], &thread) != nil || thread == nil {
+		return ""
+	}
+	var name string
+	_ = json.Unmarshal(thread["name"], &name)
+	return name
 }
 
 func encodeRPCRequest(id, method string, params map[string]json.RawMessage) ([]byte, error) {

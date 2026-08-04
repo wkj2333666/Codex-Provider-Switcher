@@ -133,6 +133,31 @@ func TestSessionClearsFreshThreadAfterAcceptedTurn(t *testing.T) {
 	}
 }
 
+func TestSessionFreshRolloutPreservesExistingThreadName(t *testing.T) {
+	t.Parallel()
+	var current *session
+	requestedName := ""
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		_ = json.Unmarshal(message.params["name"], &requestedName)
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(`{"id":%s,"result":{}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.stateMu.Lock()
+	current.fresh["thr-a"] = "Existing task name"
+	current.stateMu.Unlock()
+
+	if err := current.materializeFreshRollout(context.Background(), "thr-a", "sub2api"); err != nil {
+		t.Fatal(err)
+	}
+	if requestedName != "Existing task name" {
+		t.Fatalf("materialized name = %q, want existing name", requestedName)
+	}
+}
+
 func TestSessionDefersUnsavedProviderToAppServer(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
@@ -238,7 +263,7 @@ func TestSessionClearsProviderAfterDesktopUnsubscribeAndThreadClose(t *testing.T
 	session.stateMu.Lock()
 	session.effective["thr-unsubscribe"] = "sub2api"
 	session.effective["thr-closed"] = "sub2api"
-	session.fresh["thr-closed"] = true
+	session.fresh["thr-closed"] = ""
 	session.desktop["4"] = &desktopRequest{
 		method:       "thread/unsubscribe",
 		threadID:     "thr-unsubscribe",

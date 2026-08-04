@@ -78,7 +78,7 @@ type session struct {
 	desktop           map[string]*desktopRequest
 	resumeTemplates   map[string]map[string]json.RawMessage
 	effective         map[string]string
-	fresh             map[string]bool
+	fresh             map[string]string
 	detached          map[string]bool
 	active            map[string]bool
 	recovery          map[string]map[string]bool
@@ -108,7 +108,7 @@ func newSessionState(provider, appServerSocket string, upstreamWrite, downstream
 		desktop:         make(map[string]*desktopRequest),
 		resumeTemplates: make(map[string]map[string]json.RawMessage),
 		effective:       make(map[string]string),
-		fresh:           make(map[string]bool),
+		fresh:           make(map[string]string),
 		detached:        make(map[string]bool),
 		active:          make(map[string]bool),
 		recovery:        make(map[string]map[string]bool),
@@ -346,7 +346,7 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff stage update failed")
 	}
-	if err := current.internalResume(ctx, threadID, targetProvider); err != nil {
+	if err := current.internalResumeForHandoff(ctx, threadID, targetProvider); err != nil {
 		if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
@@ -384,6 +384,35 @@ func (current *session) restoreAfterHandoffFailure(threadID string) {
 
 func (current *session) internalResume(ctx context.Context, threadID, targetProvider string) error {
 	return current.internalResumeWithProvider(ctx, threadID, targetProvider, true)
+}
+
+func (current *session) internalResumeForHandoff(ctx context.Context, threadID, targetProvider string) error {
+	materialized := false
+	return retryFreshRollout(ctx, current.isFresh(threadID), threadID, func(callCtx context.Context) error {
+		err := current.internalResume(callCtx, threadID, targetProvider)
+		if !materialized && rolloutNotReadyError(err, threadID) {
+			materialized = true
+			if materializeErr := current.materializeFreshRollout(callCtx, threadID, targetProvider); materializeErr != nil {
+				return materializeErr
+			}
+		}
+		return err
+	})
+}
+
+func (current *session) materializeFreshRollout(ctx context.Context, threadID, targetProvider string) error {
+	name := current.freshThreadName(threadID)
+	if name == "" {
+		name = "/provider switch " + targetProvider
+	}
+	_, err := current.callUpstream(ctx, "thread/name/set", map[string]json.RawMessage{
+		"threadId": rawJSONString(threadID),
+		"name":     rawJSONString(name),
+	})
+	if err != nil {
+		return errors.New("materialize fresh provider rollout")
+	}
+	return nil
 }
 
 func (current *session) recoverProviderMismatch(ctx context.Context, threadID, targetProvider string) error {
@@ -584,6 +613,9 @@ func (current *session) callUpstream(ctx context.Context, method string, params 
 	select {
 	case response := <-waiter:
 		if response.hasError {
+			if response.errorMessage != "" {
+				return rpcMessage{}, &appServerRPCError{code: response.errorCode, message: response.errorMessage}
+			}
 			return rpcMessage{}, errors.New("internal app-server request failed")
 		}
 		return response, nil
@@ -752,7 +784,7 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 				current.effective[threadID] = provider
 				delete(current.detached, threadID)
 				if request.method == "thread/start" {
-					current.fresh[threadID] = true
+					current.fresh[threadID] = responseThreadName(message)
 				}
 			}
 			if request.method == "turn/start" {
@@ -862,6 +894,13 @@ func (current *session) clearThreadRoutingState(threadID string) {
 }
 
 func (current *session) isFresh(threadID string) bool {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	_, ok := current.fresh[threadID]
+	return ok
+}
+
+func (current *session) freshThreadName(threadID string) string {
 	current.stateMu.Lock()
 	defer current.stateMu.Unlock()
 	return current.fresh[threadID]

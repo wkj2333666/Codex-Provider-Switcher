@@ -125,6 +125,7 @@ func TestProviderCommandWaitsForFreshThreadRollout(t *testing.T) {
 	defer cancel()
 	server := newHandoffAppServer(t, ctx, true)
 	server.mu.Lock()
+	server.freshNeedsMaterialize = true
 	server.archiveNotReadyFailures = 2
 	server.stickyIdle = true
 	server.mu.Unlock()
@@ -160,9 +161,13 @@ func TestProviderCommandWaitsForFreshThreadRollout(t *testing.T) {
 	server.mu.Lock()
 	provider := server.provider
 	archiveCalls := server.archiveCalls
+	materializeCalls := server.materializeCalls
+	nameSetValue := server.nameSetValue
 	server.mu.Unlock()
-	if provider != "sub2api" || archiveCalls != 3 {
-		t.Fatalf("fresh provider=%q archive calls=%d, want sub2api and 3", provider, archiveCalls)
+	if provider != "sub2api" || archiveCalls != 3 || materializeCalls != 1 ||
+		nameSetValue != "/provider switch sub2api" {
+		t.Fatalf("fresh provider=%q archive calls=%d materialize calls=%d name=%q",
+			provider, archiveCalls, materializeCalls, nameSetValue)
 	}
 	if calls := server.turnStartCallCount(); calls != 0 {
 		t.Fatalf("fresh provider switch model turns=%d, want 0", calls)
@@ -645,6 +650,10 @@ type handoffAppServer struct {
 	history                 []string
 	archiveCalls            int
 	archiveNotReadyFailures int
+	freshNeedsMaterialize   bool
+	rolloutReady            bool
+	materializeCalls        int
+	nameSetValue            string
 	unarchived              []string
 	archived                map[string]bool
 	failUnarchive           string
@@ -711,6 +720,8 @@ func (server *handoffAppServer) handleUpgrade(writer http.ResponseWriter, reques
 			server.writeResult(connection, message.id, map[string]any{"userAgent": "handoff-test"})
 		case "thread/start":
 			server.handleStart(connection, clientID, message)
+		case "thread/name/set":
+			server.handleNameSet(connection, message)
 		case "thread/resume":
 			server.handleResume(connection, clientID, message)
 		case "thread/unsubscribe":
@@ -753,6 +764,12 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 	requestedProvider := ""
 	_ = json.Unmarshal(message.params["modelProvider"], &requestedProvider)
 	server.mu.Lock()
+	if requestedProvider != "" && requestedProvider != server.provider &&
+		server.freshNeedsMaterialize && !server.rolloutReady {
+		server.mu.Unlock()
+		server.writeError(connection, message.id, -32600, "no rollout found for thread id thr-shared")
+		return
+	}
 	if server.archived["thr-shared"] {
 		server.mu.Unlock()
 		server.writeError(connection, message.id, -32001, "thread archived")
@@ -774,6 +791,20 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 		"thread":        map[string]any{"id": "thr-shared", "turns": history, "status": map[string]any{"type": status}},
 		"modelProvider": provider,
 	})
+}
+
+func (server *handoffAppServer) handleNameSet(connection *websocket.Conn, message rpcMessage) {
+	threadID, _ := requireThreadID(message)
+	name := ""
+	_ = json.Unmarshal(message.params["name"], &name)
+	server.mu.Lock()
+	if threadID == "thr-shared" && name != "" && server.freshNeedsMaterialize && !server.rolloutReady {
+		server.rolloutReady = true
+		server.materializeCalls++
+		server.nameSetValue = name
+	}
+	server.mu.Unlock()
+	server.writeResult(connection, message.id, map[string]any{})
 }
 
 func (server *handoffAppServer) handleRead(connection *websocket.Conn, message rpcMessage) {
