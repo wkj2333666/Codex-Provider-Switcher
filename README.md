@@ -202,8 +202,8 @@ routes the provider/model pair for requests.
 ## Upgrade
 
 Repeat the download and checksum steps with the new `VERSION`, enter the
-extracted package directory, and atomically replace the installed binary,
-provider skill, and model catalog:
+extracted package directory, atomically replace the installed binary and model
+catalog, and replace the provider skill:
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"

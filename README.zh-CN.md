@@ -188,7 +188,7 @@ Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中
 ## 升级
 
 使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后原子替换已安装的
-二进制、provider skill 和 model catalog：
+二进制和 model catalog，并替换 provider skill：
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"
