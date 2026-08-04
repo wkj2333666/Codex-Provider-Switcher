@@ -683,6 +683,9 @@ func TestSessionDirtyStateForcesDifferentPeerToRepairPartialResubscribe(t *testi
 	if !coordinator.dirty {
 		t.Fatal("partial resubscribe did not leave global dirty state")
 	}
+	if got := coordinator.dirtyStageCalls[len(coordinator.dirtyStageCalls)-1]; got != handoff.DirtyStageResubscribing {
+		t.Fatalf("partial resubscribe dirty stage = %q, want %q", got, handoff.DirtyStageResubscribing)
+	}
 
 	coordinator.resubscribeErr = nil
 	second := newResponsiveResumeSession(t, coordinator, "sub2api")
@@ -1258,6 +1261,7 @@ type fakeHandoffCoordinator struct {
 	restoreCalls        int
 	markDirtyCalls      int
 	clearDirtyCalls     int
+	dirtyStageCalls     []handoff.DirtyStage
 	releaseCalls        int
 	prepareErr          error
 	prepareHandoffErr   error
@@ -1312,6 +1316,12 @@ func (coordinator *fakeHandoffCoordinator) RestoreAll(context.Context, string) e
 func (coordinator *fakeHandoffCoordinator) MarkDirty(string) error {
 	coordinator.markDirtyCalls++
 	coordinator.dirty = true
+	coordinator.dirtyStageCalls = append(coordinator.dirtyStageCalls, handoff.DirtyStagePrepared)
+	return nil
+}
+
+func (coordinator *fakeHandoffCoordinator) SetDirtyStage(_ string, stage handoff.DirtyStage) error {
+	coordinator.dirtyStageCalls = append(coordinator.dirtyStageCalls, stage)
 	return nil
 }
 

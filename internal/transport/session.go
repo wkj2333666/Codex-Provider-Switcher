@@ -37,6 +37,7 @@ type handoffCoordinator interface {
 	ResubscribeAll(context.Context, string, string) error
 	RestoreAll(context.Context, string) error
 	MarkDirty(string) error
+	SetDirtyStage(string, handoff.DirtyStage) error
 	IsDirty(string) bool
 	ClearDirty(string) error
 	BeginRecoveryAll(context.Context, string, []string) error
@@ -339,15 +340,31 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff unsubscribe failed")
 	}
+	if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageUnsubscribed); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
+		return errors.New("provider handoff stage update failed")
+	}
 	if err := current.internalResume(ctx, threadID, targetProvider); err != nil {
 		if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
 		}
+		if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageResumeMismatch); err != nil {
+			current.restoreAfterHandoffFailure(threadID)
+			return errors.New("provider handoff stage update failed")
+		}
+		if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageRecovering); err != nil {
+			current.restoreAfterHandoffFailure(threadID)
+			return errors.New("provider handoff stage update failed")
+		}
 		if err := current.recoverSystemError(ctx, threadID, targetProvider); err != nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
 		}
+	}
+	if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageResubscribing); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
+		return errors.New("provider handoff stage update failed")
 	}
 	if err := current.coordinator.ResubscribeAll(ctx, threadID, targetProvider); err != nil {
 		current.clearEffectiveProvider(threadID)

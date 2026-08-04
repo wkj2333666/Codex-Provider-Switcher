@@ -26,6 +26,22 @@ const (
 	lockRetryInterval   = 10 * time.Millisecond
 )
 
+// DirtyStage identifies the last verified boundary of an incomplete handoff.
+type DirtyStage string
+
+const (
+	DirtyStagePrepared       DirtyStage = "prepared"
+	DirtyStageUnsubscribed   DirtyStage = "unsubscribed"
+	DirtyStageResumeMismatch DirtyStage = "resumeMismatch"
+	DirtyStageRecovering     DirtyStage = "recovering"
+	DirtyStageResubscribing  DirtyStage = "resubscribing"
+)
+
+type dirtyRecord struct {
+	Version int        `json:"version"`
+	Stage   DirtyStage `json:"stage"`
+}
+
 // PeerStatus is a bounded result from one cooperating proxy connection.
 type PeerStatus string
 
@@ -171,17 +187,66 @@ func (coordinator *Coordinator) PrepareRecoveryAll(ctx context.Context, threadID
 
 // MarkDirty persists incomplete handoff state across every live proxy process.
 func (coordinator *Coordinator) MarkDirty(threadID string) error {
-	if threadID == "" {
-		return errors.New("invalid dirty handoff thread")
+	return coordinator.SetDirtyStage(threadID, DirtyStagePrepared)
+}
+
+// SetDirtyStage atomically records the last verified handoff boundary.
+func (coordinator *Coordinator) SetDirtyStage(threadID string, stage DirtyStage) error {
+	if threadID == "" || !validDirtyStage(stage) {
+		return errors.New("invalid dirty handoff stage")
 	}
-	file, err := os.OpenFile(coordinator.threadStatePath("dirty", threadID, ".state"), os.O_CREATE|os.O_WRONLY, 0o600)
+	encoded, err := json.Marshal(dirtyRecord{Version: 1, Stage: stage})
 	if err != nil {
-		return errors.New("mark dirty handoff thread")
+		return errors.New("encode dirty handoff stage")
 	}
-	if err := file.Close(); err != nil {
-		return errors.New("close dirty handoff marker")
+	temporary, err := os.CreateTemp(coordinator.directory, ".dirty-*")
+	if err != nil {
+		return errors.New("create dirty handoff stage")
 	}
+	temporaryPath := temporary.Name()
+	committed := false
+	defer func() {
+		_ = temporary.Close()
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return errors.New("secure dirty handoff stage")
+	}
+	if _, err := temporary.Write(encoded); err != nil {
+		return errors.New("write dirty handoff stage")
+	}
+	if err := temporary.Sync(); err != nil {
+		return errors.New("write dirty handoff stage")
+	}
+	if err := temporary.Close(); err != nil {
+		return errors.New("write dirty handoff stage")
+	}
+	if err := os.Rename(temporaryPath, coordinator.threadStatePath("dirty", threadID, ".state")); err != nil {
+		return errors.New("replace dirty handoff stage")
+	}
+	directory, err := os.Open(coordinator.directory)
+	if err != nil {
+		return errors.New("open dirty handoff directory")
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil || closeErr != nil {
+		return errors.New("sync dirty handoff directory")
+	}
+	committed = true
 	return nil
+}
+
+func validDirtyStage(stage DirtyStage) bool {
+	switch stage {
+	case DirtyStagePrepared, DirtyStageUnsubscribed, DirtyStageResumeMismatch,
+		DirtyStageRecovering, DirtyStageResubscribing:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsDirty reports whether a prior handoff may have left peer state divergent.

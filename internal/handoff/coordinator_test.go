@@ -158,14 +158,57 @@ func TestDirtyStateIsSharedAcrossCoordinators(t *testing.T) {
 	if err := first.MarkDirty("thr-a"); err != nil {
 		t.Fatal(err)
 	}
+	assertDirtyStage(t, first, "thr-a", DirtyStagePrepared)
 	if !second.IsDirty("thr-a") {
 		t.Fatal("dirty marker not visible to second coordinator")
 	}
+	if err := second.SetDirtyStage("thr-a", DirtyStageUnsubscribed); err != nil {
+		t.Fatal(err)
+	}
+	assertDirtyStage(t, first, "thr-a", DirtyStageUnsubscribed)
 	if err := second.ClearDirty("thr-a"); err != nil {
 		t.Fatal(err)
 	}
 	if first.IsDirty("thr-a") {
 		t.Fatal("cleared dirty marker still visible")
+	}
+}
+
+func TestDirtyStageRejectsInvalidValueAndReplacesLegacyMarker(t *testing.T) {
+	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
+	path := coordinator.threadStatePath("dirty", "thr-a", ".state")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !coordinator.IsDirty("thr-a") {
+		t.Fatal("legacy empty marker is not dirty")
+	}
+	if err := coordinator.SetDirtyStage("thr-a", DirtyStage("invalid")); err == nil {
+		t.Fatal("SetDirtyStage() error = nil for invalid stage")
+	}
+	if err := coordinator.SetDirtyStage("thr-a", DirtyStageResumeMismatch); err != nil {
+		t.Fatal(err)
+	}
+	assertDirtyStage(t, coordinator, "thr-a", DirtyStageResumeMismatch)
+}
+
+func assertDirtyStage(t *testing.T, coordinator *Coordinator, threadID string, want DirtyStage) {
+	t.Helper()
+	path := coordinator.threadStatePath("dirty", threadID, ".state")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record dirtyRecord
+	if json.Unmarshal(data, &record) != nil || record.Version != 1 || record.Stage != want {
+		t.Fatalf("dirty record = %q, %#v; want stage %q", data, record, want)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("dirty marker mode = %o, want 600", info.Mode().Perm())
 	}
 }
 
