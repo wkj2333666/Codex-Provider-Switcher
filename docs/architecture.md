@@ -98,14 +98,14 @@ layout, or a socket-specific hidden directory. A missing task selection sends
 no provider override; app-server applies its own effective configuration. An
 unreadable or corrupt saved selection fails closed.
 
-`systemError` soft reload is available in every intercepted app-server proxy
-process without an environment variable or command-line gate. The supported
-deployment routes every client that subscribes to the same app-server threads
-through the switcher wrapper. A direct socket subscriber or a deliberately
-bypassed wrapper is outside the supported provider handoff architecture;
-app-server exposes no public subscriber census from which the switcher could
-discover such a connection. Delegated Codex commands keep their native argv,
-environment, signals, and exit behavior.
+Exact `idle` provider-mismatch and `systemError` soft reloads are available in
+every intercepted app-server proxy process without an environment variable or
+command-line gate. The supported deployment routes every client that subscribes
+to the same app-server threads through the switcher wrapper. A direct socket
+subscriber or a deliberately bypassed wrapper is outside the supported
+provider handoff architecture; app-server exposes no public subscriber census
+from which the switcher could discover such a connection. Delegated Codex
+commands keep their native argv, environment, signals, and exit behavior.
 
 ## Message Flow
 
@@ -125,16 +125,20 @@ thread flock
   -> prepare every live peer (no mutation)
   -> prepareHandoffV2 capability check
   -> prepareRecoveryV1 capability check
-  -> create per-thread dirty marker
+  -> create per-thread dirty marker at stage prepared
   -> unsubscribe every ready peer
+  -> mark stage unsubscribed
   -> internal thread/resume with requested modelProvider
   -> verify returned thread id and modelProvider
   -> on a verified same-id mismatch only:
-       confirm thread/read status is systemError
+       mark stage resumeMismatch
+       confirm thread/read status is exactly idle or systemError
        enumerate at most 63 spawned descendants
+       mark stage recovering
        persist the recovery journal
        archive the root and unarchive descendants then root
        resume and verify the requested provider
+  -> mark stage resubscribing
   -> resubscribe detached peers with the verified provider
   -> forward original turn/start
 ```
@@ -173,8 +177,9 @@ Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before
 the turn begins, so previously open Desktop views continue receiving item and
 turn notifications. Explicit Desktop unsubscribe clears detach state and is
-never reversed. The dirty marker is removed only after the sender resume and
-all peer resubscribes succeed.
+never reversed. The versioned dirty marker contains only a bounded stage name
+and is removed only after the sender resume and all peer resubscribes succeed.
+Legacy empty markers remain dirty and force the same complete transaction.
 
 Any failure after the marker is created runs best-effort `restore` against all
 peers, continuing after individual errors. Detached peers resume with only the
@@ -242,12 +247,14 @@ CLI overrides, and built-in defaults. Diagnostics never format message bodies,
 prompts, handshake values, environment contents, or credentials.
 
 Provider handoff is also fail closed. A peer reporting an active turn aborts in
-the prepare phase before any unsubscribe occurs. A second-phase failure, a
-non-switcher subscriber, an older server, or a returned provider mismatch keeps
-the original turn from reaching app-server and produces static JSON-RPC error
-`-32090`. Automatic recovery changes only the verified same-id mismatch whose
-fresh `thread/read` status is exactly `systemError`; an idle or unknown mismatch
-still fails closed without archive.
+the prepare phase before any unsubscribe occurs. A second-phase failure, an
+older server, or an ineligible returned provider mismatch keeps the original
+turn from reaching app-server and produces static JSON-RPC error `-32090`.
+Automatic recovery changes only a verified same-id mismatch whose fresh
+`thread/read` status is exactly `idle` or `systemError`; active, empty,
+malformed, RPC-error, and unknown statuses fail closed without archive. Direct
+subscribers remain outside the supported deployment boundary rather than a
+condition the switcher can reliably detect.
 
 The prepare phase runs for every send, including the same-provider path. The
 sender marks its thread active before writing upstream while still holding the

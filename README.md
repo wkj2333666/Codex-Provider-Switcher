@@ -108,11 +108,12 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 
 For a normal Bash login this is usually `~/.profile`.
 
-Recovery from a terminal `systemError` is automatic. The switcher briefly
-archives and restores the affected thread to unload its failed runtime. It
-keeps the thread ID and history and never resends the failed message. Clients
-that subscribe to the same app-server threads must use the switcher wrapper;
-direct app-server subscribers are unsupported.
+Recovery from an exact idle provider mismatch or terminal `systemError` is
+automatic. The switcher briefly archives and restores the affected thread to
+unload its stale runtime. It keeps the thread ID, history, and descendants and
+never resends the user's message. Every client that subscribes to the same
+app-server threads must use the switcher wrapper; direct app-server subscribers
+are unsupported.
 
 ### 4. Verify and reconnect Desktop
 

@@ -107,10 +107,10 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 
 普通 Bash 登录通常使用 `~/.profile`。
 
-`systemError` 终止状态会自动恢复。Switcher 会短暂归档并还原受影响的任务，
-以卸载失败的运行时；任务 ID 和历史保持不变，也不会重新发送失败的消息。
-订阅同一 app-server 任务的客户端都必须使用 switcher wrapper；不支持绕过
-wrapper 直接订阅 app-server。
+精确的空闲 provider 不一致和 `systemError` 终止状态都会自动恢复。Switcher
+会短暂归档并还原受影响的任务，以卸载陈旧运行时；任务 ID、历史和子任务保持
+不变，也不会重新发送用户消息。订阅同一 app-server 任务的客户端都必须使用
+switcher wrapper；不支持绕过 wrapper 直接订阅 app-server。
 
 ### 4. 验证并重新连接 Desktop
 
