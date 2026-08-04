@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
@@ -99,6 +100,11 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	if stateDirectory == "" {
 		stateDirectory = filepath.Join(filepath.Dir(options.Config.Socket), ".codex-provider-switcher")
 	}
+	routes, err := modelroute.Load(stateDirectory)
+	if err != nil {
+		writeHTTPError(writer, http.StatusInternalServerError)
+		return errors.New("provider model routes unavailable")
+	}
 	selections, err := selection.Open(stateDirectory)
 	if err != nil {
 		writeHTTPError(writer, http.StatusInternalServerError)
@@ -139,7 +145,7 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	upstream.SetReadLimit(limit)
 	return bridge(
 		ctx, downstream, upstream, options.Config.Provider, options.Config.Socket,
-		selections, recoveryStore,
+		routes, selections, recoveryStore,
 	)
 }
 
@@ -199,13 +205,14 @@ func bridge(
 	ctx context.Context,
 	downstream, upstream *websocket.Conn,
 	provider, socket string,
+	routes *modelroute.Catalog,
 	selections providerSelections,
 	recoveries recoveryJournals,
 ) error {
 	bridgeContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 	current, err := newSessionState(
-		provider,
+		provider, routes,
 		socket,
 		func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
 			return upstream.Write(ctx, messageType, payload)

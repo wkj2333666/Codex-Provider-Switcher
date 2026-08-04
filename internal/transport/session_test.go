@@ -209,7 +209,7 @@ func TestSessionDefersUnsavedProviderToAppServer(t *testing.T) {
 
 func TestNewSessionAllowsNoProviderOverride(t *testing.T) {
 	t.Parallel()
-	current, err := newSessionState("", "/tmp/app-server.sock",
+	current, err := newSessionState("", nil, "/tmp/app-server.sock",
 		func(context.Context, websocket.MessageType, []byte) error { return nil },
 		func(context.Context, websocket.MessageType, []byte) error { return nil })
 	if err != nil {
@@ -1300,7 +1300,7 @@ func newTestSession(t *testing.T, upstreamWrite, downstreamWrite websocketWriteF
 	if downstreamWrite == nil {
 		downstreamWrite = func(context.Context, websocket.MessageType, []byte) error { return nil }
 	}
-	session, err := newSessionState("sub2api", "/tmp/app-server.sock", upstreamWrite, downstreamWrite)
+	session, err := newSessionState("sub2api", nil, "/tmp/app-server.sock", upstreamWrite, downstreamWrite)
 	if err != nil {
 		t.Fatal(err)
 	}

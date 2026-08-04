@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rewrite"
@@ -66,6 +67,7 @@ type desktopRequest struct {
 
 type session struct {
 	provider        string
+	routes          *modelroute.Catalog
 	appServerSocket string
 
 	upstreamWrite   websocketWriteFunc
@@ -91,7 +93,7 @@ type session struct {
 	recoveries        recoveryJournals
 }
 
-func newSessionState(provider, appServerSocket string, upstreamWrite, downstreamWrite websocketWriteFunc) (*session, error) {
+func newSessionState(provider string, routes *modelroute.Catalog, appServerSocket string, upstreamWrite, downstreamWrite websocketWriteFunc) (*session, error) {
 	if appServerSocket == "" || upstreamWrite == nil || downstreamWrite == nil {
 		return nil, errors.New("invalid provider handoff session")
 	}
@@ -101,6 +103,7 @@ func newSessionState(provider, appServerSocket string, upstreamWrite, downstream
 	}
 	return &session{
 		provider:        provider,
+		routes:          routes,
 		appServerSocket: appServerSocket,
 		upstreamWrite:   upstreamWrite,
 		downstreamWrite: downstreamWrite,
