@@ -35,7 +35,7 @@ type handoffCoordinator interface {
 	PrepareHandoffAll(context.Context, string) error
 	PrepareRecoveryAll(context.Context, string) error
 	UnsubscribeAll(context.Context, string) error
-	ResubscribeAll(context.Context, string, string) error
+	ResubscribeAll(context.Context, string, modelroute.Route) error
 	RestoreAll(context.Context, string) error
 	MarkDirty(string) error
 	SetDirtyStage(string, handoff.DirtyStage) error
@@ -80,6 +80,7 @@ type session struct {
 	desktop           map[string]*desktopRequest
 	resumeTemplates   map[string]map[string]json.RawMessage
 	effective         map[string]string
+	effectiveModel    map[string]string
 	fresh             map[string]string
 	detached          map[string]bool
 	active            map[string]bool
@@ -111,6 +112,7 @@ func newSessionState(provider string, routes *modelroute.Catalog, appServerSocke
 		desktop:         make(map[string]*desktopRequest),
 		resumeTemplates: make(map[string]map[string]json.RawMessage),
 		effective:       make(map[string]string),
+		effectiveModel:  make(map[string]string),
 		fresh:           make(map[string]string),
 		detached:        make(map[string]bool),
 		active:          make(map[string]bool),
@@ -135,7 +137,7 @@ func (current *session) handleDownstreamText(ctx context.Context, payload []byte
 		return current.handleThreadUnsubscribe(ctx, message, payload)
 	}
 
-	rewritten, err := rewrite.Line(payload, modelroute.Route{Provider: current.provider})
+	rewritten, err := rewrite.Line(payload, current.routeForProvider(current.provider))
 	if err != nil {
 		return errRoutingPolicy
 	}
@@ -202,38 +204,45 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if commandRecognized && command.action == providerCommandStatus {
 		return current.writeProviderStatus(ctx, message.id, threadID)
 	}
-	targetProvider := command.provider
+	targetRoute := current.routeForProvider(command.provider)
 	if !commandRecognized {
 		var selected bool
-		targetProvider, selected, err = current.selectedProvider(threadID)
+		targetRoute, selected, err = current.selectedRoute(threadID)
 		if err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
 		if !selected {
-			targetProvider = current.effectiveProvider(threadID)
-			if targetProvider == "" {
+			targetRoute = current.effectiveRoute(threadID)
+			if targetRoute.Provider == "" {
 				return current.writeHandoffError(ctx, message.id)
 			}
 		}
 	}
-	if current.coordinator.IsDirty(threadID) || current.effectiveProvider(threadID) != targetProvider {
-		if err := current.handoff(ctx, threadID, targetProvider); err != nil {
+	if current.coordinator.IsDirty(threadID) || !routeMatches(current.effectiveRoute(threadID), targetRoute) {
+		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
 	}
 	if commandRecognized {
-		if current.selections == nil || current.selections.Set(threadID, targetProvider) != nil {
+		if current.selections == nil || current.selections.Set(threadID, targetRoute.Provider) != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
+		feedback := "Provider switched to " + targetRoute.Provider + "."
+		if targetRoute.Model != "" {
+			feedback = "Provider switched to " + targetRoute.Provider + " using model " + targetRoute.Model + "."
+		}
 		return current.writeProviderControlTurn(
-			ctx, message.id, threadID, "/provider switch "+targetProvider,
-			"Provider switched to "+targetProvider+".",
+			ctx, message.id, threadID, "/provider switch "+targetRoute.Provider, feedback,
 		)
 	}
 
+	rewritten, err := rewrite.Line(payload, targetRoute)
+	if err != nil {
+		return errRoutingPolicy
+	}
 	current.setActive(threadID, true)
 	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID})
-	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
+	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
 		current.removeDesktopRequest(message.idKey)
 		current.setActive(threadID, false)
 		return err
@@ -242,29 +251,35 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 }
 
 func (current *session) writeProviderStatus(ctx context.Context, id json.RawMessage, threadID string) error {
-	selected, hasSelection, err := current.selectedProvider(threadID)
+	selected, hasSelection, err := current.selectedRoute(threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, id)
 	}
-	runtime := current.effectiveProvider(threadID)
-	if !providerid.Valid(runtime) {
-		runtime = ""
+	runtime := current.effectiveRoute(threadID)
+	if !providerid.Valid(runtime.Provider) {
+		runtime = modelroute.Route{}
 	}
 	feedback := providerStatusFeedback(runtime, selected, hasSelection)
 	return current.writeProviderControlTurn(ctx, id, threadID, "/provider status", feedback)
 }
 
-func providerStatusFeedback(runtime, selected string, hasSelection bool) string {
+func providerStatusFeedback(runtime, selected modelroute.Route, hasSelection bool) string {
 	runtimeLine := "Runtime provider: unknown."
-	if runtime != "" {
-		runtimeLine = "Runtime provider: " + runtime + " (verified)."
+	if runtime.Provider != "" {
+		runtimeLine = "Runtime provider: " + runtime.Provider + " (verified)."
+		if runtime.Model != "" {
+			runtimeLine += "\nRuntime model: " + runtime.Model + " (verified)."
+		}
 	}
 	if !hasSelection {
 		return runtimeLine + "\nSelected provider: app-server configuration."
 	}
-	selectedLine := "Selected provider: " + selected + "."
-	if runtime != selected {
-		selectedLine = "Selected provider: " + selected + " (will be applied before the next model turn)."
+	selectedLine := "Selected provider: " + selected.Provider + "."
+	if !routeMatches(runtime, selected) {
+		selectedLine = "Selected provider: " + selected.Provider + " (will be applied before the next model turn)."
+	}
+	if selected.Model != "" {
+		selectedLine += "\nSelected model: " + selected.Model + "."
 	}
 	return runtimeLine + "\n" + selectedLine
 }
@@ -303,11 +318,11 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err := current.repairRecoveryJournal(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	targetProvider, _, err := current.selectedProvider(threadID)
+	targetRoute, _, err := current.selectedRoute(threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	rewritten, err := rewrite.Line(payload, modelroute.Route{Provider: targetProvider})
+	rewritten, err := rewrite.Line(payload, targetRoute)
 	if err != nil {
 		return errRoutingPolicy
 	}
@@ -331,7 +346,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	}
 }
 
-func (current *session) handoff(ctx context.Context, threadID, targetProvider string) error {
+func (current *session) handoff(ctx context.Context, threadID string, targetRoute modelroute.Route) error {
 	if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
 		return errors.New("provider handoff capability check failed")
 	}
@@ -349,7 +364,7 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff stage update failed")
 	}
-	if err := current.internalResumeForHandoff(ctx, threadID, targetProvider); err != nil {
+	if err := current.internalResumeForHandoff(ctx, threadID, targetRoute); err != nil {
 		if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
@@ -358,7 +373,7 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 			current.restoreAfterHandoffFailure(threadID)
 			return errors.New("provider handoff stage update failed")
 		}
-		if err := current.recoverProviderMismatch(ctx, threadID, targetProvider); err != nil {
+		if err := current.recoverProviderMismatch(ctx, threadID, targetRoute); err != nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
 		}
@@ -367,7 +382,7 @@ func (current *session) handoff(ctx context.Context, threadID, targetProvider st
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff stage update failed")
 	}
-	if err := current.coordinator.ResubscribeAll(ctx, threadID, targetProvider); err != nil {
+	if err := current.coordinator.ResubscribeAll(ctx, threadID, targetRoute); err != nil {
 		current.clearEffectiveProvider(threadID)
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff resubscribe failed")
@@ -385,17 +400,17 @@ func (current *session) restoreAfterHandoffFailure(threadID string) {
 	_ = current.coordinator.RestoreAll(ctx, threadID)
 }
 
-func (current *session) internalResume(ctx context.Context, threadID, targetProvider string) error {
-	return current.internalResumeWithProvider(ctx, threadID, targetProvider, true)
+func (current *session) internalResume(ctx context.Context, threadID string, targetRoute modelroute.Route) error {
+	return current.internalResumeWithRoute(ctx, threadID, targetRoute, true)
 }
 
-func (current *session) internalResumeForHandoff(ctx context.Context, threadID, targetProvider string) error {
+func (current *session) internalResumeForHandoff(ctx context.Context, threadID string, targetRoute modelroute.Route) error {
 	materialized := false
 	return retryFreshRollout(ctx, current.isFresh(threadID), threadID, func(callCtx context.Context) error {
-		err := current.internalResume(callCtx, threadID, targetProvider)
+		err := current.internalResume(callCtx, threadID, targetRoute)
 		if !materialized && rolloutNotReadyError(err, threadID) {
 			materialized = true
-			if materializeErr := current.materializeFreshRollout(callCtx, threadID, targetProvider); materializeErr != nil {
+			if materializeErr := current.materializeFreshRollout(callCtx, threadID, targetRoute.Provider); materializeErr != nil {
 				return materializeErr
 			}
 		}
@@ -418,7 +433,7 @@ func (current *session) materializeFreshRollout(ctx context.Context, threadID, t
 	return nil
 }
 
-func (current *session) recoverProviderMismatch(ctx context.Context, threadID, targetProvider string) error {
+func (current *session) recoverProviderMismatch(ctx context.Context, threadID string, targetRoute modelroute.Route) error {
 	client, err := newRecoveryClient(ctx, current.appServerSocket)
 	if err != nil {
 		return err
@@ -431,8 +446,12 @@ func (current *session) recoverProviderMismatch(ctx context.Context, threadID, t
 	if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageRecovering); err != nil {
 		return errors.New("provider handoff stage update failed")
 	}
+	version := 1
+	if targetRoute.Model != "" {
+		version = 2
+	}
 	journal := recovery.Journal{
-		Version: 1, RootID: threadID, Provider: targetProvider, Phase: "prepared",
+		Version: version, RootID: threadID, Provider: targetRoute.Provider, Model: targetRoute.Model, Phase: "prepared",
 		Threads: append([]string(nil), ids...), Remaining: append([]string(nil), ids...),
 	}
 	if err := current.recoveries.Save(journal); err != nil {
@@ -465,7 +484,7 @@ func (current *session) recoverProviderMismatch(ctx context.Context, threadID, t
 			return errors.New("update provider recovery journal")
 		}
 	}
-	if err := current.internalResume(ctx, threadID, targetProvider); err != nil {
+	if err := current.internalResume(ctx, threadID, targetRoute); err != nil {
 		return err
 	}
 	if err := current.coordinator.EndRecoveryAll(ctx, threadID); err != nil {
@@ -525,7 +544,8 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 			return errors.New("update provider recovery repair journal")
 		}
 	}
-	provider, err := client.resume(ctx, threadID)
+	wantedRoute := modelroute.Route{Provider: journal.Provider, Model: journal.Model}
+	route, err := client.resume(ctx, threadID, wantedRoute)
 	if err != nil {
 		return err
 	}
@@ -533,7 +553,8 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 		return err
 	}
 	current.stateMu.Lock()
-	current.effective[threadID] = provider
+	current.effective[threadID] = route.Provider
+	current.effectiveModel[threadID] = route.Model
 	current.stateMu.Unlock()
 	if err := current.coordinator.EndRecoveryAll(ctx, threadID); err != nil {
 		return errors.New("end provider recovery repair isolation")
@@ -562,7 +583,23 @@ func (current *session) selectedProvider(threadID string) (string, bool, error) 
 	return selected, true, nil
 }
 
-func (current *session) internalResumeWithProvider(ctx context.Context, threadID, expectedProvider string, reuseTemplate bool) error {
+func (current *session) selectedRoute(threadID string) (modelroute.Route, bool, error) {
+	provider, selected, err := current.selectedProvider(threadID)
+	if err != nil {
+		return modelroute.Route{}, false, err
+	}
+	return current.routeForProvider(provider), selected, nil
+}
+
+func (current *session) routeForProvider(provider string) modelroute.Route {
+	return current.routes.Resolve(provider)
+}
+
+func routeMatches(actual, expected modelroute.Route) bool {
+	return actual.Provider == expected.Provider && (expected.Model == "" || actual.Model == expected.Model)
+}
+
+func (current *session) internalResumeWithRoute(ctx context.Context, threadID string, expectedRoute modelroute.Route, reuseTemplate bool) error {
 	var params map[string]json.RawMessage
 	if reuseTemplate {
 		current.stateMu.Lock()
@@ -573,21 +610,25 @@ func (current *session) internalResumeWithProvider(ctx context.Context, threadID
 		params = make(map[string]json.RawMessage)
 	}
 	params["threadId"] = rawJSONString(threadID)
-	params["modelProvider"] = rawJSONString(expectedProvider)
+	params["modelProvider"] = rawJSONString(expectedRoute.Provider)
+	if expectedRoute.Model != "" {
+		params["model"] = rawJSONString(expectedRoute.Model)
+	}
 
 	response, err := current.callUpstream(ctx, "thread/resume", params)
 	if err != nil {
 		return err
 	}
-	responseThreadID, provider, ok := responseThreadProvider(response)
+	responseThreadID, route, ok := responseThreadRoute(response)
 	if !ok || responseThreadID != threadID {
 		return errors.New("provider handoff verification failed")
 	}
-	if provider != expectedProvider {
+	if !routeMatches(route, expectedRoute) {
 		return errProviderMismatch
 	}
 	current.stateMu.Lock()
-	current.effective[threadID] = provider
+	current.effective[threadID] = route.Provider
+	current.effectiveModel[threadID] = route.Model
 	delete(current.detached, threadID)
 	current.stateMu.Unlock()
 	return nil
@@ -662,14 +703,14 @@ func (current *session) Unsubscribe(ctx context.Context, threadID string) (hando
 
 // Resubscribe implements handoff.Handler for a connection detached during the
 // coordinated provider transition.
-func (current *session) Resubscribe(ctx context.Context, threadID, provider string) (handoff.PeerStatus, error) {
+func (current *session) Resubscribe(ctx context.Context, threadID string, route modelroute.Route) (handoff.PeerStatus, error) {
 	if !current.isDetached(threadID) {
 		return handoff.StatusNotSubscribed, nil
 	}
-	if provider == "" {
+	if !providerid.Valid(route.Provider) || (route.Model != "" && !modelroute.ValidModel(route.Model)) {
 		return "", errors.New("invalid provider handoff resubscribe")
 	}
-	if err := current.internalResumeWithProvider(ctx, threadID, provider, false); err != nil {
+	if err := current.internalResumeWithRoute(ctx, threadID, route, false); err != nil {
 		return "", errors.New("resubscribe app-server thread")
 	}
 	return handoff.StatusResubscribed, nil
@@ -687,12 +728,13 @@ func (current *session) Restore(ctx context.Context, threadID string) (handoff.P
 	if err != nil {
 		return "", errors.New("restore app-server thread")
 	}
-	responseThreadID, provider, ok := responseThreadProvider(response)
+	responseThreadID, route, ok := responseThreadRoute(response)
 	if !ok || responseThreadID != threadID {
 		return "", errors.New("verify restored app-server thread")
 	}
 	current.stateMu.Lock()
-	current.effective[threadID] = provider
+	current.effective[threadID] = route.Provider
+	current.effectiveModel[threadID] = route.Model
 	delete(current.detached, threadID)
 	current.stateMu.Unlock()
 	return handoff.StatusRestored, nil
@@ -782,9 +824,10 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 		request := current.desktop[message.idKey]
 		if request != nil {
 			delete(current.desktop, message.idKey)
-			if threadID, provider, ok := responseThreadProvider(message); ok &&
+			if threadID, route, ok := responseThreadRoute(message); ok &&
 				(request.method == "thread/start" || request.method == "thread/resume" || request.method == "thread/fork") {
-				current.effective[threadID] = provider
+				current.effective[threadID] = route.Provider
+				current.effectiveModel[threadID] = route.Model
 				delete(current.detached, threadID)
 				if request.method == "thread/start" {
 					current.fresh[threadID] = responseThreadName(message)
@@ -799,6 +842,7 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 			}
 			if request.method == "thread/unsubscribe" && !message.hasError {
 				delete(current.effective, request.threadID)
+				delete(current.effectiveModel, request.threadID)
 				delete(current.detached, request.threadID)
 			}
 		}
@@ -882,16 +926,24 @@ func (current *session) effectiveProvider(threadID string) string {
 	return current.effective[threadID]
 }
 
+func (current *session) effectiveRoute(threadID string) modelroute.Route {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	return modelroute.Route{Provider: current.effective[threadID], Model: current.effectiveModel[threadID]}
+}
+
 func (current *session) clearEffectiveProvider(threadID string) {
 	current.stateMu.Lock()
 	defer current.stateMu.Unlock()
 	delete(current.effective, threadID)
+	delete(current.effectiveModel, threadID)
 }
 
 func (current *session) clearThreadRoutingState(threadID string) {
 	current.stateMu.Lock()
 	defer current.stateMu.Unlock()
 	delete(current.effective, threadID)
+	delete(current.effectiveModel, threadID)
 	delete(current.fresh, threadID)
 	delete(current.detached, threadID)
 }

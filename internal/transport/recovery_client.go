@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 )
 
 const (
@@ -256,18 +257,23 @@ func (client *recoveryClient) unarchive(ctx context.Context, threadID string) er
 	return nil
 }
 
-func (client *recoveryClient) resume(ctx context.Context, threadID string) (string, error) {
-	response, err := client.call(ctx, "thread/resume", map[string]json.RawMessage{
-		"threadId": rawJSONString(threadID),
-	})
+func (client *recoveryClient) resume(ctx context.Context, threadID string, expectedRoute modelroute.Route) (modelroute.Route, error) {
+	params := map[string]json.RawMessage{
+		"threadId":      rawJSONString(threadID),
+		"modelProvider": rawJSONString(expectedRoute.Provider),
+	}
+	if expectedRoute.Model != "" {
+		params["model"] = rawJSONString(expectedRoute.Model)
+	}
+	response, err := client.call(ctx, "thread/resume", params)
 	if err != nil {
-		return "", errors.New("resume recovery thread")
+		return modelroute.Route{}, errors.New("resume recovery thread")
 	}
-	responseThreadID, provider, ok := responseThreadProvider(response)
-	if !ok || responseThreadID != threadID {
-		return "", errors.New("verify resumed recovery thread")
+	responseThreadID, route, ok := responseThreadRoute(response)
+	if !ok || responseThreadID != threadID || !routeMatches(route, expectedRoute) {
+		return modelroute.Route{}, errors.New("verify resumed recovery thread")
 	}
-	return provider, nil
+	return route, nil
 }
 
 func (client *recoveryClient) unsubscribe(ctx context.Context, threadID string) error {

@@ -18,6 +18,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
+	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
 const (
@@ -63,7 +66,7 @@ type Handler interface {
 	BeginRecovery(threadID string, ids []string) PeerStatus
 	EndRecovery(threadID string) PeerStatus
 	Unsubscribe(context.Context, string) (PeerStatus, error)
-	Resubscribe(context.Context, string, string) (PeerStatus, error)
+	Resubscribe(context.Context, string, modelroute.Route) (PeerStatus, error)
 	Restore(context.Context, string) (PeerStatus, error)
 }
 
@@ -82,6 +85,7 @@ type controlRequest struct {
 	Method   string   `json:"method"`
 	ThreadID string   `json:"threadId"`
 	Provider string   `json:"provider,omitempty"`
+	Model    string   `json:"model,omitempty"`
 	IDs      []string `json:"ids,omitempty"`
 }
 
@@ -173,7 +177,7 @@ func (coordinator *Coordinator) PrepareAll(ctx context.Context, threadID string)
 // PrepareHandoffAll verifies that every peer supports subscription restoration
 // before the first unsubscribe mutates app-server state.
 func (coordinator *Coordinator) PrepareHandoffAll(ctx context.Context, threadID string) error {
-	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareHandoffV2", ThreadID: threadID}, func(status PeerStatus) bool {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareHandoffV3", ThreadID: threadID}, func(status PeerStatus) bool {
 		return status == StatusReady
 	})
 }
@@ -282,12 +286,12 @@ func (coordinator *Coordinator) UnsubscribeAll(ctx context.Context, threadID str
 
 // ResubscribeAll restores every connection detached by the handoff under the
 // verified effective provider.
-func (coordinator *Coordinator) ResubscribeAll(ctx context.Context, threadID, provider string) error {
-	if provider == "" {
-		return errors.New("invalid provider handoff resubscribe")
+func (coordinator *Coordinator) ResubscribeAll(ctx context.Context, threadID string, route modelroute.Route) error {
+	if !providerid.Valid(route.Provider) || (route.Model != "" && !modelroute.ValidModel(route.Model)) {
+		return errors.New("invalid provider model handoff resubscribe")
 	}
 	return coordinator.visitPeers(ctx, controlRequest{
-		Method: "resubscribe", ThreadID: threadID, Provider: provider,
+		Method: "resubscribe", ThreadID: threadID, Provider: route.Provider, Model: route.Model,
 	}, func(status PeerStatus) bool {
 		return status == StatusResubscribed || status == StatusNotSubscribed
 	})
@@ -369,7 +373,7 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 	switch request.Method {
 	case "prepare":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
-	case "prepareHandoffV2":
+	case "prepareHandoffV3":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
 	case "prepareRecoveryV1":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
@@ -391,13 +395,14 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 			response.Status = status
 		}
 	case "resubscribe":
-		if request.Provider == "" {
+		route := modelroute.Route{Provider: request.Provider, Model: request.Model}
+		if !providerid.Valid(route.Provider) || (route.Model != "" && !modelroute.ValidModel(route.Model)) {
 			response.Error = true
 			break
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 		defer cancel()
-		status, err := coordinator.handler.Resubscribe(ctx, request.ThreadID, request.Provider)
+		status, err := coordinator.handler.Resubscribe(ctx, request.ThreadID, route)
 		if err != nil {
 			response.Error = true
 		} else {

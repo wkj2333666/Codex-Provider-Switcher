@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
@@ -24,6 +25,7 @@ type Journal struct {
 	Version   int      `json:"version"`
 	RootID    string   `json:"rootId"`
 	Provider  string   `json:"provider"`
+	Model     string   `json:"model,omitempty"`
 	Phase     string   `json:"phase"`
 	Threads   []string `json:"threads"`
 	Remaining []string `json:"remaining"`
@@ -162,7 +164,9 @@ func (store *Store) path(rootID string) string {
 }
 
 func validateJournal(journal Journal) error {
-	if journal.Version != 1 || journal.RootID == "" || len(journal.RootID) > 1024 ||
+	validRouteVersion := (journal.Version == 1 && journal.Model == "") ||
+		(journal.Version == 2 && modelroute.ValidModel(journal.Model))
+	if !validRouteVersion || journal.RootID == "" || len(journal.RootID) > 1024 ||
 		!providerid.Valid(journal.Provider) ||
 		(journal.Phase != "prepared" && journal.Phase != "restoring") ||
 		len(journal.Threads) == 0 || len(journal.Threads) > maxThreadIDs ||

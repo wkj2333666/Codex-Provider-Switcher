@@ -48,6 +48,24 @@ func TestStoreRoundTripsPrivateJournal(t *testing.T) {
 	}
 }
 
+func TestStoreRoundTripsMappedRouteJournalVersionTwo(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Journal{
+		Version: 2, RootID: "root-glm", Provider: "glm", Model: "glm-5.2", Phase: "prepared",
+		Threads: []string{"root-glm"}, Remaining: []string{"root-glm"},
+	}
+	if err := store.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := store.Load("root-glm")
+	if err != nil || !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("Load() = %#v, %v, %v; want %#v, true, nil", got, ok, err, want)
+	}
+}
+
 func TestStoreFailsClosedForInvalidOrCorruptJournal(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {
@@ -56,6 +74,8 @@ func TestStoreFailsClosedForInvalidOrCorruptJournal(t *testing.T) {
 	invalid := []Journal{
 		{},
 		{Version: 2, RootID: "root", Provider: "openai", Phase: "prepared", Threads: []string{"root"}, Remaining: []string{"root"}},
+		{Version: 1, RootID: "root", Provider: "glm", Model: "glm-5.2", Phase: "prepared", Threads: []string{"root"}, Remaining: []string{"root"}},
+		{Version: 2, RootID: "root", Provider: "glm", Model: "bad model", Phase: "prepared", Threads: []string{"root"}, Remaining: []string{"root"}},
 		{Version: 1, RootID: "other", Provider: "openai", Phase: "prepared", Threads: []string{"root"}, Remaining: []string{"root"}},
 		{Version: 1, RootID: "root", Provider: "bad provider", Phase: "prepared", Threads: []string{"root"}, Remaining: []string{"root"}},
 		{Version: 1, RootID: "root", Provider: "openai", Phase: "unknown", Threads: []string{"root"}, Remaining: []string{"root"}},

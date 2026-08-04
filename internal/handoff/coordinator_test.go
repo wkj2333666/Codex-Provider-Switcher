@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 )
 
 func TestRuntimeDirectoryIsShortAndSocketSpecific(t *testing.T) {
@@ -62,7 +64,7 @@ func TestPrepareAllAbortsBeforeUnsubscribeWhenPeerBusy(t *testing.T) {
 	}
 }
 
-func TestPrepareHandoffAllRejectsLegacyPeerBeforeMutation(t *testing.T) {
+func TestPrepareHandoffAllRequiresRouteCapablePeerBeforeMutation(t *testing.T) {
 	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
 	legacyPath := filepath.Join(coordinator.directory, "session-legacy.sock")
 	listener, err := net.Listen("unix", legacyPath)
@@ -104,7 +106,7 @@ func TestPrepareHandoffAllRejectsLegacyPeerBeforeMutation(t *testing.T) {
 	}
 	select {
 	case method := <-methodSeen:
-		if method != "prepareHandoffV2" {
+		if method != "prepareHandoffV3" {
 			t.Fatalf("legacy peer method = %q", method)
 		}
 	case <-ctx.Done():
@@ -239,7 +241,7 @@ func TestUnsubscribeAllContactsEveryLivePeer(t *testing.T) {
 	}
 }
 
-func TestResubscribeAllRestoresEveryDetachedPeerWithEffectiveProvider(t *testing.T) {
+func TestResubscribeAllRestoresEveryDetachedPeerWithEffectiveRoute(t *testing.T) {
 	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
 	handlers := []*testHandler{
 		{prepare: StatusReady, resubscribe: StatusResubscribed},
@@ -252,14 +254,32 @@ func TestResubscribeAllRestoresEveryDetachedPeerWithEffectiveProvider(t *testing
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := coordinators[0].ResubscribeAll(ctx, "thr-a", "sub2api"); err != nil {
+	wantRoute := modelroute.Route{Provider: "glm", Model: "glm-5.2"}
+	if err := coordinators[0].ResubscribeAll(ctx, "thr-a", wantRoute); err != nil {
 		t.Fatalf("ResubscribeAll() error = %v", err)
 	}
 	for index, handler := range handlers {
-		calls, provider := handler.resubscribeResult()
-		if calls != 1 || provider != "sub2api" {
-			t.Fatalf("handler %d resubscribe = %d, %q", index, calls, provider)
+		calls, route := handler.resubscribeResult()
+		if calls != 1 || route != wantRoute {
+			t.Fatalf("handler %d resubscribe = %d, %#v", index, calls, route)
 		}
+	}
+}
+
+func TestResubscribeAllRejectsInvalidRouteBeforeContactingPeers(t *testing.T) {
+	handler := &testHandler{prepare: StatusReady, resubscribe: StatusResubscribed}
+	coordinator := openTestCoordinator(t, handler)
+	for _, route := range []modelroute.Route{
+		{},
+		{Provider: "bad provider"},
+		{Provider: "glm", Model: "bad model"},
+	} {
+		if err := coordinator.ResubscribeAll(context.Background(), "thr-a", route); err == nil {
+			t.Fatalf("ResubscribeAll(%#v) error = nil", route)
+		}
+	}
+	if calls, _ := handler.resubscribeResult(); calls != 0 {
+		t.Fatalf("invalid routes contacted peer %d times", calls)
 	}
 }
 
@@ -397,7 +417,7 @@ type testHandler struct {
 	calls               int
 	resumeCalls         int
 	restoreCalls        int
-	provider            string
+	route               modelroute.Route
 	restoreErr          error
 	recoveryBegin       int
 	recoveryEnd         int
@@ -436,11 +456,11 @@ func (handler *testHandler) Unsubscribe(context.Context, string) (PeerStatus, er
 	return handler.unsubscribe, nil
 }
 
-func (handler *testHandler) Resubscribe(_ context.Context, _, provider string) (PeerStatus, error) {
+func (handler *testHandler) Resubscribe(_ context.Context, _ string, route modelroute.Route) (PeerStatus, error) {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	handler.resumeCalls++
-	handler.provider = provider
+	handler.route = route
 	return handler.resubscribe, nil
 }
 
@@ -457,10 +477,10 @@ func (handler *testHandler) unsubscribeCalls() int {
 	return handler.calls
 }
 
-func (handler *testHandler) resubscribeResult() (int, string) {
+func (handler *testHandler) resubscribeResult() (int, modelroute.Route) {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
-	return handler.resumeCalls, handler.provider
+	return handler.resumeCalls, handler.route
 }
 
 func (handler *testHandler) restoreCallCount() int {
