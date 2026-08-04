@@ -117,6 +117,42 @@ show that archive/unarchive of an idle thread:
 The probe uses a temporary `CODEX_HOME`, local non-network providers, and no
 user task. Production deployment stops if any assertion fails.
 
+### Probe Result
+
+Probe date: 2026-08-04. Installed Codex: `codex-cli 0.146.0`.
+
+The initial no-turn fixture was rejected by stock app-server with `-32600 no
+rollout found`: `thread/start` alone does not persist an archiveable rollout.
+The final disposable fixture started one turn against a local blocking HTTP
+endpoint, interrupted it through `turn/interrupt`, and required a fresh
+`thread/read` status of exactly `idle` before recovery. This created one
+persisted turn without contacting a real provider. Counters were snapshotted
+after setup so the zero-turn and zero-provider-request assertions cover only
+archive, unarchive, and alternate-provider resume.
+
+Two fresh temporary homes passed independently:
+
+- Exact pre-recovery `idle` status: pass in both runs.
+- Root restored with the same thread id: pass in both runs.
+- Alternate provider returned after restore: pass in both runs.
+- History SHA-256 digest unchanged: pass in both runs.
+- Turn count unchanged at one: pass in both runs.
+- Additional `turn/started` notifications during recovery: pass; zero in both
+  runs.
+- Additional provider HTTP requests during recovery: pass; zero in both runs.
+
+The real app-server gate therefore supports the same-id, zero-model-turn idle
+soft reload used by this design.
+
+Repository verification on the same host:
+
+- `go test ./... -count=1`: pass across all packages.
+- `go vet ./...`: pass.
+- `go build ./cmd/codex-provider-switcher`: pass.
+- `go test -race ./... -count=1`: not executed by the test binaries because
+  the host exposes a 47-bit VMA while this Go ThreadSanitizer runtime requires
+  48 bits (`FATAL: Found 47 - Supported 48`). No race-pass claim is made.
+
 ## Testing
 
 - Unit tests for versioned dirty-stage persistence, legacy empty markers,
