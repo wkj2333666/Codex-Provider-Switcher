@@ -1,11 +1,14 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +60,75 @@ func TestRunSwitchesProviderOnNextTurn(t *testing.T) {
 	waitProxyDone(t, sub2apiDone)
 }
 
+func TestRunSwitchesProviderAndMappedModel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	stateDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateDirectory, "models.json"), []byte(
+		`{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}`,
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Provider: "openai",
+		Socket:   server.socket,
+		StateDir: stateDirectory,
+	})
+	defer connection.CloseNow()
+
+	initializeTestClient(t, ctx, connection)
+	sendRPC(t, ctx, connection, 2, "thread/resume", map[string]any{"threadId": "thr-shared"})
+	initial := readResponse(t, ctx, connection, "2")
+	if provider := responseProvider(t, initial.raw); provider != "openai" {
+		t.Fatalf("initial provider = %q, want openai", provider)
+	}
+	if model := responseModel(t, initial.raw); model != "gpt-5.6-sol" {
+		t.Fatalf("initial model = %q, want gpt-5.6-sol", model)
+	}
+	if record := server.lastResumeRecord(); record.provider != "openai" || record.model != "gpt-5.6-sol" {
+		t.Fatalf("initial resume = %#v, want openai/gpt-5.6-sol", record)
+	}
+
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{map[string]any{
+			"type": "text",
+			"text": "[$provider](/home/user/.agents/skills/provider/SKILL.md) switch glm",
+		}},
+	})
+	responseSeen, methods, feedback := readProviderControlLifecycle(t, ctx, connection, "3")
+	if !responseSeen || feedback != "Provider switched to glm using model glm-5.2." {
+		t.Fatalf("GLM switch lifecycle response=%v methods=%v feedback=%q", responseSeen, methods, feedback)
+	}
+	if record := server.lastResumeRecord(); record.provider != "glm" || record.model != "glm-5.2" {
+		t.Fatalf("GLM resume = %#v, want glm/glm-5.2", record)
+	}
+
+	input := []byte(`[{"type":"text","text":"preserve this input","metadata":{"parts":[1,true,null]}}]`)
+	turn := []byte(`{"jsonrpc":"2.0","id":4,"method":"turn/start","params":{"threadId":"thr-shared","model":"gpt-5.6-sol","input":` + string(input) + `}}`)
+	if err := connection.Write(ctx, websocket.MessageText, turn); err != nil {
+		t.Fatal(err)
+	}
+	var visible []visibleRPC
+	for {
+		message := readVisibleRPC(t, ctx, connection)
+		visible = append(visible, message)
+		if message.method == "turn/completed" {
+			break
+		}
+	}
+	assertNoInternalMessages(t, visible)
+	if record := <-server.turns; record.threadID != "thr-shared" || record.provider != "glm" ||
+		record.model != "glm-5.2" || !bytes.Equal(record.input, input) {
+		t.Fatalf("GLM turn = %#v, want glm/glm-5.2 with unchanged input", record)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
 func TestProviderDesktopMarkdownSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -79,7 +151,7 @@ func TestProviderDesktopMarkdownSkillCommandSwitchesWithoutModelTurn(t *testing.
 		},
 	})
 	statusResponseSeen, statusMethods, statusFeedback := readProviderControlLifecycle(t, ctx, connection, "3")
-	if !statusResponseSeen || statusFeedback != "Runtime provider: openai (verified).\nSelected provider: openai." {
+	if !statusResponseSeen || statusFeedback != "Runtime provider: openai (verified).\nRuntime model: gpt-5.6-sol (verified).\nSelected provider: openai." {
 		t.Fatalf("status lifecycle response=%v methods=%v feedback=%q", statusResponseSeen, statusMethods, statusFeedback)
 	}
 	if calls := server.turnStartCallCount(); calls != 0 {
@@ -639,12 +711,14 @@ type handoffAppServer struct {
 	writeMu                 sync.Mutex
 	nextClient              int
 	provider                string
+	model                   string
 	active                  bool
 	subscribers             map[int]*websocket.Conn
 	clients                 map[int]*websocket.Conn
 	startedGate             chan struct{}
 	turnStarts              int
 	turns                   chan handoffTurnRecord
+	resumes                 []handoffResumeRecord
 	systemError             bool
 	descendants             []string
 	history                 []string
@@ -665,6 +739,14 @@ type handoffAppServer struct {
 type handoffTurnRecord struct {
 	threadID string
 	provider string
+	model    string
+	input    json.RawMessage
+}
+
+type handoffResumeRecord struct {
+	threadID string
+	provider string
+	model    string
 }
 
 func newHandoffAppServer(t *testing.T, ctx context.Context, autoComplete bool) *handoffAppServer {
@@ -673,6 +755,7 @@ func newHandoffAppServer(t *testing.T, ctx context.Context, autoComplete bool) *
 		ctx:          ctx,
 		autoComplete: autoComplete,
 		provider:     "openai",
+		model:        "gpt-5.6-sol",
 		subscribers:  make(map[int]*websocket.Conn),
 		clients:      make(map[int]*websocket.Conn),
 		turns:        make(chan handoffTurnRecord, 8),
@@ -745,25 +828,40 @@ func (server *handoffAppServer) handleUpgrade(writer http.ResponseWriter, reques
 func (server *handoffAppServer) handleStart(connection *websocket.Conn, clientID int, message rpcMessage) {
 	requestedProvider := ""
 	_ = json.Unmarshal(message.params["modelProvider"], &requestedProvider)
+	requestedModel := ""
+	_ = json.Unmarshal(message.params["model"], &requestedModel)
 	server.mu.Lock()
 	if requestedProvider != "" {
 		server.provider = requestedProvider
 	}
+	if requestedModel != "" {
+		server.model = requestedModel
+	}
 	server.subscribers[clientID] = connection
 	provider := server.provider
+	model := server.model
 	server.mu.Unlock()
 	server.writeResult(connection, message.id, map[string]any{
 		"thread": map[string]any{
 			"id": "thr-shared", "turns": []any{}, "status": map[string]any{"type": "idle"},
 		},
 		"modelProvider": provider,
+		"model":         model,
 	})
 }
 
 func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientID int, message rpcMessage) {
 	requestedProvider := ""
 	_ = json.Unmarshal(message.params["modelProvider"], &requestedProvider)
+	requestedModel := ""
+	_ = json.Unmarshal(message.params["model"], &requestedModel)
+	threadID, _ := requireThreadID(message)
 	server.mu.Lock()
+	server.resumes = append(server.resumes, handoffResumeRecord{
+		threadID: threadID,
+		provider: requestedProvider,
+		model:    requestedModel,
+	})
 	if requestedProvider != "" && requestedProvider != server.provider &&
 		server.freshNeedsMaterialize && !server.rolloutReady {
 		server.mu.Unlock()
@@ -778,9 +876,13 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 	if requestedProvider != "" && requestedProvider != server.provider && len(server.subscribers) == 0 &&
 		!server.active && !server.systemError && (!server.stickyIdle || server.softReloaded) {
 		server.provider = requestedProvider
+		if requestedModel != "" {
+			server.model = requestedModel
+		}
 	}
 	server.subscribers[clientID] = connection
 	provider := server.provider
+	model := server.model
 	status := "idle"
 	if server.systemError {
 		status = "systemError"
@@ -790,6 +892,7 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 	server.writeResult(connection, message.id, map[string]any{
 		"thread":        map[string]any{"id": "thr-shared", "turns": history, "status": map[string]any{"type": status}},
 		"modelProvider": provider,
+		"model":         model,
 	})
 }
 
@@ -897,6 +1000,9 @@ func (server *handoffAppServer) handleUnsubscribe(connection *websocket.Conn, cl
 
 func (server *handoffAppServer) handleTurnStart(connection *websocket.Conn, message rpcMessage) {
 	threadID, _ := requireThreadID(message)
+	model := ""
+	_ = json.Unmarshal(message.params["model"], &model)
+	input := append(json.RawMessage(nil), message.params["input"]...)
 	server.mu.Lock()
 	server.turnStarts++
 	if server.active {
@@ -909,7 +1015,7 @@ func (server *handoffAppServer) handleTurnStart(connection *websocket.Conn, mess
 	subscribers := server.subscriberConnectionsLocked()
 	startedGate := server.startedGate
 	server.mu.Unlock()
-	server.turns <- handoffTurnRecord{threadID: threadID, provider: provider}
+	server.turns <- handoffTurnRecord{threadID: threadID, provider: provider, model: model, input: input}
 	server.writeResult(connection, message.id, map[string]any{
 		"turn": map[string]any{"id": "turn-test", "status": "inProgress", "items": []any{}},
 	})
@@ -946,6 +1052,15 @@ func (server *handoffAppServer) turnStartCallCount() int {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	return server.turnStarts
+}
+
+func (server *handoffAppServer) lastResumeRecord() handoffResumeRecord {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if len(server.resumes) == 0 {
+		return handoffResumeRecord{}
+	}
+	return server.resumes[len(server.resumes)-1]
 }
 
 func (server *handoffAppServer) subscriberConnectionsLocked() []*websocket.Conn {
@@ -1233,6 +1348,19 @@ func responseProvider(t *testing.T, payload []byte) string {
 		t.Fatal(err)
 	}
 	return response.Result.ModelProvider
+}
+
+func responseModel(t *testing.T, payload []byte) string {
+	t.Helper()
+	var response struct {
+		Result struct {
+			Model string `json:"model"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.Result.Model
 }
 
 func assertNoInternalMessages(t *testing.T, messages []visibleRPC) {

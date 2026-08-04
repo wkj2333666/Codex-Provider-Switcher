@@ -95,7 +95,24 @@ rm -rf "$HOME/.agents/skills/provider"
 cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 ```
 
-### 3. 配置登录 Shell
+### 3. 配置 provider 到 model 的路由
+
+在 switcher 状态目录创建严格校验的 `models.json`。必须为用户可能切换到的每个
+provider 配置 model；受支持的部署使用以下三个精确路由：
+
+```bash
+STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
+install -d -m 0700 "$STATE_ROOT"
+install -m 0600 /dev/null "$STATE_ROOT/models.json"
+printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+  > "$STATE_ROOT/models.json"
+```
+
+该文件是 provider 名称到 model ID 的 JSON 对象，并会进行严格校验：JSON 格式错误、
+无效名称或 model、符号链接和非常规文件都会使 switcher 在代理 Desktop 前关闭请求。
+缺少条目时不会注入 model，因此不要遗漏任何可切换 provider。
+
+### 4. 配置登录 Shell
 
 将以下内容加入 Desktop 使用的远程登录 Shell 配置文件。第一个值必须替换成
 上一步输出的绝对路径。
@@ -112,7 +129,7 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 不变，也不会重新发送用户消息。订阅同一 app-server 任务的客户端都必须使用
 switcher wrapper；不支持绕过 wrapper 直接订阅 app-server。
 
-### 4. 验证并重新连接 Desktop
+### 5. 验证并重新连接 Desktop
 
 启动一个新的登录 Shell，然后运行：
 
@@ -161,6 +178,11 @@ Host pi
 切换后任务 ID 和历史记录保持不变。运行中的 turn 不会被中断；请等待它结束
 后再切换。
 
+`models.json` 控制发送给当前任务的 model。成功切换到 GLM 后，当前线程标签可以
+显示已验证的 `glm-5.2`；这不表示 Desktop 的 model picker 中包含 GLM。Picker 由
+Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中的 provider/model
+组合。
+
 ## 升级
 
 使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后替换已安装的
@@ -178,7 +200,8 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 
 这些命令会直接替换当前安装，不保留旧版本备份。不要修改现有的
 `CODEX_PROVIDER_SWITCHER_CODEX`：它必须指向真正的 Codex，不能指向 wrapper。
-每次升级后都要重新连接 Desktop SSH 主机。
+每次升级后都要重新连接 Desktop SSH 主机。重新连接前请保持
+`$STATE_ROOT/models.json` 为 0600，并更新全部可切换 provider 的路由。
 
 ## 常见问题
 

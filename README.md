@@ -96,7 +96,26 @@ rm -rf "$HOME/.agents/skills/provider"
 cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 ```
 
-### 3. Configure the login shell
+### 3. Configure provider-to-model routes
+
+Create the strict `models.json` catalog in the switcher state directory. Map
+every provider that users may switch to; the supported deployment uses these
+three exact routes:
+
+```bash
+STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
+install -d -m 0700 "$STATE_ROOT"
+install -m 0600 /dev/null "$STATE_ROOT/models.json"
+printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+  > "$STATE_ROOT/models.json"
+```
+
+The catalog is a JSON object of provider names to model IDs. It is validated
+strictly: malformed JSON, invalid names or models, symlinks, and non-regular
+files make the switcher fail closed before it proxies Desktop. A missing entry
+does not inject a model, so do not leave a switchable provider unmapped.
+
+### 4. Configure the login shell
 
 Add these exports to the remote login-shell profile used by Desktop. Replace
 the first value with the absolute path printed in the previous step.
@@ -115,7 +134,7 @@ never resends the user's message. Every client that subscribes to the same
 app-server threads must use the switcher wrapper; direct app-server subscribers
 are unsupported.
 
-### 4. Verify and reconnect Desktop
+### 5. Verify and reconnect Desktop
 
 Start a fresh login shell and run:
 
@@ -171,6 +190,12 @@ model tokens. A successful alternative-provider switch reports
 `Provider switched to sub2api.` Switching keeps the same task ID and history.
 An active turn is never interrupted; wait for it to finish before switching.
 
+`models.json` controls the model sent for the current task. After a successful
+GLM switch, the current-thread label can show the verified `glm-5.2` model; this
+does not mean Desktop's model picker contains GLM. The picker is owned by
+Desktop and app-server configuration, while the switcher only validates and
+routes the provider/model pair for requests.
+
 ## Upgrade
 
 Repeat the download and checksum steps with the new `VERSION`, enter the
@@ -189,7 +214,8 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 These commands replace the current installation and do not keep an old-version
 backup. Keep the existing `CODEX_PROVIDER_SWITCHER_CODEX` value—it must point to
 the real Codex executable, not the wrapper. Reconnect the Desktop SSH host after
-every upgrade.
+every upgrade. Keep `$STATE_ROOT/models.json` at mode 0600 and update every
+switchable provider route before reconnecting.
 
 ## Troubleshooting
 
