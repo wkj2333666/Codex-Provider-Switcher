@@ -188,16 +188,13 @@ Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中
 ## 升级
 
 使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后原子替换已安装的
-二进制和 model catalog，并替换 provider skill：
+二进制和 model catalog；先暂存两者，再依次启用 catalog 和二进制，最后替换
+provider skill：
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"
 BINARY_STAGE="$(mktemp "$INSTALL_ROOT/.codex-provider-switcher.XXXXXX")"
 install -m 0755 codex-provider-switcher "$BINARY_STAGE"
-mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
-
-rm -rf "$HOME/.agents/skills/provider"
-cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 
 STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
@@ -206,12 +203,16 @@ install -m 0600 /dev/null "$MODELS_STAGE"
 printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
   > "$MODELS_STAGE"
 mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
+mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
+
+rm -rf "$HOME/.agents/skills/provider"
+cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 ```
 
 这些命令会直接替换当前安装，不保留旧版本备份。不要修改现有的
 `CODEX_PROVIDER_SWITCHER_CODEX`：它必须指向真正的 Codex，不能指向 wrapper。
 每次升级后都要重新连接 Desktop SSH 主机。重新连接前，暂存 catalog 的替换会以
-0600 写入精确的受支持路由。
+0600 写入精确的受支持路由，并在新二进制启用前生效。
 
 ## 常见问题
 

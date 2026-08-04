@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -122,6 +123,65 @@ func TestRunSwitchesProviderAndMappedModel(t *testing.T) {
 	if record := <-server.turns; record.threadID != "thr-shared" || record.provider != "glm" ||
 		record.model != "glm-5.2" || !bytes.Equal(record.input, input) {
 		t.Fatalf("GLM turn = %#v, want glm/glm-5.2 with unchanged input", record)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestRunResolvesDefaultProviderMappedModelBeforeFirstTurn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	server.mu.Lock()
+	server.provider = "glm"
+	server.model = "gpt-5.6-sol"
+	server.mu.Unlock()
+	stateDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateDirectory, "models.json"), []byte(
+		`{"glm":"glm-5.2"}`,
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Socket:   server.socket,
+		StateDir: stateDirectory,
+	})
+	defer connection.CloseNow()
+
+	initializeTestClient(t, ctx, connection)
+	sendRPC(t, ctx, connection, 2, "thread/resume", map[string]any{"threadId": "thr-shared"})
+	resumed := readResponse(t, ctx, connection, "2")
+	if provider, model := responseProvider(t, resumed.raw), responseModel(t, resumed.raw); provider != "glm" || model != "gpt-5.6-sol" {
+		t.Fatalf("app-server route after resume = %s/%s, want glm/gpt-5.6-sol", provider, model)
+	}
+
+	input := []byte(`[{"type":"text","text":"first ordinary turn","metadata":{"parts":[1,true,null]}}]`)
+	turn := []byte(`{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"thr-shared","model":"gpt-5.6-sol","input":` + string(input) + `}}`)
+	if err := connection.Write(ctx, websocket.MessageText, turn); err != nil {
+		t.Fatal(err)
+	}
+	var visible []visibleRPC
+	for {
+		message := readVisibleRPC(t, ctx, connection)
+		visible = append(visible, message)
+		if message.method == "turn/completed" {
+			break
+		}
+	}
+	assertNoInternalMessages(t, visible)
+	var gotDecoded, wantDecoded any
+	record := <-server.turns
+	if json.Unmarshal(record.input, &gotDecoded) != nil || json.Unmarshal(input, &wantDecoded) != nil ||
+		!reflect.DeepEqual(gotDecoded, wantDecoded) {
+		t.Fatalf("first ordinary turn input = %s, want semantic value %s", record.input, input)
+	}
+	if record.threadID != "thr-shared" || record.provider != "glm" || record.model != "glm-5.2" {
+		t.Fatalf("first ordinary turn = %#v, want glm/glm-5.2", record)
+	}
+	if record := server.lastResumeRecord(); record.provider != "glm" || record.model != "glm-5.2" {
+		t.Fatalf("verified resume = %#v, want glm/glm-5.2", record)
 	}
 
 	cancel()
@@ -873,7 +933,9 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 		server.writeError(connection, message.id, -32001, "thread archived")
 		return
 	}
-	if requestedProvider != "" && requestedProvider != server.provider && len(server.subscribers) == 0 &&
+	requestedRouteDiffers := requestedProvider != "" &&
+		(requestedProvider != server.provider || requestedModel != "" && requestedModel != server.model)
+	if requestedRouteDiffers && len(server.subscribers) == 0 &&
 		!server.active && !server.systemError && (!server.stickyIdle || server.softReloaded) {
 		server.provider = requestedProvider
 		if requestedModel != "" {

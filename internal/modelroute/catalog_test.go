@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestLoadMissingAndEmptyCatalogPreserveProviderOnlyRoutes(t *testing.T) {
@@ -111,6 +113,71 @@ func TestLoadRejectsSymlinkAndNonRegularCatalog(t *testing.T) {
 	}
 	if _, err := Load(directoryEntry); err == nil {
 		t.Fatal("Load(directory) error = nil")
+	}
+}
+
+func TestLoadRejectsFIFOWithoutBlocking(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "models.json")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := Load(directory)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Load(FIFO) error = nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Load(FIFO) blocked")
+	}
+}
+
+func TestReadCatalogUsesOpenedDescriptorAfterPathReplacement(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "models.json")
+	writeModels(t, directory, `{"glm":"glm-5.2"}`)
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := os.Rename(path, filepath.Join(directory, "opened.json")); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(directory, "secret.json")
+	if err := os.WriteFile(secret, []byte(`{"glm":"secret-model"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, path); err != nil {
+		t.Fatal(err)
+	}
+
+	catalog, err := readCatalog(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := catalog.Resolve("glm"); got != (Route{Provider: "glm", Model: "glm-5.2"}) {
+		t.Fatalf("Resolve(glm) = %#v, want original opened catalog", got)
+	}
+}
+
+func TestReadCatalogRejectsClosedDescriptorWithStaticError(t *testing.T) {
+	directory := t.TempDir()
+	writeModels(t, directory, `{"glm":"secret-model"}`)
+	file, err := os.Open(filepath.Join(directory, "models.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCatalog(file); err == nil || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), directory) {
+		t.Fatalf("readCatalog(closed) error = %v", err)
 	}
 }
 

@@ -202,17 +202,13 @@ routes the provider/model pair for requests.
 ## Upgrade
 
 Repeat the download and checksum steps with the new `VERSION`, enter the
-extracted package directory, atomically replace the installed binary and model
-catalog, and replace the provider skill:
+extracted package directory, stage the binary and model catalog, activate the
+catalog before the binary, and replace the provider skill:
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"
 BINARY_STAGE="$(mktemp "$INSTALL_ROOT/.codex-provider-switcher.XXXXXX")"
 install -m 0755 codex-provider-switcher "$BINARY_STAGE"
-mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
-
-rm -rf "$HOME/.agents/skills/provider"
-cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 
 STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
@@ -221,13 +217,17 @@ install -m 0600 /dev/null "$MODELS_STAGE"
 printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
   > "$MODELS_STAGE"
 mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
+mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
+
+rm -rf "$HOME/.agents/skills/provider"
+cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 ```
 
 These commands replace the current installation and do not keep an old-version
 backup. Keep the existing `CODEX_PROVIDER_SWITCHER_CODEX` value—it must point to
 the real Codex executable, not the wrapper. Reconnect the Desktop SSH host after
 every upgrade. The staged catalog replacement installs the exact supported
-routes at mode 0600 before reconnecting.
+routes at mode 0600 before the new binary becomes active.
 
 ## Troubleshooting
 

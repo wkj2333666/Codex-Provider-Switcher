@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"unicode"
 	"unicode/utf8"
 
@@ -37,18 +38,22 @@ func Load(stateDirectory string) (*Catalog, error) {
 		return nil, errors.New("model route state directory is required")
 	}
 	path := filepath.Join(stateDirectory, catalogFileName)
-	info, err := os.Lstat(path)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return &Catalog{models: map[string]string{}}, nil
 	}
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxCatalogSize {
-		return nil, errors.New("invalid model route catalog file")
-	}
-	file, err := os.Open(path)
 	if err != nil {
 		return nil, errors.New("open model route catalog")
 	}
 	defer file.Close()
+	return readCatalog(file)
+}
+
+func readCatalog(file *os.File) (*Catalog, error) {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxCatalogSize {
+		return nil, errors.New("invalid model route catalog file")
+	}
 	data, err := io.ReadAll(io.LimitReader(file, maxCatalogSize+1))
 	if err != nil || len(data) > maxCatalogSize {
 		return nil, errors.New("read model route catalog")

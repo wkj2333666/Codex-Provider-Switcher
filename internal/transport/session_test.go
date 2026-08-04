@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 )
 
 func TestSessionConsumesInternalResponse(t *testing.T) {
@@ -207,6 +209,63 @@ func TestSessionDefersUnsavedProviderToAppServer(t *testing.T) {
 	}
 	if coordinator.prepareHandoffCalls != 0 || coordinator.unsubscribeCalls != 0 || coordinator.resubscribeCalls != 0 {
 		t.Fatalf("unsaved provider triggered handoff: %#v", coordinator)
+	}
+}
+
+func TestSessionResolvesUnsavedEffectiveProviderThroughCatalogBeforeFirstTurn(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	selections := &fakeProviderSelections{values: map[string]string{}}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			assertRawString(t, message.params, "modelProvider", "glm")
+			assertRawString(t, message.params, "model", "glm-5.2")
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"glm","model":"glm-5.2"}}`, message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testModelCatalog(t)
+	current.selections = selections
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "gpt-5.6-sol"
+	current.stateMu.Unlock()
+
+	wantInput := json.RawMessage(`[{"type":"text","text":"keep me","metadata":{"parts":[1,true,null]}}]`)
+	request := []byte(`{"id":29,"method":"turn/start","params":{"threadId":"thr-a","model":"gpt-5.6-sol","input":` + string(wantInput) + `}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 2 {
+		t.Fatalf("upstream messages = %q, want verified resume then ordinary turn", messages)
+	}
+	turn, err := parseRPCMessage(messages[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, turn.params, "model", "glm-5.2")
+	var gotDecoded, wantDecoded any
+	if json.Unmarshal(turn.params["input"], &gotDecoded) != nil || json.Unmarshal(wantInput, &wantDecoded) != nil ||
+		!reflect.DeepEqual(gotDecoded, wantDecoded) {
+		t.Fatalf("turn input = %s, want semantic value %s", turn.params["input"], wantInput)
+	}
+	if coordinator.prepareHandoffCalls != 1 ||
+		coordinator.resubscribeRoute != (modelroute.Route{Provider: "glm", Model: "glm-5.2"}) {
+		t.Fatalf("coordinator calls = %#v", coordinator)
 	}
 }
 
@@ -1342,6 +1401,50 @@ func TestSessionSuppressesOnlyMatchingRecoveryLifecycle(t *testing.T) {
 	}
 }
 
+func TestSessionV2JournalRepairRejectsLegacyPeerBeforeRecoveryMutation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	server.mu.Lock()
+	server.archived["thr-shared"] = true
+	server.mu.Unlock()
+	store, err := recovery.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := recovery.Journal{
+		Version: 2, RootID: "thr-shared", Provider: "glm", Model: "glm-5.2", Phase: "restoring",
+		Threads: []string{"thr-shared"}, Remaining: []string{"thr-shared"},
+	}
+	if err := store.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := &fakeHandoffCoordinator{prepareHandoffErr: errors.New("legacy peer")}
+	current := newTestSession(t, nil, nil)
+	current.appServerSocket = server.socket
+	current.coordinator = coordinator
+	current.recoveries = store
+
+	if err := current.repairRecoveryJournal(ctx, "thr-shared"); err == nil {
+		t.Fatal("repairRecoveryJournal() error = nil with legacy peer")
+	}
+	if coordinator.prepareCalls != 1 || coordinator.prepareHandoffCalls != 1 || coordinator.beginRecoveryCalls != 0 {
+		t.Fatalf("coordinator calls = %#v", coordinator)
+	}
+	server.mu.Lock()
+	connections := server.nextClient
+	unarchived := append([]string(nil), server.unarchived...)
+	resumes := append([]handoffResumeRecord(nil), server.resumes...)
+	server.mu.Unlock()
+	if connections != 0 || len(unarchived) != 0 || len(resumes) != 0 {
+		t.Fatalf("app-server mutations: connections=%d unarchived=%v resumes=%v", connections, unarchived, resumes)
+	}
+	got, found, err := store.Load("thr-shared")
+	if err != nil || !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("journal after rejected repair = %#v, %v, %v; want unchanged %#v", got, found, err, want)
+	}
+}
+
 type messageRecorder struct {
 	mu       sync.Mutex
 	payloads [][]byte
@@ -1460,6 +1563,7 @@ type fakeHandoffCoordinator struct {
 	clearDirtyCalls     int
 	dirtyStageCalls     []handoff.DirtyStage
 	releaseCalls        int
+	beginRecoveryCalls  int
 	prepareErr          error
 	prepareHandoffErr   error
 	unsubscribeErr      error
@@ -1470,6 +1574,7 @@ type fakeHandoffCoordinator struct {
 }
 
 func (coordinator *fakeHandoffCoordinator) BeginRecoveryAll(context.Context, string, []string) error {
+	coordinator.beginRecoveryCalls++
 	return nil
 }
 

@@ -212,10 +212,11 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 			return current.writeHandoffError(ctx, message.id)
 		}
 		if !selected {
-			targetRoute = current.effectiveRoute(threadID)
-			if targetRoute.Provider == "" {
+			effectiveProvider := current.effectiveProvider(threadID)
+			if effectiveProvider == "" {
 				return current.writeHandoffError(ctx, message.id)
 			}
+			targetRoute = current.routeForProvider(effectiveProvider)
 		}
 	}
 	if current.coordinator.IsDirty(threadID) || !routeMatches(current.effectiveRoute(threadID), targetRoute) {
@@ -510,6 +511,11 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 	}
 	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
 		return errors.New("prepare provider recovery repair")
+	}
+	if journal.Version == 2 {
+		if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
+			return errors.New("prepare provider recovery repair")
+		}
 	}
 	client, err := newRecoveryClient(ctx, current.appServerSocket)
 	if err != nil {

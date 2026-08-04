@@ -224,8 +224,8 @@ git commit -m "feat: switch providers with mapped models"
 Start with a GPT route, issue the exact provider skill command to switch to
 `glm`, assert the fake app-server receives `{modelProvider:"glm",model:"glm-5.2"}`
 on resume, then send a normal turn containing a conflicting GPT model and assert
-the forwarded turn uses `glm-5.2` while its input remains byte-for-byte
-semantically identical.
+the forwarded turn uses `glm-5.2` while its decoded input remains semantically
+identical.
 
 - [ ] **Step 2: Run the integration test and verify RED**
 

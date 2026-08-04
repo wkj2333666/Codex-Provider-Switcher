@@ -71,9 +71,10 @@ uses per-thread `flock` files to serialize transitions.
 `internal/transport/session` multiplexes Desktop and switcher-internal JSON-RPC
 requests on one upstream WebSocket. It correlates and hides internal responses,
 tracks effective provider/model routes and active turns, resolves durable task
-selections, and preserves ordinary Desktop messages byte-for-byte after routing
-policy is applied. It also recognizes exact provider controls and encodes a
-synthetic Codex turn lifecycle after a verified switch.
+selections, preserves turn input and unrelated JSON fields semantically when
+routing policy rewrites a message, and passes transparent messages byte-for-byte.
+It also recognizes exact provider controls and encodes a synthetic Codex turn
+lifecycle after a verified switch.
 
 `cmd/codex-provider-switcher` owns mode selection, signal cancellation, help,
 version output, diagnostics, and process exit codes. Delegated commands replace
@@ -250,7 +251,7 @@ command:
   configured providers remain visible.
 - Ordinary `turn/start` is held until the selected provider/model route is
   ready. Its model is replaced with the verified mapped value while its input
-  remains byte-for-byte unchanged.
+  remains semantically unchanged.
 - Exact provider controls are consumed locally and replaced by a fake lifecycle.
 - `model/list`, unknown methods, server messages, and binary messages are not
   rewritten.
