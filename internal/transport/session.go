@@ -78,6 +78,7 @@ type session struct {
 	desktop           map[string]*desktopRequest
 	resumeTemplates   map[string]map[string]json.RawMessage
 	effective         map[string]string
+	fresh             map[string]bool
 	detached          map[string]bool
 	active            map[string]bool
 	recovery          map[string]map[string]bool
@@ -107,6 +108,7 @@ func newSessionState(provider, appServerSocket string, upstreamWrite, downstream
 		desktop:         make(map[string]*desktopRequest),
 		resumeTemplates: make(map[string]map[string]json.RawMessage),
 		effective:       make(map[string]string),
+		fresh:           make(map[string]bool),
 		detached:        make(map[string]bool),
 		active:          make(map[string]bool),
 		recovery:        make(map[string]map[string]bool),
@@ -415,7 +417,7 @@ func (current *session) recoverProviderMismatch(ctx context.Context, threadID, t
 			_ = current.coordinator.EndRecoveryAll(repairCtx, threadID)
 		}
 	}()
-	if err := client.archive(ctx, threadID); err != nil {
+	if err := client.archive(ctx, threadID, current.isFresh(threadID)); err != nil {
 		return err
 	}
 	journal.Phase = "restoring"
@@ -749,9 +751,16 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 				(request.method == "thread/start" || request.method == "thread/resume" || request.method == "thread/fork") {
 				current.effective[threadID] = provider
 				delete(current.detached, threadID)
+				if request.method == "thread/start" {
+					current.fresh[threadID] = true
+				}
 			}
-			if request.method == "turn/start" && message.hasError {
-				delete(current.active, request.threadID)
+			if request.method == "turn/start" {
+				if message.hasError {
+					delete(current.active, request.threadID)
+				} else {
+					delete(current.fresh, request.threadID)
+				}
 			}
 			if request.method == "thread/unsubscribe" && !message.hasError {
 				delete(current.effective, request.threadID)
@@ -848,7 +857,14 @@ func (current *session) clearThreadRoutingState(threadID string) {
 	current.stateMu.Lock()
 	defer current.stateMu.Unlock()
 	delete(current.effective, threadID)
+	delete(current.fresh, threadID)
 	delete(current.detached, threadID)
+}
+
+func (current *session) isFresh(threadID string) bool {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	return current.fresh[threadID]
 }
 
 func (current *session) setDetached(threadID string, detached bool) {

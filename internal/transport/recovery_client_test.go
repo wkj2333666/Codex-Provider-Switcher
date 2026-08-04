@@ -123,6 +123,29 @@ func TestRecoveryClientRejectsSubtreeOverLimit(t *testing.T) {
 	}
 }
 
+func TestRolloutNotReadyErrorRequiresExactRPCError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "exact", err: &recoveryRPCError{code: -32600, message: "no rollout found"}, want: true},
+		{name: "wrapped exact", err: fmt.Errorf("outer: %w", &recoveryRPCError{code: -32600, message: "no rollout found"}), want: true},
+		{name: "wrong code", err: &recoveryRPCError{code: -32000, message: "no rollout found"}},
+		{name: "wrong message", err: &recoveryRPCError{code: -32600, message: "no archived rollout found"}},
+		{name: "generic", err: fmt.Errorf("no rollout found")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := rolloutNotReadyError(test.err); got != test.want {
+				t.Fatalf("rolloutNotReadyError() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 type recoveryProtocolRequest struct {
 	method string
 	params json.RawMessage

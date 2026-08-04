@@ -106,6 +106,33 @@ func TestSessionRecordsEffectiveProviderFromResumeResponse(t *testing.T) {
 	}
 }
 
+func TestSessionClearsFreshThreadAfterAcceptedTurn(t *testing.T) {
+	t.Parallel()
+	var downstream messageRecorder
+	session := newTestSession(t, nil, downstream.write)
+	session.stateMu.Lock()
+	session.desktop["1"] = &desktopRequest{method: "thread/start"}
+	session.stateMu.Unlock()
+
+	startResponse := []byte(`{"id":1,"result":{"thread":{"id":"thr-fresh"},"modelProvider":"openai"}}`)
+	if err := session.handleUpstreamText(context.Background(), startResponse); err != nil {
+		t.Fatal(err)
+	}
+	if !session.isFresh("thr-fresh") {
+		t.Fatal("thread/start response did not mark thread fresh")
+	}
+
+	session.stateMu.Lock()
+	session.desktop["2"] = &desktopRequest{method: "turn/start", threadID: "thr-fresh"}
+	session.stateMu.Unlock()
+	if err := session.handleUpstreamText(context.Background(), []byte(`{"id":2,"result":{"turn":{"id":"turn-1"}}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if session.isFresh("thr-fresh") {
+		t.Fatal("accepted turn left thread fresh")
+	}
+}
+
 func TestSessionDefersUnsavedProviderToAppServer(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
@@ -211,6 +238,7 @@ func TestSessionClearsProviderAfterDesktopUnsubscribeAndThreadClose(t *testing.T
 	session.stateMu.Lock()
 	session.effective["thr-unsubscribe"] = "sub2api"
 	session.effective["thr-closed"] = "sub2api"
+	session.fresh["thr-closed"] = true
 	session.desktop["4"] = &desktopRequest{
 		method:       "thread/unsubscribe",
 		threadID:     "thr-unsubscribe",
@@ -229,6 +257,9 @@ func TestSessionClearsProviderAfterDesktopUnsubscribeAndThreadClose(t *testing.T
 	}
 	if got := session.effectiveProvider("thr-closed"); got != "" {
 		t.Fatalf("provider after thread/closed = %q", got)
+	}
+	if session.isFresh("thr-closed") {
+		t.Fatal("thread/closed left thread fresh")
 	}
 }
 

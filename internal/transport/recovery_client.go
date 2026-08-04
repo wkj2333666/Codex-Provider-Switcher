@@ -9,11 +9,16 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/coder/websocket"
 )
 
-const maxRecoveryThreads = 64
+const (
+	maxRecoveryThreads        = 64
+	freshRolloutWaitTimeout   = 15 * time.Second
+	freshRolloutRetryInterval = 100 * time.Millisecond
+)
 
 type recoveryClient struct {
 	connection *websocket.Conn
@@ -38,6 +43,11 @@ func alreadyUnarchivedError(err error, threadID string) bool {
 	var rpcError *recoveryRPCError
 	return errors.As(err, &rpcError) && rpcError.code == -32600 &&
 		rpcError.message == "no archived rollout found for thread id "+threadID
+}
+
+func rolloutNotReadyError(err error) bool {
+	var rpcError *recoveryRPCError
+	return errors.As(err, &rpcError) && rpcError.code == -32600 && rpcError.message == "no rollout found"
 }
 
 func newRecoveryClient(ctx context.Context, socket string) (*recoveryClient, error) {
@@ -204,12 +214,30 @@ func (client *recoveryClient) readThread(ctx context.Context, threadID string) (
 	return recoveryThread{ID: result.Thread.ID, Status: result.Thread.Status.Type}, nil
 }
 
-func (client *recoveryClient) archive(ctx context.Context, threadID string) error {
-	_, err := client.call(ctx, "thread/archive", map[string]json.RawMessage{"threadId": rawJSONString(threadID)})
-	if err != nil {
-		return errors.New("archive recovery thread")
+func (client *recoveryClient) archive(ctx context.Context, threadID string, waitForFreshRollout bool) error {
+	waitCtx := ctx
+	cancel := func() {}
+	if waitForFreshRollout {
+		waitCtx, cancel = context.WithTimeout(ctx, freshRolloutWaitTimeout)
 	}
-	return nil
+	defer cancel()
+
+	for {
+		_, err := client.call(waitCtx, "thread/archive", map[string]json.RawMessage{"threadId": rawJSONString(threadID)})
+		if err == nil {
+			return nil
+		}
+		if !waitForFreshRollout || !rolloutNotReadyError(err) {
+			return errors.New("archive recovery thread")
+		}
+		timer := time.NewTimer(freshRolloutRetryInterval)
+		select {
+		case <-timer.C:
+		case <-waitCtx.Done():
+			timer.Stop()
+			return errors.New("archive recovery thread")
+		}
+	}
 }
 
 func (client *recoveryClient) unarchive(ctx context.Context, threadID string) error {

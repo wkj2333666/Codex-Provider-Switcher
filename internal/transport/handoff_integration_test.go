@@ -120,6 +120,99 @@ func TestProviderDesktopMarkdownSkillCommandSwitchesWithoutModelTurn(t *testing.
 	waitProxyDone(t, done)
 }
 
+func TestProviderCommandWaitsForFreshThreadRollout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	server.mu.Lock()
+	server.archiveNotReadyFailures = 2
+	server.stickyIdle = true
+	server.mu.Unlock()
+	connection, done := dialProviderProxy(t, ctx, server.socket, "openai")
+	defer connection.CloseNow()
+
+	initializeTestClient(t, ctx, connection)
+	sendRPC(t, ctx, connection, 2, "thread/start", map[string]any{"cwd": "/tmp"})
+	if provider := responseProvider(t, readResponse(t, ctx, connection, "2").raw); provider != "openai" {
+		t.Fatalf("fresh thread provider = %q, want openai", provider)
+	}
+
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{map[string]any{
+			"type": "text", "text": "/provider switch sub2api",
+		}},
+	})
+	response := readResponse(t, ctx, connection, "3")
+	if response.errorCode != 0 {
+		t.Fatalf("fresh provider switch response = %#v", response)
+	}
+	feedback := ""
+	for range 7 {
+		message := readVisibleRPC(t, ctx, connection)
+		if message.method == "item/agentMessage/delta" {
+			feedback = message.delta
+		}
+	}
+	if feedback != "Provider switched to sub2api." {
+		t.Fatalf("fresh provider switch feedback = %q", feedback)
+	}
+	server.mu.Lock()
+	provider := server.provider
+	archiveCalls := server.archiveCalls
+	server.mu.Unlock()
+	if provider != "sub2api" || archiveCalls != 3 {
+		t.Fatalf("fresh provider=%q archive calls=%d, want sub2api and 3", provider, archiveCalls)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("fresh provider switch model turns=%d, want 0", calls)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestProviderCommandDoesNotWaitForExistingThreadRollout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	server.mu.Lock()
+	server.archiveNotReadyFailures = 2
+	server.stickyIdle = true
+	server.mu.Unlock()
+	connection, done := dialProviderProxy(t, ctx, server.socket, "openai")
+	defer connection.CloseNow()
+
+	initializeTestClient(t, ctx, connection)
+	if provider := resumeTestThread(t, ctx, connection, 2); provider != "openai" {
+		t.Fatalf("existing thread provider = %q, want openai", provider)
+	}
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{map[string]any{
+			"type": "text", "text": "/provider switch sub2api",
+		}},
+	})
+	response := readResponse(t, ctx, connection, "3")
+	if response.errorCode != handoffErrorCode {
+		t.Fatalf("existing provider switch response = %#v", response)
+	}
+	server.mu.Lock()
+	archiveCalls := server.archiveCalls
+	server.mu.Unlock()
+	if archiveCalls != 1 {
+		t.Fatalf("existing thread archive calls=%d, want 1", archiveCalls)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("existing provider switch model turns=%d, want 0", calls)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
 func TestRunRecoversSystemErrorProviderWithoutModelTurn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -537,26 +630,27 @@ type handoffAppServer struct {
 	ctx          context.Context
 	autoComplete bool
 
-	mu            sync.Mutex
-	writeMu       sync.Mutex
-	nextClient    int
-	provider      string
-	active        bool
-	subscribers   map[int]*websocket.Conn
-	clients       map[int]*websocket.Conn
-	startedGate   chan struct{}
-	turnStarts    int
-	turns         chan handoffTurnRecord
-	systemError   bool
-	descendants   []string
-	history       []string
-	archiveCalls  int
-	unarchived    []string
-	archived      map[string]bool
-	failUnarchive string
-	stickyIdle    bool
-	softReloaded  bool
-	readStatus    string
+	mu                      sync.Mutex
+	writeMu                 sync.Mutex
+	nextClient              int
+	provider                string
+	active                  bool
+	subscribers             map[int]*websocket.Conn
+	clients                 map[int]*websocket.Conn
+	startedGate             chan struct{}
+	turnStarts              int
+	turns                   chan handoffTurnRecord
+	systemError             bool
+	descendants             []string
+	history                 []string
+	archiveCalls            int
+	archiveNotReadyFailures int
+	unarchived              []string
+	archived                map[string]bool
+	failUnarchive           string
+	stickyIdle              bool
+	softReloaded            bool
+	readStatus              string
 }
 
 type handoffTurnRecord struct {
@@ -615,6 +709,8 @@ func (server *handoffAppServer) handleUpgrade(writer http.ResponseWriter, reques
 		switch message.method {
 		case "initialize":
 			server.writeResult(connection, message.id, map[string]any{"userAgent": "handoff-test"})
+		case "thread/start":
+			server.handleStart(connection, clientID, message)
 		case "thread/resume":
 			server.handleResume(connection, clientID, message)
 		case "thread/unsubscribe":
@@ -633,6 +729,24 @@ func (server *handoffAppServer) handleUpgrade(writer http.ResponseWriter, reques
 			server.writeResult(connection, message.id, map[string]any{})
 		}
 	}
+}
+
+func (server *handoffAppServer) handleStart(connection *websocket.Conn, clientID int, message rpcMessage) {
+	requestedProvider := ""
+	_ = json.Unmarshal(message.params["modelProvider"], &requestedProvider)
+	server.mu.Lock()
+	if requestedProvider != "" {
+		server.provider = requestedProvider
+	}
+	server.subscribers[clientID] = connection
+	provider := server.provider
+	server.mu.Unlock()
+	server.writeResult(connection, message.id, map[string]any{
+		"thread": map[string]any{
+			"id": "thr-shared", "turns": []any{}, "status": map[string]any{"type": "idle"},
+		},
+		"modelProvider": provider,
+	})
 }
 
 func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientID int, message rpcMessage) {
@@ -693,6 +807,12 @@ func (server *handoffAppServer) handleList(connection *websocket.Conn, message r
 func (server *handoffAppServer) handleArchive(connection *websocket.Conn, message rpcMessage) {
 	server.mu.Lock()
 	server.archiveCalls++
+	if server.archiveNotReadyFailures > 0 {
+		server.archiveNotReadyFailures--
+		server.mu.Unlock()
+		server.writeError(connection, message.id, -32600, "no rollout found")
+		return
+	}
 	server.systemError = false
 	server.subscribers = make(map[int]*websocket.Conn)
 	clients := server.clientConnectionsLocked()
