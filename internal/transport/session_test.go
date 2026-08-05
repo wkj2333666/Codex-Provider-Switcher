@@ -618,6 +618,85 @@ func TestSessionSwitchesProviderBeforeTurnStart(t *testing.T) {
 	}
 }
 
+func TestSessionInternalResumeRewritesCollaborationModel(t *testing.T) {
+	t.Parallel()
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+			`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"glm","model":"glm-5.2"}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.stateMu.Lock()
+	current.resumeTemplates["thr-a"] = map[string]json.RawMessage{
+		"threadId":      json.RawMessage(`"thr-a"`),
+		"modelProvider": json.RawMessage(`"openai"`),
+		"model":         json.RawMessage(`"gpt-5.6-sol"`),
+		"collaborationMode": json.RawMessage(
+			`{"mode":"default","settings":{"model":"gpt-5.6-sol","effort":"high"}}`,
+		),
+	}
+	current.stateMu.Unlock()
+
+	wantRoute := modelroute.Route{Provider: "glm", Model: "glm-5.2"}
+	if err := current.internalResumeWithRoute(context.Background(), "thr-a", wantRoute, true); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 1 {
+		t.Fatalf("internal resume messages = %q", messages)
+	}
+	resume, err := parseRPCMessage(messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, resume.params, "model", "glm-5.2")
+	var collaboration struct {
+		Settings struct {
+			Model  string `json:"model"`
+			Effort string `json:"effort"`
+		} `json:"settings"`
+	}
+	if json.Unmarshal(resume.params["collaborationMode"], &collaboration) != nil ||
+		collaboration.Settings.Model != "glm-5.2" || collaboration.Settings.Effort != "high" {
+		t.Fatalf("internal resume collaborationMode = %s", resume.params["collaborationMode"])
+	}
+}
+
+func TestSessionInternalResumeRejectsMalformedCollaborationBeforeWrite(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.stateMu.Lock()
+	current.resumeTemplates["thr-a"] = map[string]json.RawMessage{
+		"threadId":          json.RawMessage(`"thr-a"`),
+		"collaborationMode": json.RawMessage(`"unsafe-value"`),
+	}
+	current.stateMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := current.internalResumeWithRoute(
+		ctx, "thr-a", modelroute.Route{Provider: "glm", Model: "glm-5.2"}, true,
+	)
+	if err == nil {
+		t.Fatal("internalResumeWithRoute() error = nil")
+	}
+	if bytes.Contains([]byte(err.Error()), []byte("unsafe-value")) {
+		t.Fatalf("internal resume error leaked collaboration value: %v", err)
+	}
+	if len(upstream.messages()) != 0 {
+		t.Fatalf("malformed internal resume reached app-server: %q", upstream.messages())
+	}
+}
+
 func TestSessionChecksPeersBeforeSameProviderTurn(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
@@ -1014,6 +1093,99 @@ func TestSessionAppliesMappedRouteToInitialThreadAndNormalTurn(t *testing.T) {
 	var input []commandInputItem
 	if json.Unmarshal(turnMessage.params["input"], &input) != nil || len(input) != 1 || input[0].Text != "keep me" {
 		t.Fatalf("turn input changed: %s", turnMessage.params["input"])
+	}
+}
+
+func TestSessionAppliesSavedRouteToThreadSettingsUpdate(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	coordinator := &fakeHandoffCoordinator{}
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testModelCatalog(t)
+	current.selections = &fakeProviderSelections{values: map[string]string{"thr-a": "glm"}}
+	current.coordinator = coordinator
+
+	request := []byte(`{"id":123,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"gpt-5.6-sol","collaborationMode":{"mode":"default","settings":{"model":"gpt-5.6-sol","effort":"high"}}}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 1 {
+		t.Fatalf("upstream messages = %q, want one settings update", messages)
+	}
+	message, err := parseRPCMessage(messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	if _, present := message.params["modelProvider"]; present {
+		t.Fatalf("settings update gained modelProvider: %s", messages[0])
+	}
+	var collaboration struct {
+		Settings struct {
+			Model  string `json:"model"`
+			Effort string `json:"effort"`
+		} `json:"settings"`
+	}
+	if json.Unmarshal(message.params["collaborationMode"], &collaboration) != nil ||
+		collaboration.Settings.Model != "glm-5.2" || collaboration.Settings.Effort != "high" {
+		t.Fatalf("collaborationMode = %s", message.params["collaborationMode"])
+	}
+	if coordinator.lockCalls != 1 || coordinator.releaseCalls != 1 {
+		t.Fatalf("settings update was not serialized: %#v", coordinator)
+	}
+}
+
+func TestSessionPreservesUnselectedThreadSettingsUpdate(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	coordinator := &fakeHandoffCoordinator{}
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testModelCatalog(t)
+	current.selections = &fakeProviderSelections{values: map[string]string{}}
+	current.coordinator = coordinator
+
+	request := []byte(` { "id": 124, "method": "thread/settings/update", "params": { "threadId": "thr-a", "model": "gpt-5.6-sol" } } `)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 1 || !bytes.Equal(messages[0], request) {
+		t.Fatalf("unselected settings update = %q, want byte-for-byte %q", messages, request)
+	}
+	if coordinator.lockCalls != 1 || coordinator.releaseCalls != 1 {
+		t.Fatalf("settings selection lookup was not serialized: %#v", coordinator)
+	}
+}
+
+func TestSessionAppliesDirectOverrideToThreadSettingsUpdate(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = "glm"
+	current.routes = testModelCatalog(t)
+	current.selections = &fakeProviderSelections{values: map[string]string{}}
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":125,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"gpt-5.6-sol","collaborationMode":{"mode":"default","settings":{"model":"gpt-5.6-sol"}}}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	var collaboration struct {
+		Settings struct {
+			Model string `json:"model"`
+		} `json:"settings"`
+	}
+	if json.Unmarshal(message.params["collaborationMode"], &collaboration) != nil ||
+		collaboration.Settings.Model != "glm-5.2" {
+		t.Fatalf("direct override collaborationMode = %s", message.params["collaborationMode"])
 	}
 }
 

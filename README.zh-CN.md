@@ -183,7 +183,9 @@ Host pi
 `models.json` 控制发送给当前任务的 model。成功切换到 GLM 后，当前线程标签可以
 显示已验证的 `glm-5.2`；这不表示 Desktop 的 model picker 中包含 GLM。Picker 由
 Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中的 provider/model
-组合。
+组合。任务保存 provider 选择或使用 direct provider override 后，映射 model 也会覆盖
+Desktop 的 collaboration mode 和 settings 更新，防止 picker 静默替换该 provider
+所需的 model。
 
 ## 升级
 

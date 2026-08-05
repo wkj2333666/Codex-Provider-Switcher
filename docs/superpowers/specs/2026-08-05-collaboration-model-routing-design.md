@@ -15,14 +15,16 @@ routing and can make the switcher's verified runtime cache stale.
 The selected provider route remains authoritative for model-bearing requests.
 One rewrite helper will set the top-level `model` and, when a non-null
 `collaborationMode` is present, its `settings.model`. The helper applies to
-provider-bearing thread start/resume/fork requests, ordinary turns, and
-task-selected `thread/settings/update` requests.
+provider-bearing thread start/resume/fork requests (including internal handoff
+resumes that reuse a Desktop template), ordinary turns, and authoritative
+`thread/settings/update` requests.
 
-`thread/settings/update` remains byte-transparent when the task has no saved
-provider selection. A selected update is serialized by the existing per-thread
-coordinator lock and uses the immutable catalog route. It does not initiate a
-provider handoff or save new state; the next ordinary turn retains responsibility
-for reconciling a provider mismatch.
+`thread/settings/update` remains byte-transparent when the task has neither a
+saved provider selection nor an explicit direct-mode provider override. An
+authoritative update is serialized by the existing per-thread coordinator lock
+and uses the immutable catalog route. It does not initiate a provider handoff or
+save new state; the next ordinary turn retains responsibility for reconciling a
+provider mismatch.
 
 ## Safety
 
@@ -31,7 +33,7 @@ for reconciling a provider mismatch.
   `collaborationMode.settings`, or another unsafe target shape as a routing
   policy error.
 - Do not add `modelProvider` to `turn/start` or `thread/settings/update`.
-- Do not rewrite settings for tasks without a saved selection.
+- Do not rewrite settings without a saved selection or direct provider override.
 - Keep exact provider controls local and preserve their input semantics.
 
 ## Verification
@@ -40,4 +42,3 @@ Unit tests cover nested model precedence, settings updates, null collaboration
 mode, malformed nested structures, unselected transparency, and input
 preservation. Existing integration and repository tests remain the regression
 gate. A host build and Linux/Darwin cross-builds verify release compatibility.
-

@@ -4,14 +4,14 @@
 
 **Goal:** Prevent Codex collaboration-mode and settings updates from overriding a verified provider/model route.
 
-**Architecture:** Extend the existing JSON rewrite boundary with one fail-closed model-field helper. Route saved-task `thread/settings/update` requests through the session's selection catalog while keeping unsaved tasks transparent.
+**Architecture:** Extend the existing JSON rewrite boundary with one fail-closed model-field helper. Route authoritative `thread/settings/update` and internal handoff resume requests through the same model rewrite while keeping tasks without a saved selection or direct override transparent.
 
 **Tech Stack:** Go 1.24, JSON-RPC over WebSocket, `encoding/json`, existing transport and rewrite tests.
 
 ## Global Constraints
 
 - Preserve provider control input and never replay user input.
-- Keep tasks without saved provider selections transparent.
+- Keep tasks without saved selections or direct provider overrides transparent.
 - Fail closed on malformed model-bearing request structures.
 - Do not change Codex credentials, task storage, or Desktop model listing.
 - Run `go clean -cache -testcache` after every Go build or test command.
@@ -45,8 +45,9 @@
 - Produces: `handleThreadSettingsUpdate(context.Context, rpcMessage, []byte) error`.
 
 - [ ] Add a failing session test showing a saved `kimi -> k3` route replaces both stale settings model fields.
-- [ ] Add a passing-transparency assertion for a task without a selection.
-- [ ] Dispatch settings updates to a dedicated handler, resolve only saved routes, and call `rewrite.Line` under the existing thread lock.
+- [ ] Add transparency and direct-override assertions for tasks without a saved selection.
+- [ ] Dispatch settings updates to a dedicated handler, resolve saved or direct-override routes, and call `rewrite.Line` under the existing thread lock.
+- [ ] Route internal handoff resume templates through the same model helper and reject malformed collaboration settings before writing upstream.
 - [ ] Run transport tests and confirm they pass.
 
 ### Task 3: Document And Verify

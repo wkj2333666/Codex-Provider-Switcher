@@ -245,20 +245,26 @@ command:
 
 - `thread/start` and `thread/fork` receive an explicit `params.modelProvider`
   only in direct override mode. A configured route also supplies its
-  `params.model`. `thread/resume` applies a saved task selection and its mapped
-  model.
+  `params.model` and any present collaboration-mode model. `thread/resume`
+  applies a saved task selection and its mapped model in both locations.
 - `thread/list` receives an empty `params.modelProviders` list so tasks from all
   configured providers remain visible.
+- `thread/settings/update` remains byte-transparent without a saved selection
+  or direct provider override. With either authority, its top-level and
+  collaboration-mode model fields are replaced under the same per-thread lock
+  used by provider handoff.
 - Ordinary `turn/start` is held until the selected provider/model route is
-  ready. Its model is replaced with the verified mapped value while its input
-  remains semantically unchanged.
+  ready. Its top-level and collaboration-mode models are replaced with the
+  verified mapped value while its input remains semantically unchanged.
+- Internal provider-handoff resumes apply the same two model replacements to
+  any reused Desktop resume template before writing it upstream.
 - Exact provider controls are consumed locally and replaced by a fake lifecycle.
 - `model/list`, unknown methods, server messages, and binary messages are not
   rewritten.
 
 A corrupt selection, malformed provider control, legacy `/provider <name>`
-input, attachment on a provider control, unsafe overridden `params` shape, or
-unsafe `models.json` fails closed. The catalog accepts only a regular,
+input, attachment on a provider control, unsafe overridden `params` or
+collaboration-mode shape, or unsafe `models.json` fails closed. The catalog accepts only a regular,
 non-symlink JSON object whose provider names and model IDs pass validation; an
 unreadable or invalid catalog prevents the downstream upgrade. Production must
 map every switchable provider, because an absent entry intentionally leaves the

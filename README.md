@@ -197,7 +197,10 @@ An active turn is never interrupted; wait for it to finish before switching.
 GLM switch, the current-thread label can show the verified `glm-5.2` model; this
 does not mean Desktop's model picker contains GLM. The picker is owned by
 Desktop and app-server configuration, while the switcher only validates and
-routes the provider/model pair for requests.
+routes the provider/model pair for requests. For a task with a saved selection
+or direct provider override, the mapped model also overrides Desktop
+collaboration-mode and settings updates so the picker cannot silently replace
+the provider's required model.
 
 ## Upgrade
 

@@ -131,6 +131,8 @@ func (current *session) handleDownstreamText(ctx context.Context, payload []byte
 	switch message.method {
 	case "turn/start":
 		return current.handleTurnStart(ctx, message, payload)
+	case "thread/settings/update":
+		return current.handleThreadSettingsUpdate(ctx, message, payload)
 	case "thread/resume":
 		return current.handleThreadResume(ctx, message, payload)
 	case "thread/unsubscribe":
@@ -143,6 +145,31 @@ func (current *session) handleDownstreamText(ctx context.Context, payload []byte
 	}
 	if message.method == "thread/start" || message.method == "thread/fork" {
 		current.trackDesktopRequest(message, &desktopRequest{method: message.method})
+	}
+	return current.writeUpstream(ctx, websocket.MessageText, rewritten)
+}
+
+func (current *session) handleThreadSettingsUpdate(ctx context.Context, message rpcMessage, payload []byte) error {
+	threadID, err := requireThreadID(message)
+	if err != nil || message.idKey == "" || current.coordinator == nil || message.params == nil {
+		return errRoutingPolicy
+	}
+	release, err := current.coordinator.LockThread(ctx, threadID)
+	if err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	defer release()
+
+	targetRoute, selected, err := current.selectedRoute(threadID)
+	if err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	if !selected {
+		return current.writeUpstream(ctx, websocket.MessageText, payload)
+	}
+	rewritten, err := rewrite.Line(payload, targetRoute)
+	if err != nil {
+		return errRoutingPolicy
 	}
 	return current.writeUpstream(ctx, websocket.MessageText, rewritten)
 }
@@ -618,7 +645,9 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	params["threadId"] = rawJSONString(threadID)
 	params["modelProvider"] = rawJSONString(expectedRoute.Provider)
 	if expectedRoute.Model != "" {
-		params["model"] = rawJSONString(expectedRoute.Model)
+		if err := rewrite.ApplyModel(params, expectedRoute.Model); err != nil {
+			return errors.New("provider handoff resume has invalid collaboration mode")
+		}
 	}
 
 	response, err := current.callUpstream(ctx, "thread/resume", params)

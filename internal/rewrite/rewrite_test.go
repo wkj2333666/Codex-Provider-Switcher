@@ -176,6 +176,120 @@ func TestLineAppliesMappedModelToThreadAndTurnRequests(t *testing.T) {
 	}
 }
 
+func TestLineAppliesMappedModelToCollaborationSettings(t *testing.T) {
+	t.Parallel()
+	route := modelroute.Route{Provider: "kimi", Model: "k3"}
+	tests := []struct {
+		name         string
+		method       string
+		wantProvider bool
+	}{
+		{name: "thread start", method: "thread/start", wantProvider: true},
+		{name: "thread resume", method: "thread/resume", wantProvider: true},
+		{name: "thread fork", method: "thread/fork", wantProvider: true},
+		{name: "turn start", method: "turn/start"},
+		{name: "thread settings update", method: "thread/settings/update"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			input := []byte(`{"id":1,"method":"` + test.method + `","params":{"threadId":"thr-a","model":"gpt-5.6-sol","collaborationMode":{"mode":"default","settings":{"model":"gpt-5.6-sol","effort":"high","extension":{"keep":true}}}}}`)
+			got, err := Line(input, route)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var message struct {
+				Params struct {
+					Model         string `json:"model"`
+					ModelProvider string `json:"modelProvider"`
+					Collaboration struct {
+						Settings struct {
+							Model     string `json:"model"`
+							Effort    string `json:"effort"`
+							Extension struct {
+								Keep bool `json:"keep"`
+							} `json:"extension"`
+						} `json:"settings"`
+					} `json:"collaborationMode"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(got, &message) != nil {
+				t.Fatalf("invalid rewritten message: %s", got)
+			}
+			if message.Params.Model != "k3" || message.Params.Collaboration.Settings.Model != "k3" {
+				t.Fatalf("models = %q, %q, want k3", message.Params.Model, message.Params.Collaboration.Settings.Model)
+			}
+			if message.Params.Collaboration.Settings.Effort != "high" ||
+				!message.Params.Collaboration.Settings.Extension.Keep {
+				t.Fatalf("unrelated collaboration settings changed: %s", got)
+			}
+			if test.wantProvider && message.Params.ModelProvider != "kimi" {
+				t.Fatalf("modelProvider = %q, want kimi", message.Params.ModelProvider)
+			}
+			if !test.wantProvider && message.Params.ModelProvider != "" {
+				t.Fatalf("%s gained modelProvider: %s", test.method, got)
+			}
+		})
+	}
+}
+
+func TestLineValidatesCollaborationSettingsOnlyWhenRoutingModel(t *testing.T) {
+	t.Parallel()
+	route := modelroute.Route{Provider: "kimi", Model: "k3"}
+	tests := []struct {
+		name      string
+		input     string
+		wantError bool
+	}{
+		{
+			name:  "null collaboration mode",
+			input: `{"id":1,"method":"turn/start","params":{"threadId":"thr-a","collaborationMode":null}}`,
+		},
+		{
+			name:      "non-object collaboration mode",
+			input:     `{"id":2,"method":"turn/start","params":{"threadId":"thr-a","collaborationMode":"unsafe"}}`,
+			wantError: true,
+		},
+		{
+			name:      "missing collaboration settings",
+			input:     `{"id":3,"method":"turn/start","params":{"threadId":"thr-a","collaborationMode":{"mode":"default"}}}`,
+			wantError: true,
+		},
+		{
+			name:      "null collaboration settings",
+			input:     `{"id":4,"method":"turn/start","params":{"threadId":"thr-a","collaborationMode":{"mode":"default","settings":null}}}`,
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Line([]byte(test.input), route)
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("Line() = %s, want routing error", got)
+				}
+				if strings.Contains(err.Error(), "unsafe") {
+					t.Fatalf("error leaked collaboration value: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var message struct {
+				Params struct {
+					Model         string `json:"model"`
+					Collaboration any    `json:"collaborationMode"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(got, &message) != nil || message.Params.Model != "k3" || message.Params.Collaboration != nil {
+				t.Fatalf("null collaboration rewrite = %s", got)
+			}
+		})
+	}
+}
+
 func TestLinePreservesUnmappedTurnAndModelListByteForByte(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
