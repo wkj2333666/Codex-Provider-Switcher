@@ -55,6 +55,20 @@ func TestParseProxyDefersProviderToAppServerAndIgnoresLegacyEnvironment(t *testi
 	}
 }
 
+func TestParseProxyIgnoresRemovedRecoveryEnvironment(t *testing.T) {
+	socket := unixSocket(t, "app-server.sock")
+	result, err := ParseProxy([]string{"--socket", socket}, environment(map[string]string{
+		"CODEX_PROVIDER_SWITCHER_RECOVERY": "exclusive",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Config{Socket: socket, StateDir: customStateDir(socket)}
+	if result.Config != want {
+		t.Fatalf("Config = %#v, want %#v", result.Config, want)
+	}
+}
+
 func TestParseProxyRejectsInvalidConfiguration(t *testing.T) {
 	socket := unixSocket(t, "valid.sock")
 	regularFile := filepath.Join(t.TempDir(), "not-a-socket")

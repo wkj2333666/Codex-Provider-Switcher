@@ -65,6 +65,64 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
+func TestRunVersionIncludesShortCommit(t *testing.T) {
+	setBuildInformation(t, "main-0123456", "0123456789abcdef0123456789abcdef01234567", "main", "2026-08-12T01:02:03Z")
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), "codex-provider-switcher", []string{"--version"}, dependencies{
+		stdout: &stdout,
+		stderr: &stderr,
+	})
+	if code != 0 || stdout.String() != "codex-provider-switcher main-0123456 (commit 0123456)\n" || stderr.Len() != 0 {
+		t.Fatalf("run(--version) = %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestRunBuildInfoDefaults(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), "codex-provider-switcher", []string{"--build-info"}, dependencies{
+		getenv: func(string) string { return "" },
+		stdout: &stdout,
+		stderr: &stderr,
+		runProxy: func(context.Context, transport.Options) error {
+			return errors.New("must not run")
+		},
+	})
+
+	var got struct {
+		Version string `json:"version"`
+		Commit  string `json:"commit"`
+		Source  string `json:"source"`
+		BuiltAt string `json:"builtAt"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("run(--build-info) stdout is not JSON: %q: %v", stdout.String(), err)
+	}
+	want := struct {
+		Version string `json:"version"`
+		Commit  string `json:"commit"`
+		Source  string `json:"source"`
+		BuiltAt string `json:"builtAt"`
+	}{Version: "dev", Commit: "unknown", Source: "unknown", BuiltAt: "unknown"}
+	if code != 0 || got != want || stderr.Len() != 0 {
+		t.Fatalf("run(--build-info) = %d, info %#v, stderr %q", code, got, stderr.String())
+	}
+}
+
+func TestRunBuildInfoEmbeddedValues(t *testing.T) {
+	setBuildInformation(t, "v1.2.3", "0123456789abcdef0123456789abcdef01234567", "release", "2026-08-12T01:02:03Z")
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), "codex-provider-switcher", []string{"--build-info"}, dependencies{
+		stdout: &stdout,
+		stderr: &stderr,
+	})
+	want := "{\"version\":\"v1.2.3\",\"commit\":\"0123456789abcdef0123456789abcdef01234567\",\"source\":\"release\",\"builtAt\":\"2026-08-12T01:02:03Z\"}\n"
+	if code != 0 || stdout.String() != want || stderr.Len() != 0 {
+		t.Fatalf("run(--build-info) = %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestRunDirectProxyMode(t *testing.T) {
 	socket := unixSocket(t)
 	stdin := strings.NewReader("input")
@@ -87,6 +145,17 @@ func TestRunDirectProxyMode(t *testing.T) {
 	}
 	if got.Config.Provider != "provider-a" || got.Config.Socket != socket || got.Stdin != stdin || got.Stdout != &stdout {
 		t.Fatalf("proxy options = %#v", got)
+	}
+}
+
+func TestUsageDoesNotAdvertiseRemovedRecoveryEnvironment(t *testing.T) {
+	var stdout bytes.Buffer
+	code := run(context.Background(), "codex-provider-switcher", nil, dependencies{stdout: &stdout})
+	if code != 0 {
+		t.Fatalf("run(help) = %d", code)
+	}
+	if strings.Contains(stdout.String(), "CODEX_PROVIDER_SWITCHER_RECOVERY") {
+		t.Fatalf("usage advertises removed recovery environment: %q", stdout.String())
 	}
 }
 
@@ -313,6 +382,35 @@ func TestRunWrapperDelegatesCodexVersion(t *testing.T) {
 	if code != 0 || !delegated || stdout.Len() != 0 {
 		t.Fatalf("run(codex --version) = %d, delegated %v, stdout %q", code, delegated, stdout.String())
 	}
+}
+
+func TestRunWrapperDelegatesBuildInfo(t *testing.T) {
+	current := executable(t, filepath.Join(t.TempDir(), "switcher"))
+	realCodex := executable(t, filepath.Join(t.TempDir(), "codex-real"))
+	delegated := false
+	var stdout bytes.Buffer
+	code := run(context.Background(), "codex", []string{"--build-info"}, dependencies{
+		getenv:     env(map[string]string{"CODEX_PROVIDER_SWITCHER_CODEX": realCodex}),
+		executable: func() (string, error) { return current, nil },
+		stdout:     &stdout,
+		execProcess: func(path string, argv, environment []string) error {
+			delegated = path == realCodex && slices.Equal(argv, []string{realCodex, "--build-info"})
+			return nil
+		},
+	})
+	if code != 0 || !delegated || stdout.Len() != 0 {
+		t.Fatalf("run(codex --build-info) = %d, delegated %v, stdout %q", code, delegated, stdout.String())
+	}
+}
+
+func setBuildInformation(t *testing.T, nextVersion, nextCommit, nextSource, nextBuiltAt string) {
+	t.Helper()
+	previousVersion, previousCommit := version, commit
+	previousSource, previousBuiltAt := source, builtAt
+	version, commit, source, builtAt = nextVersion, nextCommit, nextSource, nextBuiltAt
+	t.Cleanup(func() {
+		version, commit, source, builtAt = previousVersion, previousCommit, previousSource, previousBuiltAt
+	})
 }
 
 func TestRunReportsSanitizedFailures(t *testing.T) {

@@ -56,6 +56,11 @@ func TestReleaseContainsRequiredTargetsChecksumsAndPermissions(t *testing.T) {
 		"allow_implicit_invocation: false",
 		`cp -R plugins/codex-provider-switcher "$root/plugins/"`,
 		`tar -tzf "dist/${name}.tar.gz" | grep -Fx "${name}/plugins/codex-provider-switcher/skills/provider/SKILL.md"`,
+		"-X main.version=",
+		"-X main.commit=",
+		"-X main.source=release",
+		"-X main.builtAt=",
+		"--build-info",
 	} {
 		if !strings.Contains(content, required) {
 			t.Errorf("release.yml missing %q", required)

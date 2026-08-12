@@ -95,7 +95,24 @@ rm -rf "$HOME/.agents/skills/provider"
 cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 ```
 
-### 3. 配置登录 Shell
+### 3. 配置 provider 到 model 的路由
+
+在 switcher 状态目录创建严格校验的 `models.json`。必须为用户可能切换到的每个
+provider 配置 model；受支持的部署使用以下三个精确路由：
+
+```bash
+STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
+install -d -m 0700 "$STATE_ROOT"
+install -m 0600 /dev/null "$STATE_ROOT/models.json"
+printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+  > "$STATE_ROOT/models.json"
+```
+
+该文件是 provider 名称到 model ID 的 JSON 对象，并会进行严格校验：JSON 格式错误、
+无效名称或 model、符号链接和非常规文件都会使 switcher 在代理 Desktop 前关闭请求。
+缺少条目时不会注入 model，因此不要遗漏任何可切换 provider。
+
+### 4. 配置登录 Shell
 
 将以下内容加入 Desktop 使用的远程登录 Shell 配置文件。第一个值必须替换成
 上一步输出的绝对路径。
@@ -107,7 +124,12 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 
 普通 Bash 登录通常使用 `~/.profile`。
 
-### 4. 验证并重新连接 Desktop
+精确的空闲 provider 不一致和 `systemError` 终止状态都会自动恢复。Switcher
+会短暂归档并还原受影响的任务，以卸载陈旧运行时；任务 ID、历史和子任务保持
+不变，也不会重新发送用户消息。订阅同一 app-server 任务的客户端都必须使用
+switcher wrapper；不支持绕过 wrapper 直接订阅 app-server。
+
+### 5. 验证并重新连接 Desktop
 
 启动一个新的登录 Shell，然后运行：
 
@@ -145,6 +167,7 @@ Host pi
 /provider status
 /provider switch openai
 /provider switch sub2api
+/provider switch glm
 ```
 
 面向用户的命令只有：
@@ -153,18 +176,54 @@ Host pi
 - `/provider switch <name>`：切换当前空闲任务并保存选择。
 
 确认消息由 switcher 在本地生成，因此不会调用模型，也不会消耗模型 token。
-切换后任务 ID 和历史记录保持不变。运行中的 turn 不会被中断；请等待它结束
-后再切换。
+成功切换到 sub2api 时，确认消息为
+`Provider switched to sub2api using model gpt-5.6-sol.`。切换后任务 ID 和历史
+记录保持不变。运行中的 turn 不会被中断；请等待它结束后再切换。
 
-## 升级
+`models.json` 控制发送给当前任务的 model。成功切换到 GLM 后，当前线程标签可以
+显示已验证的 `glm-5.2`；这不表示 Desktop 的 model picker 中包含 GLM。Picker 由
+Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中的 provider/model
+组合。任务保存 provider 选择或使用 direct provider override 后，映射 model 也会覆盖
+Desktop 的 collaboration mode 和 settings 更新，防止 picker 静默替换该 provider
+所需的 model。
 
-使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后替换已安装的
-二进制和 skill：
+## 从当前 main 部署
+
+本机部署请使用仓库提供的受保护命令，不要从当前打开的任意 worktree 手动复制
+二进制。该命令只接受干净的 `main`，并要求 `HEAD` 与 `origin/main` 完全一致；
+随后自动运行测试、构建 Linux arm64、校验内置来源信息，并原子替换已安装文件，
+不保留旧版本备份：
+
+```bash
+cd /home/wkj/projects/codex-provider-switcher
+git switch main
+git pull --ff-only origin main
+scripts/deploy-local.sh
+"$HOME/.local/lib/codex-provider-switcher/codex-provider-switcher" --build-info
+```
+
+输出中的 `source` 必须是 `main`，commit 必须是你刚推送的版本。脚本不会停止已有
+proxy；部署后请重新连接 Desktop Remote SSH 主机，让新的 proxy 进程加载替换后的
+二进制。
+
+## 从 Release 压缩包升级
+
+使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后原子替换已安装的
+二进制和 model catalog；先暂存两者，再依次启用 catalog 和二进制，最后替换
+provider skill：
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"
 BINARY_STAGE="$(mktemp "$INSTALL_ROOT/.codex-provider-switcher.XXXXXX")"
 install -m 0755 codex-provider-switcher "$BINARY_STAGE"
+
+STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
+install -d -m 0700 "$STATE_ROOT"
+MODELS_STAGE="$(mktemp "$STATE_ROOT/.models.json.XXXXXX")"
+install -m 0600 /dev/null "$MODELS_STAGE"
+printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+  > "$MODELS_STAGE"
+mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
 mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
 
 rm -rf "$HOME/.agents/skills/provider"
@@ -173,7 +232,8 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 
 这些命令会直接替换当前安装，不保留旧版本备份。不要修改现有的
 `CODEX_PROVIDER_SWITCHER_CODEX`：它必须指向真正的 Codex，不能指向 wrapper。
-每次升级后都要重新连接 Desktop SSH 主机。
+每次升级后都要重新连接 Desktop SSH 主机。重新连接前，暂存 catalog 的替换会以
+0600 写入精确的受支持路由，并在新二进制启用前生效。
 
 ## 常见问题
 
@@ -187,7 +247,8 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 Codex 可执行文件的绝对路径。
 
 **切换被拒绝：** 先等待当前 turn 结束，同时确认 app-server 已配置目标供应商，
-并且 Codex CLI 不低于 0.146.0。
+并且 Codex CLI 不低于 0.146.0。升级 switcher 后请重新连接 Desktop SSH 主机，
+确保所有仍在运行的 proxy 使用同一版本。
 
 **app-server socket 不可用：** 重新连接或重启 Codex Desktop 的远程主机，让
 它正常启动 app-server。Switcher 会按设计关闭失败，不会自行启动第二个 daemon。
@@ -197,7 +258,7 @@ Codex 可执行文件的绝对路径。
 
 ## 卸载
 
-先从远程登录 Shell 配置文件中删除安装时加入的两个 export，然后删除 wrapper
+先从远程登录 Shell 配置文件中删除安装时加入的 switcher export，然后删除 wrapper
 和 skill：
 
 ```bash

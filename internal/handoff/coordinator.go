@@ -18,6 +18,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
+	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
 const (
@@ -25,6 +28,22 @@ const (
 	peerTimeout         = 2 * time.Second
 	lockRetryInterval   = 10 * time.Millisecond
 )
+
+// DirtyStage identifies the last verified boundary of an incomplete handoff.
+type DirtyStage string
+
+const (
+	DirtyStagePrepared       DirtyStage = "prepared"
+	DirtyStageUnsubscribed   DirtyStage = "unsubscribed"
+	DirtyStageResumeMismatch DirtyStage = "resumeMismatch"
+	DirtyStageRecovering     DirtyStage = "recovering"
+	DirtyStageResubscribing  DirtyStage = "resubscribing"
+)
+
+type dirtyRecord struct {
+	Version int        `json:"version"`
+	Stage   DirtyStage `json:"stage"`
+}
 
 // PeerStatus is a bounded result from one cooperating proxy connection.
 type PeerStatus string
@@ -37,13 +56,17 @@ const (
 	StatusNotLoaded     PeerStatus = "notLoaded"
 	StatusResubscribed  PeerStatus = "resubscribed"
 	StatusRestored      PeerStatus = "restored"
+	StatusRecoveryReady PeerStatus = "recoveryReady"
+	StatusRecoveryEnded PeerStatus = "recoveryEnded"
 )
 
 // Handler applies peer requests to one proxy connection.
 type Handler interface {
 	Prepare(threadID string) PeerStatus
+	BeginRecovery(threadID string, ids []string) PeerStatus
+	EndRecovery(threadID string) PeerStatus
 	Unsubscribe(context.Context, string) (PeerStatus, error)
-	Resubscribe(context.Context, string, string) (PeerStatus, error)
+	Resubscribe(context.Context, string, modelroute.Route) (PeerStatus, error)
 	Restore(context.Context, string) (PeerStatus, error)
 }
 
@@ -59,9 +82,11 @@ type Coordinator struct {
 }
 
 type controlRequest struct {
-	Method   string `json:"method"`
-	ThreadID string `json:"threadId"`
-	Provider string `json:"provider,omitempty"`
+	Method   string   `json:"method"`
+	ThreadID string   `json:"threadId"`
+	Provider string   `json:"provider,omitempty"`
+	Model    string   `json:"model,omitempty"`
+	IDs      []string `json:"ids,omitempty"`
 }
 
 type controlResponse struct {
@@ -152,24 +177,80 @@ func (coordinator *Coordinator) PrepareAll(ctx context.Context, threadID string)
 // PrepareHandoffAll verifies that every peer supports subscription restoration
 // before the first unsubscribe mutates app-server state.
 func (coordinator *Coordinator) PrepareHandoffAll(ctx context.Context, threadID string) error {
-	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareHandoffV2", ThreadID: threadID}, func(status PeerStatus) bool {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareHandoffV3", ThreadID: threadID}, func(status PeerStatus) bool {
+		return status == StatusReady
+	})
+}
+
+// PrepareRecoveryAll verifies recovery protocol support without changing state.
+func (coordinator *Coordinator) PrepareRecoveryAll(ctx context.Context, threadID string) error {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareRecoveryV1", ThreadID: threadID}, func(status PeerStatus) bool {
 		return status == StatusReady
 	})
 }
 
 // MarkDirty persists incomplete handoff state across every live proxy process.
 func (coordinator *Coordinator) MarkDirty(threadID string) error {
-	if threadID == "" {
-		return errors.New("invalid dirty handoff thread")
+	return coordinator.SetDirtyStage(threadID, DirtyStagePrepared)
+}
+
+// SetDirtyStage atomically records the last verified handoff boundary.
+func (coordinator *Coordinator) SetDirtyStage(threadID string, stage DirtyStage) error {
+	if threadID == "" || !validDirtyStage(stage) {
+		return errors.New("invalid dirty handoff stage")
 	}
-	file, err := os.OpenFile(coordinator.threadStatePath("dirty", threadID, ".state"), os.O_CREATE|os.O_WRONLY, 0o600)
+	encoded, err := json.Marshal(dirtyRecord{Version: 1, Stage: stage})
 	if err != nil {
-		return errors.New("mark dirty handoff thread")
+		return errors.New("encode dirty handoff stage")
 	}
-	if err := file.Close(); err != nil {
-		return errors.New("close dirty handoff marker")
+	temporary, err := os.CreateTemp(coordinator.directory, ".dirty-*")
+	if err != nil {
+		return errors.New("create dirty handoff stage")
 	}
+	temporaryPath := temporary.Name()
+	committed := false
+	defer func() {
+		_ = temporary.Close()
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return errors.New("secure dirty handoff stage")
+	}
+	if _, err := temporary.Write(encoded); err != nil {
+		return errors.New("write dirty handoff stage")
+	}
+	if err := temporary.Sync(); err != nil {
+		return errors.New("write dirty handoff stage")
+	}
+	if err := temporary.Close(); err != nil {
+		return errors.New("write dirty handoff stage")
+	}
+	if err := os.Rename(temporaryPath, coordinator.threadStatePath("dirty", threadID, ".state")); err != nil {
+		return errors.New("replace dirty handoff stage")
+	}
+	directory, err := os.Open(coordinator.directory)
+	if err != nil {
+		return errors.New("open dirty handoff directory")
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil || closeErr != nil {
+		return errors.New("sync dirty handoff directory")
+	}
+	committed = true
 	return nil
+}
+
+func validDirtyStage(stage DirtyStage) bool {
+	switch stage {
+	case DirtyStagePrepared, DirtyStageUnsubscribed, DirtyStageResumeMismatch,
+		DirtyStageRecovering, DirtyStageResubscribing:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsDirty reports whether a prior handoff may have left peer state divergent.
@@ -205,12 +286,12 @@ func (coordinator *Coordinator) UnsubscribeAll(ctx context.Context, threadID str
 
 // ResubscribeAll restores every connection detached by the handoff under the
 // verified effective provider.
-func (coordinator *Coordinator) ResubscribeAll(ctx context.Context, threadID, provider string) error {
-	if provider == "" {
-		return errors.New("invalid provider handoff resubscribe")
+func (coordinator *Coordinator) ResubscribeAll(ctx context.Context, threadID string, route modelroute.Route) error {
+	if !providerid.Valid(route.Provider) || (route.Model != "" && !modelroute.ValidModel(route.Model)) {
+		return errors.New("invalid provider model handoff resubscribe")
 	}
 	return coordinator.visitPeers(ctx, controlRequest{
-		Method: "resubscribe", ThreadID: threadID, Provider: provider,
+		Method: "resubscribe", ThreadID: threadID, Provider: route.Provider, Model: route.Model,
 	}, func(status PeerStatus) bool {
 		return status == StatusResubscribed || status == StatusNotSubscribed
 	})
@@ -220,6 +301,35 @@ func (coordinator *Coordinator) ResubscribeAll(ctx context.Context, threadID, pr
 func (coordinator *Coordinator) RestoreAll(ctx context.Context, threadID string) error {
 	return coordinator.visitPeersMode(ctx, controlRequest{Method: "restore", ThreadID: threadID}, func(status PeerStatus) bool {
 		return status == StatusRestored || status == StatusNotSubscribed
+	}, true)
+}
+
+// BeginRecoveryAll installs bounded notification suppression on every peer.
+func (coordinator *Coordinator) BeginRecoveryAll(ctx context.Context, threadID string, ids []string) error {
+	if !validRecoveryIDs(threadID, ids) {
+		return errors.New("invalid provider recovery threads")
+	}
+	err := coordinator.visitPeers(ctx, controlRequest{
+		Method: "beginRecoveryV1", ThreadID: threadID, IDs: append([]string(nil), ids...),
+	}, func(status PeerStatus) bool {
+		return status == StatusRecoveryReady
+	})
+	if err != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+		defer cancel()
+		_ = coordinator.visitPeersMode(rollbackCtx, controlRequest{
+			Method: "endRecoveryV1", ThreadID: threadID,
+		}, func(status PeerStatus) bool {
+			return status == StatusRecoveryEnded
+		}, true)
+	}
+	return err
+}
+
+// EndRecoveryAll removes notification suppression from every peer.
+func (coordinator *Coordinator) EndRecoveryAll(ctx context.Context, threadID string) error {
+	return coordinator.visitPeersMode(ctx, controlRequest{Method: "endRecoveryV1", ThreadID: threadID}, func(status PeerStatus) bool {
+		return status == StatusRecoveryEnded
 	}, true)
 }
 
@@ -263,8 +373,18 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 	switch request.Method {
 	case "prepare":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
-	case "prepareHandoffV2":
+	case "prepareHandoffV3":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
+	case "prepareRecoveryV1":
+		response.Status = coordinator.handler.Prepare(request.ThreadID)
+	case "beginRecoveryV1":
+		if !validRecoveryIDs(request.ThreadID, request.IDs) {
+			response.Error = true
+			break
+		}
+		response.Status = coordinator.handler.BeginRecovery(request.ThreadID, request.IDs)
+	case "endRecoveryV1":
+		response.Status = coordinator.handler.EndRecovery(request.ThreadID)
 	case "unsubscribe":
 		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 		defer cancel()
@@ -275,13 +395,14 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 			response.Status = status
 		}
 	case "resubscribe":
-		if request.Provider == "" {
+		route := modelroute.Route{Provider: request.Provider, Model: request.Model}
+		if !providerid.Valid(route.Provider) || (route.Model != "" && !modelroute.ValidModel(route.Model)) {
 			response.Error = true
 			break
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 		defer cancel()
-		status, err := coordinator.handler.Resubscribe(ctx, request.ThreadID, request.Provider)
+		status, err := coordinator.handler.Resubscribe(ctx, request.ThreadID, route)
 		if err != nil {
 			response.Error = true
 		} else {
@@ -300,6 +421,20 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 		response.Error = true
 	}
 	coordinator.writeControlResponse(connection, response)
+}
+
+func validRecoveryIDs(rootID string, ids []string) bool {
+	if rootID == "" || len(ids) == 0 || len(ids) > 64 {
+		return false
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	return seen[rootID]
 }
 
 func (coordinator *Coordinator) writeControlResponse(connection net.Conn, response controlResponse) {

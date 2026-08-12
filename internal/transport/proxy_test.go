@@ -77,6 +77,34 @@ func TestServeConnectionFlushesHTTPErrorBeforeReturn(t *testing.T) {
 	}
 }
 
+func TestServeConnectionRejectsInvalidModelCatalogBeforeUpstreamDial(t *testing.T) {
+	stateDirectory := t.TempDir()
+	secret := `{"glm":"secret model"}`
+	if err := os.WriteFile(filepath.Join(stateDirectory, "models.json"), []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	writer := &flushRecorder{header: make(http.Header)}
+	err = serveConnection(context.Background(), writer, request, Options{Config: config.Config{
+		Provider: "glm",
+		Socket:   filepath.Join(t.TempDir(), "missing.sock"),
+		StateDir: stateDirectory,
+	}})
+	if err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("serveConnection() error = %v", err)
+	}
+	if writer.status != http.StatusInternalServerError || !writer.flushed {
+		t.Fatalf("HTTP error status = %d, flushed = %v", writer.status, writer.flushed)
+	}
+}
+
 func TestTransportProcessHelper(t *testing.T) {
 	if os.Getenv("CODEX_PROVIDER_SWITCHER_TRANSPORT_HELPER") != "1" {
 		return

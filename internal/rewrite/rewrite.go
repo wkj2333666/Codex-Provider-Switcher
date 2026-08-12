@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 )
 
 var providerMethods = map[string]struct{}{
@@ -15,9 +17,14 @@ var providerMethods = map[string]struct{}{
 	"thread/fork":   {},
 }
 
+var modelMethods = map[string]struct{}{
+	"turn/start":             {},
+	"thread/settings/update": {},
+}
+
 // Line validates one JSON-RPC line and applies routing fields to target
 // methods. Valid non-target messages are returned unchanged.
-func Line(line []byte, provider string) ([]byte, error) {
+func Line(line []byte, route modelroute.Route) ([]byte, error) {
 	var message map[string]json.RawMessage
 	if err := json.Unmarshal(line, &message); err != nil || message == nil {
 		return nil, errors.New("invalid JSON object")
@@ -30,10 +37,12 @@ func Line(line []byte, provider string) ([]byte, error) {
 	}
 
 	_, injectProvider := providerMethods[method]
-	if !injectProvider && method != "thread/list" {
+	_, modelMethod := modelMethods[method]
+	injectModel := route.Model != "" && (injectProvider || modelMethod)
+	if !injectProvider && !injectModel && method != "thread/list" {
 		return line, nil
 	}
-	if injectProvider && provider == "" {
+	if injectProvider && route.Provider == "" {
 		return line, nil
 	}
 
@@ -44,12 +53,18 @@ func Line(line []byte, provider string) ([]byte, error) {
 	}
 
 	if injectProvider {
-		value, err := json.Marshal(provider)
+		value, err := json.Marshal(route.Provider)
 		if err != nil {
 			return nil, errors.New("encode provider")
 		}
 		params["modelProvider"] = value
-	} else {
+	}
+	if injectModel {
+		if err := ApplyModel(params, route.Model); err != nil {
+			return nil, fmt.Errorf("method %s has invalid collaboration mode", method)
+		}
+	}
+	if method == "thread/list" {
 		params["modelProviders"] = json.RawMessage("[]")
 	}
 
@@ -64,6 +79,44 @@ func Line(line []byte, provider string) ([]byte, error) {
 		return nil, fmt.Errorf("encode method %s", method)
 	}
 	return encoded, nil
+}
+
+// ApplyModel replaces every model field that Codex can use for one request.
+func ApplyModel(params map[string]json.RawMessage, model string) error {
+	params["model"] = rawJSONString(model)
+	collaborationRaw, present := params["collaborationMode"]
+	if !present || !hasNonNull(collaborationRaw) {
+		return nil
+	}
+	collaboration, err := objectParams(collaborationRaw, true)
+	if err != nil {
+		return err
+	}
+	settingsRaw, present := collaboration["settings"]
+	if !present || !hasNonNull(settingsRaw) {
+		return errors.New("missing collaboration settings")
+	}
+	settings, err := objectParams(settingsRaw, true)
+	if err != nil {
+		return err
+	}
+	settings["model"] = rawJSONString(model)
+	encodedSettings, err := json.Marshal(settings)
+	if err != nil {
+		return errors.New("encode collaboration settings")
+	}
+	collaboration["settings"] = encodedSettings
+	encodedCollaboration, err := json.Marshal(collaboration)
+	if err != nil {
+		return errors.New("encode collaboration mode")
+	}
+	params["collaborationMode"] = encodedCollaboration
+	return nil
+}
+
+func rawJSONString(value string) json.RawMessage {
+	encoded, _ := json.Marshal(value)
+	return encoded
 }
 
 func objectParams(raw json.RawMessage, present bool) (map[string]json.RawMessage, error) {

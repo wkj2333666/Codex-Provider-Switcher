@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
+	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
 type rpcKind uint8
@@ -16,14 +19,25 @@ const (
 )
 
 type rpcMessage struct {
-	kind     rpcKind
-	method   string
-	id       json.RawMessage
-	idKey    string
-	params   map[string]json.RawMessage
-	result   map[string]json.RawMessage
-	hasError bool
-	threadID string
+	kind         rpcKind
+	method       string
+	id           json.RawMessage
+	idKey        string
+	params       map[string]json.RawMessage
+	result       map[string]json.RawMessage
+	hasError     bool
+	errorCode    int
+	errorMessage string
+	threadID     string
+}
+
+type appServerRPCError struct {
+	code    int
+	message string
+}
+
+func (*appServerRPCError) Error() string {
+	return "app-server request failed"
 }
 
 func parseRPCMessage(payload []byte) (rpcMessage, error) {
@@ -55,6 +69,14 @@ func parseRPCMessage(payload []byte) (rpcMessage, error) {
 	message.result = decodeObject(envelope["result"])
 	if rawError, ok := envelope["error"]; ok && hasJSONValue(rawError) {
 		message.hasError = true
+		var rpcError struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(rawError, &rpcError) == nil {
+			message.errorCode = rpcError.Code
+			message.errorMessage = rpcError.Message
+		}
 	}
 	if message.params != nil {
 		_ = json.Unmarshal(message.params["threadId"], &message.threadID)
@@ -70,19 +92,43 @@ func requireThreadID(message rpcMessage) (string, error) {
 }
 
 func responseThreadProvider(message rpcMessage) (string, string, bool) {
+	threadID, route, ok := responseThreadRoute(message)
+	return threadID, route.Provider, ok
+}
+
+func responseThreadRoute(message rpcMessage) (string, modelroute.Route, bool) {
 	if message.kind != rpcResponse || message.hasError || message.result == nil {
-		return "", "", false
+		return "", modelroute.Route{}, false
 	}
 	var thread map[string]json.RawMessage
 	if err := json.Unmarshal(message.result["thread"], &thread); err != nil || thread == nil {
-		return "", "", false
+		return "", modelroute.Route{}, false
 	}
 	var threadID, provider string
 	if json.Unmarshal(thread["id"], &threadID) != nil || threadID == "" ||
-		json.Unmarshal(message.result["modelProvider"], &provider) != nil || provider == "" {
-		return "", "", false
+		json.Unmarshal(message.result["modelProvider"], &provider) != nil || !providerid.Valid(provider) {
+		return "", modelroute.Route{}, false
 	}
-	return threadID, provider, true
+	route := modelroute.Route{Provider: provider}
+	if rawModel, present := message.result["model"]; present {
+		if !hasJSONValue(rawModel) || json.Unmarshal(rawModel, &route.Model) != nil || !modelroute.ValidModel(route.Model) {
+			return "", modelroute.Route{}, false
+		}
+	}
+	return threadID, route, true
+}
+
+func responseThreadName(message rpcMessage) string {
+	if message.kind != rpcResponse || message.hasError || message.result == nil {
+		return ""
+	}
+	var thread map[string]json.RawMessage
+	if json.Unmarshal(message.result["thread"], &thread) != nil || thread == nil {
+		return ""
+	}
+	var name string
+	_ = json.Unmarshal(thread["name"], &name)
+	return name
 }
 
 func encodeRPCRequest(id, method string, params map[string]json.RawMessage) ([]byte, error) {

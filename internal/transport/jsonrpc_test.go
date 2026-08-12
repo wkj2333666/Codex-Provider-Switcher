@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 )
 
 func TestParseRPCMessageExtractsRoutingMetadata(t *testing.T) {
@@ -89,23 +91,39 @@ func TestRequireThreadIDRejectsMalformedTurnStart(t *testing.T) {
 	}
 }
 
-func TestResponseThreadProvider(t *testing.T) {
+func TestResponseThreadRoute(t *testing.T) {
 	t.Parallel()
-	message, err := parseRPCMessage([]byte(`{"id":1,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`))
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name         string
+		input        string
+		wantThreadID string
+		wantRoute    modelroute.Route
+		wantOK       bool
+	}{
+		{
+			name: "mapped route", input: `{"id":1,"result":{"thread":{"id":"thr-a"},"model":"glm-5.2","modelProvider":"glm"}}`,
+			wantThreadID: "thr-a", wantRoute: modelroute.Route{Provider: "glm", Model: "glm-5.2"}, wantOK: true,
+		},
+		{
+			name: "provider-only legacy route", input: `{"id":2,"result":{"thread":{"id":"thr-b"},"modelProvider":"sub2api"}}`,
+			wantThreadID: "thr-b", wantRoute: modelroute.Route{Provider: "sub2api"}, wantOK: true,
+		},
+		{name: "malformed thread", input: `{"id":3,"result":{"thread":{"id":7},"modelProvider":"glm","model":"glm-5.2"}}`},
+		{name: "missing provider", input: `{"id":4,"result":{"thread":{"id":"thr-a"},"model":"glm-5.2"}}`},
+		{name: "malformed model", input: `{"id":5,"result":{"thread":{"id":"thr-a"},"modelProvider":"glm","model":52}}`},
+		{name: "rpc error", input: `{"id":6,"error":{"code":500,"message":"secret"}}`},
 	}
-	threadID, provider, ok := responseThreadProvider(message)
-	if !ok || threadID != "thr-a" || provider != "sub2api" {
-		t.Fatalf("responseThreadProvider() = %q, %q, %v", threadID, provider, ok)
-	}
-
-	malformed, err := parseRPCMessage([]byte(`{"id":2,"result":{"thread":{"id":7},"modelProvider":"secret-provider"}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, ok := responseThreadProvider(malformed); ok {
-		t.Fatal("responseThreadProvider() accepted malformed response")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			message, err := parseRPCMessage([]byte(tt.input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			threadID, route, ok := responseThreadRoute(message)
+			if ok != tt.wantOK || threadID != tt.wantThreadID || route != tt.wantRoute {
+				t.Fatalf("responseThreadRoute() = %q, %#v, %v; want %q, %#v, %v", threadID, route, ok, tt.wantThreadID, tt.wantRoute, tt.wantOK)
+			}
+		})
 	}
 }
 

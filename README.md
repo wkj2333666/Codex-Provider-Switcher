@@ -96,7 +96,26 @@ rm -rf "$HOME/.agents/skills/provider"
 cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/provider"
 ```
 
-### 3. Configure the login shell
+### 3. Configure provider-to-model routes
+
+Create the strict `models.json` catalog in the switcher state directory. Map
+every provider that users may switch to; the supported deployment uses these
+three exact routes:
+
+```bash
+STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
+install -d -m 0700 "$STATE_ROOT"
+install -m 0600 /dev/null "$STATE_ROOT/models.json"
+printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+  > "$STATE_ROOT/models.json"
+```
+
+The catalog is a JSON object of provider names to model IDs. It is validated
+strictly: malformed JSON, invalid names or models, symlinks, and non-regular
+files make the switcher fail closed before it proxies Desktop. A missing entry
+does not inject a model, so do not leave a switchable provider unmapped.
+
+### 4. Configure the login shell
 
 Add these exports to the remote login-shell profile used by Desktop. Replace
 the first value with the absolute path printed in the previous step.
@@ -108,7 +127,14 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 
 For a normal Bash login this is usually `~/.profile`.
 
-### 4. Verify and reconnect Desktop
+Recovery from an exact idle provider mismatch or terminal `systemError` is
+automatic. The switcher briefly archives and restores the affected thread to
+unload its stale runtime. It keeps the thread ID, history, and descendants and
+never resends the user's message. Every client that subscribes to the same
+app-server threads must use the switcher wrapper; direct app-server subscribers
+are unsupported.
+
+### 5. Verify and reconnect Desktop
 
 Start a fresh login shell and run:
 
@@ -148,10 +174,12 @@ commands:
 /provider status
 /provider switch openai
 /provider switch sub2api
+/provider switch glm
 ```
 
 For example, use `/provider switch openai` for the native provider or
-`/provider switch sub2api` for the configured alternative.
+`/provider switch sub2api` or `/provider switch glm` for configured
+alternatives.
 
 The user-facing commands are:
 
@@ -161,18 +189,57 @@ The user-facing commands are:
 
 The confirmation is generated locally, so it does not invoke a model or consume
 model tokens. A successful alternative-provider switch reports
-`Provider switched to sub2api.` Switching keeps the same task ID and history.
+`Provider switched to sub2api using model gpt-5.6-sol.` Switching keeps the
+same task ID and history.
 An active turn is never interrupted; wait for it to finish before switching.
 
-## Upgrade
+`models.json` controls the model sent for the current task. After a successful
+GLM switch, the current-thread label can show the verified `glm-5.2` model; this
+does not mean Desktop's model picker contains GLM. The picker is owned by
+Desktop and app-server configuration, while the switcher only validates and
+routes the provider/model pair for requests. For a task with a saved selection
+or direct provider override, the mapped model also overrides Desktop
+collaboration-mode and settings updates so the picker cannot silently replace
+the provider's required model.
+
+## Deploy the current main checkout
+
+For this machine, use the repository's guarded deployment command instead of
+copying a binary from whichever worktree happens to be open. It only accepts a
+clean checkout on `main` whose `HEAD` exactly matches `origin/main`, then runs
+tests, builds Linux arm64, verifies embedded provenance, and atomically replaces
+the installed executable without a backup:
+
+```bash
+cd /home/wkj/projects/codex-provider-switcher
+git switch main
+git pull --ff-only origin main
+scripts/deploy-local.sh
+"$HOME/.local/lib/codex-provider-switcher/codex-provider-switcher" --build-info
+```
+
+The output must report `source` as `main` and the pushed commit you intended to
+deploy. The script never stops an existing proxy; reconnect the Desktop Remote
+SSH host so new proxy processes load the replacement.
+
+## Upgrade from a release archive
 
 Repeat the download and checksum steps with the new `VERSION`, enter the
-extracted package directory, and replace the installed binary and skill:
+extracted package directory, stage the binary and model catalog, activate the
+catalog before the binary, and replace the provider skill:
 
 ```bash
 INSTALL_ROOT="$HOME/.local/lib/codex-provider-switcher"
 BINARY_STAGE="$(mktemp "$INSTALL_ROOT/.codex-provider-switcher.XXXXXX")"
 install -m 0755 codex-provider-switcher "$BINARY_STAGE"
+
+STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
+install -d -m 0700 "$STATE_ROOT"
+MODELS_STAGE="$(mktemp "$STATE_ROOT/.models.json.XXXXXX")"
+install -m 0600 /dev/null "$MODELS_STAGE"
+printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+  > "$MODELS_STAGE"
+mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
 mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
 
 rm -rf "$HOME/.agents/skills/provider"
@@ -182,7 +249,8 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 These commands replace the current installation and do not keep an old-version
 backup. Keep the existing `CODEX_PROVIDER_SWITCHER_CODEX` value—it must point to
 the real Codex executable, not the wrapper. Reconnect the Desktop SSH host after
-every upgrade.
+every upgrade. The staged catalog replacement installs the exact supported
+routes at mode 0600 before the new binary becomes active.
 
 ## Troubleshooting
 
@@ -198,6 +266,8 @@ is an absolute path to the real Codex executable.
 
 **A switch is rejected:** finish any active turn first. Also confirm the
 provider is configured in the app-server and Codex CLI is 0.146.0 or newer.
+After upgrading the switcher, reconnect the Desktop SSH host so every live
+proxy uses the same version.
 
 **The app-server socket is unavailable:** connect or restart Codex Desktop's
 remote host so its normal app-server is running. The switcher intentionally
@@ -208,7 +278,7 @@ For transport and handoff details, see
 
 ## Uninstall
 
-Remove the two exports from the remote login-shell profile, then remove the
+Remove the switcher exports from the remote login-shell profile, then remove the
 wrapper and skill:
 
 ```bash
