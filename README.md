@@ -202,7 +202,27 @@ or direct provider override, the mapped model also overrides Desktop
 collaboration-mode and settings updates so the picker cannot silently replace
 the provider's required model.
 
-## Upgrade
+## Deploy the current main checkout
+
+For this machine, use the repository's guarded deployment command instead of
+copying a binary from whichever worktree happens to be open. It only accepts a
+clean checkout on `main` whose `HEAD` exactly matches `origin/main`, then runs
+tests, builds Linux arm64, verifies embedded provenance, and atomically replaces
+the installed executable without a backup:
+
+```bash
+cd /home/wkj/projects/codex-provider-switcher
+git switch main
+git pull --ff-only origin main
+scripts/deploy-local.sh
+"$HOME/.local/lib/codex-provider-switcher/codex-provider-switcher" --build-info
+```
+
+The output must report `source` as `main` and the pushed commit you intended to
+deploy. The script never stops an existing proxy; reconnect the Desktop Remote
+SSH host so new proxy processes load the replacement.
+
+## Upgrade from a release archive
 
 Repeat the download and checksum steps with the new `VERSION`, enter the
 extracted package directory, stage the binary and model catalog, activate the

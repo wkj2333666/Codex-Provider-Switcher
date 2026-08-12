@@ -187,7 +187,26 @@ Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中
 Desktop 的 collaboration mode 和 settings 更新，防止 picker 静默替换该 provider
 所需的 model。
 
-## 升级
+## 从当前 main 部署
+
+本机部署请使用仓库提供的受保护命令，不要从当前打开的任意 worktree 手动复制
+二进制。该命令只接受干净的 `main`，并要求 `HEAD` 与 `origin/main` 完全一致；
+随后自动运行测试、构建 Linux arm64、校验内置来源信息，并原子替换已安装文件，
+不保留旧版本备份：
+
+```bash
+cd /home/wkj/projects/codex-provider-switcher
+git switch main
+git pull --ff-only origin main
+scripts/deploy-local.sh
+"$HOME/.local/lib/codex-provider-switcher/codex-provider-switcher" --build-info
+```
+
+输出中的 `source` 必须是 `main`，commit 必须是你刚推送的版本。脚本不会停止已有
+proxy；部署后请重新连接 Desktop Remote SSH 主机，让新的 proxy 进程加载替换后的
+二进制。
+
+## 从 Release 压缩包升级
 
 使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后原子替换已安装的
 二进制和 model catalog；先暂存两者，再依次启用 catalog 和二进制，最后替换

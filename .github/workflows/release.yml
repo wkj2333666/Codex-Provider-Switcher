@@ -103,13 +103,22 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           name="codex-provider-switcher-${version}-${TARGET}"
           root="dist/${name}"
           mkdir -p "$root"
           go build -trimpath \
-            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA} -X main.source=release -X main.builtAt=${built_at}" \
             -o "$root/codex-provider-switcher" \
             ./cmd/codex-provider-switcher
+          go clean -cache -testcache
+          if [[ "$TARGET" == "linux-amd64" ]]; then
+            build_info="$($root/codex-provider-switcher --build-info)"
+            grep -Fq "\"version\":\"${GITHUB_REF_NAME}\"" <<<"$build_info"
+            grep -Fq "\"commit\":\"${GITHUB_SHA}\"" <<<"$build_info"
+            grep -Fq '"source":"release"' <<<"$build_info"
+            grep -Fq "\"builtAt\":\"${built_at}\"" <<<"$build_info"
+          fi
           cp README.md README.zh-CN.md LICENSE THIRD_PARTY_NOTICES "$root/"
           mkdir -p "$root/plugins"
           cp -R plugins/codex-provider-switcher "$root/plugins/"

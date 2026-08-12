@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,16 +17,30 @@ import (
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/wrapper"
 )
 
-var version = "dev"
+var (
+	version = "dev"
+	commit  = "unknown"
+	source  = "unknown"
+	builtAt = "unknown"
+)
+
+type buildInformation struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Source  string `json:"source"`
+	BuiltAt string `json:"builtAt"`
+}
 
 const usage = `Usage:
   codex-provider-switcher proxy [options]
   codex-provider-switcher --version
+  codex-provider-switcher --build-info
 
 Proxy options:
   --provider <id>  Optional explicit provider override
   --socket <path>  Shared app-server Unix socket
   --version        Print the switcher version and exit
+  --build-info     Print machine-readable switcher build information and exit
   --help           Print this help and exit
 
 Environment:
@@ -82,6 +97,13 @@ func runDirect(ctx context.Context, args []string, deps dependencies) int {
 	}
 	if len(args) == 1 && args[0] == "--version" {
 		printVersion(deps.stdout)
+		return 0
+	}
+	if len(args) == 1 && args[0] == "--build-info" {
+		if err := printBuildInformation(deps.stdout); err != nil {
+			_, _ = fmt.Fprintln(deps.stderr, "codex-provider-switcher: output error: encode build information")
+			return 1
+		}
 		return 0
 	}
 	if args[0] != "proxy" {
@@ -147,7 +169,24 @@ func runProxyCommand(ctx context.Context, args []string, deps dependencies) int 
 }
 
 func printVersion(writer io.Writer) {
-	_, _ = fmt.Fprintf(writer, "codex-provider-switcher %s\n", version)
+	if commit == "unknown" || commit == "" {
+		_, _ = fmt.Fprintf(writer, "codex-provider-switcher %s\n", version)
+		return
+	}
+	shortCommit := commit
+	if len(shortCommit) > 7 {
+		shortCommit = shortCommit[:7]
+	}
+	_, _ = fmt.Fprintf(writer, "codex-provider-switcher %s (commit %s)\n", version, shortCommit)
+}
+
+func printBuildInformation(writer io.Writer) error {
+	return json.NewEncoder(writer).Encode(buildInformation{
+		Version: version,
+		Commit:  commit,
+		Source:  source,
+		BuiltAt: builtAt,
+	})
 }
 
 func withDefaults(deps dependencies) dependencies {
