@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/coder/websocket"
@@ -670,6 +672,86 @@ func TestSessionInternalResumeRewritesCollaborationModel(t *testing.T) {
 	}
 }
 
+func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_stale"}}` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var current *session
+	writer := func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/read" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, path)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.codexHome = home
+	if _, err := current.sanitizeThreadRollout(context.Background(), "thr-a"); err != nil {
+		t.Fatalf("sanitizeThreadRollout() error = %v", err)
+	}
+	cleaned, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_stale") {
+		t.Fatalf("stale reasoning survived: %s", cleaned)
+	}
+}
+
+func TestSessionHandoffSanitizesAfterUnsubscribe(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	lockDir := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_handoff_stale"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(lockDir, "thr-a.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	coordinator := &fakeHandoffCoordinator{unsubscribeHook: func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	}}
+	current := newResponsiveResumeSession(t, coordinator, "sub2api", rolloutPath)
+	current.codexHome = home
+	if err := current.handoff(context.Background(), "thr-a", modelroute.Route{Provider: "sub2api"}); err != nil {
+		t.Fatalf("handoff() error = %v", err)
+	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_handoff_stale") {
+		t.Fatalf("handoff resumed before sanitation: %s", cleaned)
+	}
+}
+
 func TestSessionInternalResumeRejectsMalformedCollaborationBeforeWrite(t *testing.T) {
 	t.Parallel()
 	var upstream messageRecorder
@@ -899,13 +981,21 @@ func TestSessionDirtyStateForcesDifferentPeerToRepairPartialResubscribe(t *testi
 	}
 }
 
-func newResponsiveResumeSession(t *testing.T, coordinator handoffCoordinator, provider string) *session {
+func newResponsiveResumeSession(t *testing.T, coordinator handoffCoordinator, provider string, rolloutPaths ...string) *session {
 	t.Helper()
 	var current *session
 	writer := func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
 		message, err := parseRPCMessage(payload)
 		if err != nil {
 			return err
+		}
+		if message.method == "thread/read" {
+			path := ""
+			if len(rolloutPaths) != 0 {
+				path = rolloutPaths[0]
+			}
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, path)))
 		}
 		if message.method == "thread/resume" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
@@ -1480,6 +1570,16 @@ func TestSessionUsesStoredProviderForNormalTurn(t *testing.T) {
 
 func TestSessionResumeUsesStoredProvider(t *testing.T) {
 	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_resume_stale"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	selections := &fakeProviderSelections{values: map[string]string{"thr-a": "sub2api"}}
 	var current *session
 	var upstream messageRecorder
@@ -1491,23 +1591,35 @@ func TestSessionResumeUsesStoredProvider(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		if message.method == "thread/read" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, rolloutPath)))
+		}
 		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
 			`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
 	}
 	current = newTestSession(t, writer, nil)
 	current.provider = "openai"
+	current.codexHome = home
 	current.selections = selections
 	current.coordinator = &fakeHandoffCoordinator{}
 
-	request := []byte(`{"id":25,"method":"thread/resume","params":{"threadId":"thr-a","modelProvider":"openai"}}`)
+	request := []byte(`{"id":25,"method":"thread/resume","params":{"threadId":"thr-a","path":"/stale/rollout.jsonl","modelProvider":"openai"}}`)
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_resume_stale") {
+		t.Fatalf("thread/resume forwarded before sanitation: %s", cleaned)
+	}
 	messages := upstream.messages()
-	if len(messages) != 1 {
+	if len(messages) != 2 {
 		t.Fatalf("upstream messages = %q", messages)
 	}
-	resume, err := parseRPCMessage(messages[0])
+	resume, err := parseRPCMessage(messages[1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1515,6 +1627,11 @@ func TestSessionResumeUsesStoredProvider(t *testing.T) {
 	_ = json.Unmarshal(resume.params["modelProvider"], &requestedProvider)
 	if requestedProvider != "sub2api" {
 		t.Fatalf("resume provider = %q", requestedProvider)
+	}
+	var requestedPath string
+	_ = json.Unmarshal(resume.params["path"], &requestedPath)
+	if requestedPath != rolloutPath {
+		t.Fatalf("resume path = %q, want %q", requestedPath, rolloutPath)
 	}
 }
 
@@ -1739,6 +1856,7 @@ type fakeHandoffCoordinator struct {
 	prepareErr          error
 	prepareHandoffErr   error
 	unsubscribeErr      error
+	unsubscribeHook     func()
 	resubscribeErr      error
 	restoreErr          error
 	dirty               bool
@@ -1775,6 +1893,9 @@ func (coordinator *fakeHandoffCoordinator) PrepareRecoveryAll(context.Context, s
 
 func (coordinator *fakeHandoffCoordinator) UnsubscribeAll(context.Context, string) error {
 	coordinator.unsubscribeCalls++
+	if coordinator.unsubscribeHook != nil {
+		coordinator.unsubscribeHook()
+	}
 	return coordinator.unsubscribeErr
 }
 

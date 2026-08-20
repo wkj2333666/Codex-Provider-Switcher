@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rewrite"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rollout"
 )
 
 const (
@@ -67,6 +69,7 @@ type desktopRequest struct {
 
 type session struct {
 	provider        string
+	codexHome       string
 	routes          *modelroute.Catalog
 	appServerSocket string
 
@@ -346,9 +349,19 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err := current.repairRecoveryJournal(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
+	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID)
+	if err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
 	targetRoute, _, err := current.selectedRoute(threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
+	}
+	if rolloutPath != "" {
+		payload, err = rewriteResumePath(payload, rolloutPath)
+		if err != nil {
+			return errRoutingPolicy
+		}
 	}
 	rewritten, err := rewrite.Line(payload, targetRoute)
 	if err != nil {
@@ -391,6 +404,10 @@ func (current *session) handoff(ctx context.Context, threadID string, targetRout
 	if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageUnsubscribed); err != nil {
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff stage update failed")
+	}
+	if _, err := current.sanitizeThreadRollout(ctx, threadID); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
+		return errors.New("provider handoff rollout sanitation failed")
 	}
 	if err := current.internalResumeForHandoff(ctx, threadID, targetRoute); err != nil {
 		if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
@@ -642,6 +659,10 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	if params == nil {
 		params = make(map[string]json.RawMessage)
 	}
+	// A saved desktop resume template may contain an immutable rollout path
+	// from before thread/revert. Let app-server resolve the current rollout by
+	// stable thread ID instead of replaying that stale path.
+	delete(params, "path")
 	params["threadId"] = rawJSONString(threadID)
 	params["modelProvider"] = rawJSONString(expectedRoute.Provider)
 	if expectedRoute.Model != "" {
@@ -667,6 +688,65 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	delete(current.detached, threadID)
 	current.stateMu.Unlock()
 	return nil
+}
+
+func (current *session) sanitizeThreadRollout(ctx context.Context, threadID string) (string, error) {
+	if current.codexHome == "" {
+		return "", nil
+	}
+	response, err := current.callUpstream(ctx, "thread/read", map[string]json.RawMessage{
+		"threadId":     rawJSONString(threadID),
+		"includeTurns": json.RawMessage("false"),
+	})
+	if err != nil {
+		if rolloutNotReadyError(err, threadID) {
+			return "", nil
+		}
+		return "", err
+	}
+	var thread struct {
+		ID   string  `json:"id"`
+		Path *string `json:"path"`
+	}
+	encoded, err := json.Marshal(response.result["thread"])
+	if err != nil || json.Unmarshal(encoded, &thread) != nil || thread.ID != threadID {
+		return "", errors.New("thread/read returned invalid rollout metadata")
+	}
+	if thread.Path == nil || *thread.Path == "" {
+		return "", nil
+	}
+	if err := rollout.ValidatePath(current.codexHome, threadID, *thread.Path); err != nil {
+		return "", err
+	}
+	lockPath := filepath.Join(current.codexHome, "thread-writer-locks", threadID+".lock")
+	_, err = rollout.SanitizeFile(*thread.Path, lockPath, threadID)
+	return *thread.Path, err
+}
+
+func rewriteResumePath(payload []byte, path string) ([]byte, error) {
+	var message map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &message); err != nil || message == nil {
+		return nil, errors.New("invalid resume request")
+	}
+	var params map[string]json.RawMessage
+	if raw, ok := message["params"]; ok && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &params); err != nil || params == nil {
+			return nil, errors.New("resume params must be an object")
+		}
+	} else {
+		params = make(map[string]json.RawMessage)
+	}
+	params["path"] = rawJSONString(path)
+	encodedParams, err := json.Marshal(params)
+	if err != nil {
+		return nil, errors.New("encode resume params")
+	}
+	message["params"] = encodedParams
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		return nil, errors.New("encode resume request")
+	}
+	return encoded, nil
 }
 
 func (current *session) callUpstream(ctx context.Context, method string, params map[string]json.RawMessage) (rpcMessage, error) {

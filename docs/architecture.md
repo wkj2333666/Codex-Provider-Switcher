@@ -44,6 +44,15 @@ mode-0600 files, a mode-0700 directory, and atomic replace plus directory sync.
 an interrupted archive/unarchive transaction after a process or machine
 restart.
 
+`internal/rollout` validates the exact JSONL rollout path returned by
+`thread/read` under `CODEX_HOME` and performs a conservative pre-load sanitation.
+It removes invalid provider-bound
+reasoning records, strips stale optional `item_` IDs from other response items,
+preserves visible content and call pairs, and commits only through a same-directory
+atomic replace. Malformed input, symlinks, unsafe task IDs, and an active Codex
+thread-writer lock when changes are required fail closed. A clean rollout is a
+read-only no-op even while app-server owns the writer lock.
+
 `internal/wrapper` classifies invocations of a transparent executable named
 `codex`. Its three-stage parser recognizes supported common configuration
 options before `app-server`, before `proxy`, and after `proxy`. It intercepts
@@ -131,6 +140,7 @@ thread flock
   -> create per-thread dirty marker at stage prepared
   -> unsubscribe every ready peer
   -> mark stage unsubscribed
+  -> atomically sanitize stale provider-bound rollout items
   -> internal thread/resume with requested modelProvider and model
   -> verify returned thread id, modelProvider, and mapped model
   -> on a verified same-id mismatch only:
@@ -186,9 +196,12 @@ Missing runtime state is shown as `Runtime provider: unknown.`; no saved
 override is shown as `Selected provider: app-server configuration.` If
 selection and runtime differ, the response says the selection `will be applied before the next model turn`.
 
-Ordinary `thread/resume` uses the same lock and holds it through the app-server
-response, so a new subscriber cannot appear midway through handoff. Internal
-request ids and their responses never reach Desktop.
+Ordinary `thread/resume` uses the same lock, sanitizes the task rollout before
+forwarding the resume, and holds the lock through the app-server response, so a
+new subscriber cannot appear midway through handoff. A handoff sanitizes only
+after every ready peer has unsubscribed and before the first internal resume;
+resubscribing peers do not repeat the disk rewrite. Internal request ids and
+their responses never reach Desktop.
 
 Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before

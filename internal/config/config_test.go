@@ -176,6 +176,26 @@ func TestParseProxyResolvesStateDirectoryPrecedence(t *testing.T) {
 	if want := filepath.Join(codexHome, "codex-provider-switcher"); result.Config.StateDir != want {
 		t.Fatalf("inferred StateDir = %q, want %q", result.Config.StateDir, want)
 	}
+	if result.Config.CodexHome != codexHome {
+		t.Fatalf("inferred CodexHome = %q, want %q", result.Config.CodexHome, codexHome)
+	}
+}
+
+func TestParseProxyCarriesCodexHomeForRolloutSanitation(t *testing.T) {
+	codexHome := filepath.Join(shortTempDir(t), "codex-home")
+	if err := os.MkdirAll(filepath.Join(codexHome, "app-server-control"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := unixSocket(t, filepath.Join(codexHome, "app-server-control", "app-server-control.sock"))
+	result, err := ParseProxy([]string{"--socket", socket}, environment(map[string]string{
+		"CODEX_HOME": codexHome,
+	}))
+	if err != nil {
+		t.Fatalf("ParseProxy() error = %v", err)
+	}
+	if result.Config.CodexHome != codexHome {
+		t.Fatalf("CodexHome = %q, want %q", result.Config.CodexHome, codexHome)
+	}
 }
 
 func TestParseProxyControlModesSkipConfigurationValidation(t *testing.T) {
