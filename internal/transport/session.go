@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -742,9 +743,6 @@ func requestedModel(params map[string]json.RawMessage) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	if topPresent && nestedPresent && top != nested {
-		return "", false, errors.New("conflicting requested models")
-	}
 	if nestedPresent {
 		return nested, true, nil
 	}
@@ -753,6 +751,9 @@ func requestedModel(params map[string]json.RawMessage) (string, bool, error) {
 
 func rawModel(raw json.RawMessage) (string, bool, error) {
 	if len(raw) == 0 {
+		return "", false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return "", false, nil
 	}
 	var model string

@@ -1437,7 +1437,6 @@ func TestSessionRejectsForeignPickerModelForSelectedProvider(t *testing.T) {
 	var upstream messageRecorder
 	selections := &fakeProviderSelections{
 		values: map[string]string{"thr-a": "glm"},
-		models: map[string]string{"thr-a": "glm-5.2"},
 	}
 	current := newTestSession(t, upstream.write, nil)
 	current.provider = ""
@@ -1446,7 +1445,7 @@ func TestSessionRejectsForeignPickerModelForSelectedProvider(t *testing.T) {
 	current.coordinator = &fakeHandoffCoordinator{}
 	current.stateMu.Lock()
 	current.effective["thr-a"] = "glm"
-	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.effectiveModel["thr-a"] = "glm-5.3"
 	current.stateMu.Unlock()
 
 	request := []byte(`{"id":226,"method":"turn/start","params":{"threadId":"thr-a","model":"deepseek-v4-pro","input":[]}}`)
@@ -1457,13 +1456,133 @@ func TestSessionRejectsForeignPickerModelForSelectedProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRawString(t, message.params, "model", "glm-5.2")
-	if got := selections.models["thr-a"]; got != "glm-5.2" {
+	assertRawString(t, message.params, "model", "glm-5.3")
+	if got := selections.models["thr-a"]; got != "" {
 		t.Fatalf("foreign model changed selection to %q", got)
 	}
 }
 
-func TestSessionFailsClosedOnConflictingPickerModels(t *testing.T) {
+func TestRequestedModelPrecedenceAndValidation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		params  string
+		want    string
+		present bool
+		wantErr bool
+	}{
+		{
+			name:    "nested model wins",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":{"model":"glm-5.2"}}}`,
+			want:    "glm-5.2",
+			present: true,
+		},
+		{
+			name:    "null top leaves nested model",
+			params:  `{"model":null,"collaborationMode":{"settings":{"model":"glm-5.2"}}}`,
+			want:    "glm-5.2",
+			present: true,
+		},
+		{
+			name:    "null nested falls back to top model",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":{"model":null}}}`,
+			want:    "glm-5.3",
+			present: true,
+		},
+		{
+			name:   "both models null",
+			params: `{"model":null,"collaborationMode":{"settings":{"model":null}}}`,
+		},
+		{
+			name:    "null collaboration falls back to top model",
+			params:  `{"model":"glm-5.3","collaborationMode":null}`,
+			want:    "glm-5.3",
+			present: true,
+		},
+		{
+			name:    "invalid top model type",
+			params:  `{"model":7,"collaborationMode":{"settings":{"model":"glm-5.2"}}}`,
+			wantErr: true,
+		},
+		{
+			name:    "invalid nested model type",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":{"model":false}}}`,
+			wantErr: true,
+		},
+		{
+			name:    "invalid collaboration shape",
+			params:  `{"model":"glm-5.3","collaborationMode":"unsafe"}`,
+			wantErr: true,
+		},
+		{
+			name:    "missing collaboration settings",
+			params:  `{"model":"glm-5.3","collaborationMode":{"mode":"default"}}`,
+			wantErr: true,
+		},
+		{
+			name:    "null collaboration settings",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":null}}`,
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var params map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(test.params), &params); err != nil {
+				t.Fatal(err)
+			}
+			got, present, err := requestedModel(params)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("requestedModel() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if test.wantErr {
+				return
+			}
+			if got != test.want || present != test.present {
+				t.Fatalf("requestedModel() = %q, %v; want %q, %v", got, present, test.want, test.present)
+			}
+		})
+	}
+}
+
+func TestSessionUsesNestedPickerModelWhenDesktopFieldsConflict(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = &fakeProviderSelections{values: map[string]string{"thr-a": "glm"}}
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":227,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.3","collaborationMode":{"mode":"default","settings":{"model":"glm-5.2"}},"input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	var collaboration struct {
+		Settings struct {
+			Model string `json:"model"`
+		} `json:"settings"`
+	}
+	if json.Unmarshal(message.params["collaborationMode"], &collaboration) != nil ||
+		collaboration.Settings.Model != "glm-5.2" {
+		t.Fatalf("collaborationMode = %s", message.params["collaborationMode"])
+	}
+	if got := current.selections.(*fakeProviderSelections).models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("persisted model = %q, want nested picker model", got)
+	}
+}
+
+func TestSessionTreatsNullPickerModelsAsAbsent(t *testing.T) {
 	t.Parallel()
 	var upstream messageRecorder
 	current := newTestSession(t, upstream.write, nil)
@@ -1476,12 +1595,23 @@ func TestSessionFailsClosedOnConflictingPickerModels(t *testing.T) {
 	current.effectiveModel["thr-a"] = "glm-5.3"
 	current.stateMu.Unlock()
 
-	request := []byte(`{"id":227,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.3","collaborationMode":{"mode":"default","settings":{"model":"glm-5.2"}},"input":[]}}`)
-	if err := current.handleDownstreamText(context.Background(), request); !errors.Is(err, errRoutingPolicy) {
-		t.Fatalf("handleDownstreamText() error = %v, want routing policy rejection", err)
+	request := []byte(`{"id":231,"method":"turn/start","params":{"threadId":"thr-a","model":null,"collaborationMode":{"mode":"default","settings":{"model":null}},"input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
 	}
-	if got := upstream.messages(); len(got) != 0 {
-		t.Fatalf("conflicting models reached upstream: %q", got)
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.3")
+	var collaboration struct {
+		Settings struct {
+			Model string `json:"model"`
+		} `json:"settings"`
+	}
+	if json.Unmarshal(message.params["collaborationMode"], &collaboration) != nil ||
+		collaboration.Settings.Model != "glm-5.3" {
+		t.Fatalf("collaborationMode = %s", message.params["collaborationMode"])
 	}
 }
 

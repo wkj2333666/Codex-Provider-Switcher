@@ -272,7 +272,11 @@ command:
 - Ordinary `turn/start` may adopt an allowlisted same-provider model only while
   migrating provider-only legacy/direct state. Once an exact route is saved,
   stale turn fields cannot replace it. The turn is held until that exact route
-  is ready; both model fields are replaced while input remains unchanged.
+  is ready; both model fields are replaced while input remains unchanged. When
+  Desktop supplies different picker values, the collaboration settings model
+  wins because app-server gives it precedence; a JSON `null` picker value is
+  treated as absent. A picker value can never leave the selected provider's
+  allowlist.
 - Internal provider-handoff resumes apply the same two model replacements to
   any reused Desktop resume template before writing it upstream.
 - Exact provider controls are consumed locally and replaced by a fake lifecycle.
@@ -281,14 +285,15 @@ command:
 
 A corrupt selection, malformed provider control, legacy `/provider <name>`
 input, attachment on a provider control, unsafe overridden `params` or
-collaboration-mode shape, conflicting picker models, corrupt persisted model,
-or unsafe `models.json` fails closed. The catalog accepts only a regular,
-non-symlink JSON object whose provider names, defaults, allowlists, and model IDs
-pass validation; an unreadable or invalid catalog prevents the downstream
-upgrade. Production must map every switchable provider, because an absent entry
-intentionally leaves the model untouched. Ordinary prompts that merely mention `/provider` or
-`$provider` remain ordinary prompts. With no selection, provider-bearing
-requests pass through byte-for-byte. The switcher does not read or parse `config.toml`,
+collaboration-mode shape, non-null picker value with an invalid type, corrupt
+persisted model, or unsafe `models.json` fails closed. The catalog accepts only
+a regular, non-symlink JSON object whose provider names, defaults, allowlists,
+and model IDs pass validation; an unreadable or invalid catalog prevents the
+downstream upgrade. Production must map every switchable provider, because an
+absent entry intentionally leaves the model untouched. Ordinary prompts that
+merely mention `/provider` or `$provider` remain ordinary prompts. With no
+selection, provider-bearing requests pass through byte-for-byte. The switcher
+does not read or parse `config.toml`,
 so Codex retains its full configuration precedence, profiles, project settings,
 CLI overrides, and built-in defaults. Diagnostics never format message bodies,
 prompts, handshake values, environment contents, or credentials.
