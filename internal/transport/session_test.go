@@ -18,6 +18,7 @@ import (
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
 func TestSessionConsumesInternalResponse(t *testing.T) {
@@ -1227,6 +1228,134 @@ func TestSessionAppliesSavedRouteToThreadSettingsUpdate(t *testing.T) {
 	}
 }
 
+func TestSessionAcceptsAndPersistsAllowlistedModelFromSettingsUpdate(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":223,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2","collaborationMode":{"mode":"default","settings":{"model":"glm-5.2","effort":"high"}}}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	if got := selections.models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("persisted model = %q, want glm-5.2", got)
+	}
+}
+
+func TestSessionUsesPersistedAllowlistedModelForNextTurn(t *testing.T) {
+	t.Parallel()
+	current := newTestSession(t, nil, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.2"},
+	}
+
+	got, selected, err := current.selectedRoute("thr-a")
+	want := modelroute.Route{Provider: "glm", Model: "glm-5.2"}
+	if err != nil || !selected || got != want {
+		t.Fatalf("selectedRoute() = %#v, %v, %v; want %#v", got, selected, err, want)
+	}
+}
+
+func TestSessionAcceptsAllowlistedModelFromTurnStart(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":225,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.2","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	if got := selections.models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("persisted model = %q, want glm-5.2", got)
+	}
+}
+
+func TestSessionRejectsForeignPickerModelForSelectedProvider(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.2"},
+	}
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":226,"method":"turn/start","params":{"threadId":"thr-a","model":"deepseek-v4-pro","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	if got := selections.models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("foreign model changed selection to %q", got)
+	}
+}
+
+func TestSessionFailsClosedOnConflictingPickerModels(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = &fakeProviderSelections{values: map[string]string{"thr-a": "glm"}}
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.3"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":227,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.3","collaborationMode":{"mode":"default","settings":{"model":"glm-5.2"}},"input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); !errors.Is(err, errRoutingPolicy) {
+		t.Fatalf("handleDownstreamText() error = %v, want routing policy rejection", err)
+	}
+	if got := upstream.messages(); len(got) != 0 {
+		t.Fatalf("conflicting models reached upstream: %q", got)
+	}
+}
+
 func TestSessionPreservesUnselectedThreadSettingsUpdate(t *testing.T) {
 	t.Parallel()
 	var upstream messageRecorder
@@ -1741,9 +1870,29 @@ type messageRecorder struct {
 
 type fakeProviderSelections struct {
 	values   map[string]string
+	models   map[string]string
 	getErr   error
 	setErr   error
 	setCalls int
+}
+
+func (selections *fakeProviderSelections) GetRoute(threadID string) (selection.Value, bool, error) {
+	provider, ok, err := selections.Get(threadID)
+	if err != nil || !ok {
+		return selection.Value{}, ok, err
+	}
+	return selection.Value{Provider: provider, Model: selections.models[threadID]}, true, nil
+}
+
+func (selections *fakeProviderSelections) SetRoute(threadID string, value selection.Value) error {
+	if err := selections.Set(threadID, value.Provider); err != nil {
+		return err
+	}
+	if selections.models == nil {
+		selections.models = make(map[string]string)
+	}
+	selections.models[threadID] = value.Model
+	return nil
 }
 
 func (selections *fakeProviderSelections) Get(threadID string) (string, bool, error) {
@@ -1942,6 +2091,20 @@ func testModelCatalog(t *testing.T) *modelroute.Catalog {
 	t.Helper()
 	directory := t.TempDir()
 	data := []byte(`{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}`)
+	if err := os.WriteFile(filepath.Join(directory, "models.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := modelroute.Load(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func testMultiModelCatalog(t *testing.T) *modelroute.Catalog {
+	t.Helper()
+	directory := t.TempDir()
+	data := []byte(`{"glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]}}`)
 	if err := os.WriteFile(filepath.Join(directory, "models.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rewrite"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rollout"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
 const (
@@ -51,8 +52,8 @@ type handoffCoordinator interface {
 type websocketWriteFunc func(context.Context, websocket.MessageType, []byte) error
 
 type providerSelections interface {
-	Get(string) (string, bool, error)
-	Set(string, string) error
+	GetRoute(string) (selection.Value, bool, error)
+	SetRoute(string, selection.Value) error
 }
 
 type recoveryJournals interface {
@@ -170,6 +171,18 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 	if !selected {
 		return current.writeUpstream(ctx, websocket.MessageText, payload)
 	}
+	requested, present, err := requestedModel(message.params)
+	if err != nil {
+		return errRoutingPolicy
+	}
+	if present {
+		if route, allowed := current.routes.ResolveModel(targetRoute.Provider, requested); allowed {
+			targetRoute = route
+			if err := current.persistSelectedRoute(threadID, targetRoute); err != nil {
+				return current.writeHandoffError(ctx, message.id)
+			}
+		}
+	}
 	rewritten, err := rewrite.Line(payload, targetRoute)
 	if err != nil {
 		return errRoutingPolicy
@@ -235,6 +248,7 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return current.writeProviderStatus(ctx, message.id, threadID)
 	}
 	targetRoute := current.routeForProvider(command.provider)
+	persistRequestedRoute := false
 	if !commandRecognized {
 		var selected bool
 		targetRoute, selected, err = current.selectedRoute(threadID)
@@ -248,6 +262,16 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 			}
 			targetRoute = current.routeForProvider(effectiveProvider)
 		}
+		requested, present, requestErr := requestedModel(message.params)
+		if requestErr != nil {
+			return errRoutingPolicy
+		}
+		if present {
+			if route, allowed := current.routes.ResolveModel(targetRoute.Provider, requested); allowed {
+				targetRoute = route
+				persistRequestedRoute = selected
+			}
+		}
 	}
 	if current.coordinator.IsDirty(threadID) || !routeMatches(current.effectiveRoute(threadID), targetRoute) {
 		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
@@ -255,7 +279,7 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		}
 	}
 	if commandRecognized {
-		if current.selections == nil || current.selections.Set(threadID, targetRoute.Provider) != nil {
+		if current.persistSelectedRoute(threadID, targetRoute) != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
 		feedback := "Provider switched to " + targetRoute.Provider + "."
@@ -265,6 +289,11 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return current.writeProviderControlTurn(
 			ctx, message.id, threadID, "/provider switch "+targetRoute.Provider, feedback,
 		)
+	}
+	if persistRequestedRoute {
+		if err := current.persistSelectedRoute(threadID, targetRoute); err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
 	}
 
 	rewritten, err := rewrite.Line(payload, targetRoute)
@@ -616,29 +645,36 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 	return nil
 }
 
-func (current *session) selectedProvider(threadID string) (string, bool, error) {
+func (current *session) selectedRoute(threadID string) (modelroute.Route, bool, error) {
 	if current.selections == nil {
-		return current.provider, current.provider != "", nil
+		return current.routeForProvider(current.provider), current.provider != "", nil
 	}
-	selected, ok, err := current.selections.Get(threadID)
+	selected, ok, err := current.selections.GetRoute(threadID)
 	if err != nil {
-		return "", false, errors.New("read provider selection")
+		return modelroute.Route{}, false, errors.New("read provider selection")
 	}
 	if !ok {
-		return current.provider, current.provider != "", nil
+		return current.routeForProvider(current.provider), current.provider != "", nil
 	}
-	if !providerid.Valid(selected) {
-		return "", false, errors.New("invalid provider selection")
+	if !providerid.Valid(selected.Provider) {
+		return modelroute.Route{}, false, errors.New("invalid provider selection")
 	}
-	return selected, true, nil
+	if selected.Model == "" {
+		return current.routeForProvider(selected.Provider), true, nil
+	}
+	route, allowed := current.routes.ResolveModel(selected.Provider, selected.Model)
+	if !allowed {
+		return modelroute.Route{}, false, errors.New("invalid provider selection")
+	}
+	return route, true, nil
 }
 
-func (current *session) selectedRoute(threadID string) (modelroute.Route, bool, error) {
-	provider, selected, err := current.selectedProvider(threadID)
-	if err != nil {
-		return modelroute.Route{}, false, err
+func (current *session) persistSelectedRoute(threadID string, route modelroute.Route) error {
+	if current.selections == nil || !providerid.Valid(route.Provider) ||
+		(route.Model != "" && !modelroute.ValidModel(route.Model)) {
+		return errors.New("invalid provider selection")
 	}
-	return current.routeForProvider(provider), selected, nil
+	return current.selections.SetRoute(threadID, selection.Value{Provider: route.Provider, Model: route.Model})
 }
 
 func (current *session) routeForProvider(provider string) modelroute.Route {
@@ -647,6 +683,54 @@ func (current *session) routeForProvider(provider string) modelroute.Route {
 
 func routeMatches(actual, expected modelroute.Route) bool {
 	return actual.Provider == expected.Provider && (expected.Model == "" || actual.Model == expected.Model)
+}
+
+func requestedModel(params map[string]json.RawMessage) (string, bool, error) {
+	if params == nil {
+		return "", false, nil
+	}
+	top, topPresent, err := rawModel(params["model"])
+	if err != nil {
+		return "", false, err
+	}
+	collaborationRaw, collaborationPresent := params["collaborationMode"]
+	if !collaborationPresent || string(collaborationRaw) == "null" {
+		return top, topPresent, nil
+	}
+	var collaboration map[string]json.RawMessage
+	if json.Unmarshal(collaborationRaw, &collaboration) != nil || collaboration == nil {
+		return "", false, errors.New("invalid collaboration mode")
+	}
+	settingsRaw, settingsPresent := collaboration["settings"]
+	if !settingsPresent || string(settingsRaw) == "null" {
+		return "", false, errors.New("invalid collaboration mode")
+	}
+	var settings map[string]json.RawMessage
+	if json.Unmarshal(settingsRaw, &settings) != nil || settings == nil {
+		return "", false, errors.New("invalid collaboration mode")
+	}
+	nested, nestedPresent, err := rawModel(settings["model"])
+	if err != nil {
+		return "", false, err
+	}
+	if topPresent && nestedPresent && top != nested {
+		return "", false, errors.New("conflicting requested models")
+	}
+	if nestedPresent {
+		return nested, true, nil
+	}
+	return top, topPresent, nil
+}
+
+func rawModel(raw json.RawMessage) (string, bool, error) {
+	if len(raw) == 0 {
+		return "", false, nil
+	}
+	var model string
+	if json.Unmarshal(raw, &model) != nil || !modelroute.ValidModel(model) {
+		return "", false, errors.New("invalid requested model")
+	}
+	return model, true, nil
 }
 
 func (current *session) internalResumeWithRoute(ctx context.Context, threadID string, expectedRoute modelroute.Route, reuseTemplate bool) error {

@@ -58,6 +58,62 @@ func TestLoadResolvesLiteralProviderModelRoutes(t *testing.T) {
 	}
 }
 
+func TestLoadResolvesAllowlistedProviderModels(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	writeModels(t, directory, `{
+  "glm": {
+    "default": "glm-5.3",
+    "models": ["glm-5.3", "glm-5.2"]
+  }
+}`)
+
+	catalog, err := Load(directory)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := catalog.Resolve("glm"); got != (Route{Provider: "glm", Model: "glm-5.3"}) {
+		t.Fatalf("Resolve(glm) = %#v, want default GLM route", got)
+	}
+	if got, ok := catalog.ResolveModel("glm", "glm-5.2"); !ok || got != (Route{Provider: "glm", Model: "glm-5.2"}) {
+		t.Fatalf("ResolveModel(glm, glm-5.2) = %#v, %v", got, ok)
+	}
+	if got, ok := catalog.ResolveModel("glm", "deepseek-v4-pro"); ok || got != (Route{}) {
+		t.Fatalf("ResolveModel(glm, foreign model) = %#v, %v", got, ok)
+	}
+}
+
+func TestLoadRejectsInvalidAllowlistedProviderModels(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "missing default", data: `{"glm":{"models":["glm-5.3"]}}`},
+		{name: "missing models", data: `{"glm":{"default":"glm-5.3"}}`},
+		{name: "default not allowed", data: `{"glm":{"default":"glm-5.3","models":["glm-5.2"]}}`},
+		{name: "duplicate model", data: `{"glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.3"]}}`},
+		{name: "empty models", data: `{"glm":{"default":"glm-5.3","models":[]}}`},
+		{name: "unknown field", data: `{"glm":{"default":"glm-5.3","models":["glm-5.3"],"fallback":"secret-model"}}`},
+		{name: "duplicate default", data: `{"glm":{"default":"glm-5.3","default":"secret-model","models":["glm-5.3"]}}`},
+		{name: "duplicate models field", data: `{"glm":{"default":"glm-5.3","models":["glm-5.3"],"models":["secret-model"]}}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := t.TempDir()
+			writeModels(t, directory, tt.data)
+			_, err := Load(directory)
+			if err == nil {
+				t.Fatal("Load() error = nil")
+			}
+			if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "glm-5") {
+				t.Fatalf("Load() leaked catalog contents: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsUnsafeCatalogsWithoutLeakingValues(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
