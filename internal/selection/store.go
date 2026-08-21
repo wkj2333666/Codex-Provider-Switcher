@@ -102,11 +102,14 @@ func (store *Store) SetRoute(threadID string, value Value) error {
 	if store == nil || threadID == "" || !validValue(value) {
 		return errors.New("invalid provider selection")
 	}
-	data, err := json.Marshal(value)
-	if err != nil {
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
 		return errors.New("encode provider selection")
 	}
-	if len(data)+1 > maximumStateSize {
+	data := encoded.Bytes()
+	if len(data) > maximumStateSize {
 		return errors.New("provider selection is too large")
 	}
 	temporary, err := os.CreateTemp(store.directory, ".provider-*.tmp")
@@ -122,7 +125,7 @@ func (store *Store) SetRoute(threadID string, value Value) error {
 		cleanup()
 		return errors.New("secure provider selection state")
 	}
-	if _, err := temporary.Write(append(data, '\n')); err != nil {
+	if _, err := temporary.Write(data); err != nil {
 		cleanup()
 		return errors.New("write provider selection state")
 	}

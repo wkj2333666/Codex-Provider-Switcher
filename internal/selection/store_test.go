@@ -112,17 +112,24 @@ func TestStoreRejectsWhitespaceAroundLegacyProvider(t *testing.T) {
 
 func TestStoreRoundTripsMaximumLengthModel(t *testing.T) {
 	t.Parallel()
-	store, err := Open(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := Value{Provider: "glm", Model: strings.Repeat("m", 256)}
-	if err := store.SetRoute("boundary-thread", want); err != nil {
-		t.Fatal(err)
-	}
-	got, ok, err := store.GetRoute("boundary-thread")
-	if err != nil || !ok || got != want {
-		t.Fatalf("GetRoute(maximum model) = %#v, %v, %v", got, ok, err)
+	for name, model := range map[string]string{
+		"plain":          strings.Repeat("m", 256),
+		"html-sensitive": strings.Repeat("<&", 128),
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := Value{Provider: "glm", Model: model}
+			if err := store.SetRoute("boundary-thread", want); err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err := store.GetRoute("boundary-thread")
+			if err != nil || !ok || got != want {
+				t.Fatalf("GetRoute(maximum model) = %#v, %v, %v", got, ok, err)
+			}
+		})
 	}
 }
 

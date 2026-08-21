@@ -269,9 +269,10 @@ command:
   same-provider picker model is persisted only after app-server accepts the
   settings update; other values are replaced with the saved route. The request,
   response, and both model fields are handled under the provider-handoff lock.
-- Ordinary `turn/start` accepts and persists an allowlisted same-provider
-  picker model, then is held until that exact provider/model route is ready.
-  Both model fields are replaced while input remains semantically unchanged.
+- Ordinary `turn/start` may adopt an allowlisted same-provider model only while
+  migrating provider-only legacy/direct state. Once an exact route is saved,
+  stale turn fields cannot replace it. The turn is held until that exact route
+  is ready; both model fields are replaced while input remains unchanged.
 - Internal provider-handoff resumes apply the same two model replacements to
   any reused Desktop resume template before writing it upstream.
 - Exact provider controls are consumed locally and replaced by a fake lifecycle.
