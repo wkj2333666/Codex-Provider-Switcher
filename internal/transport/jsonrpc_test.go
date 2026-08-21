@@ -72,6 +72,23 @@ func TestParseRPCMessageRejectsInvalidTopLevelWithoutLeaking(t *testing.T) {
 	}
 }
 
+func TestParseRPCMessageRejectsDuplicateObjectKeys(t *testing.T) {
+	t.Parallel()
+	for _, input := range []string{
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.3","model":"secret-model"}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a","collaborationMode":{"settings":{"model":"glm-5.3","model":"secret-model"}}}}`,
+		`{"id":1,"method":"turn/start","params":{"threadId":"thr-a"},"params":{"threadId":"secret-thread"}}`,
+	} {
+		_, err := parseRPCMessage([]byte(input))
+		if err == nil {
+			t.Fatal("parseRPCMessage(duplicate keys) error = nil")
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("duplicate-key error leaked payload: %v", err)
+		}
+	}
+}
+
 func TestRequireThreadIDRejectsMalformedTurnStart(t *testing.T) {
 	t.Parallel()
 	for _, input := range []string{

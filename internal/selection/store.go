@@ -15,7 +15,7 @@ import (
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
-const maximumStateSize = 256
+const maximumStateSize = 1024
 
 // Store keeps private per-task provider selections in one directory.
 type Store struct {
@@ -105,6 +105,9 @@ func (store *Store) SetRoute(threadID string, value Value) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return errors.New("encode provider selection")
+	}
+	if len(data)+1 > maximumStateSize {
+		return errors.New("provider selection is too large")
 	}
 	temporary, err := os.CreateTemp(store.directory, ".provider-*.tmp")
 	if err != nil {

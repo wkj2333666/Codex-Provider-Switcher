@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
@@ -41,6 +42,9 @@ func (*appServerRPCError) Error() string {
 }
 
 func parseRPCMessage(payload []byte) (rpcMessage, error) {
+	if err := validateUniqueJSONKeys(payload); err != nil {
+		return rpcMessage{}, errors.New("invalid JSON-RPC object")
+	}
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &envelope); err != nil || envelope == nil {
 		return rpcMessage{}, errors.New("invalid JSON-RPC object")
@@ -82,6 +86,63 @@ func parseRPCMessage(payload []byte) (rpcMessage, error) {
 		_ = json.Unmarshal(message.params["threadId"], &message.threadID)
 	}
 	return message, nil
+}
+
+func validateUniqueJSONKeys(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := consumeUniqueJSONValue(decoder); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("invalid JSON value")
+	}
+	return nil
+}
+
+func consumeUniqueJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return errors.New("invalid JSON value")
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			rawKey, err := decoder.Token()
+			key, ok := rawKey.(string)
+			if err != nil || !ok {
+				return errors.New("invalid JSON object")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return errors.New("duplicate JSON object key")
+			}
+			seen[key] = struct{}{}
+			if err := consumeUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return errors.New("invalid JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return errors.New("invalid JSON array")
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
+	return nil
 }
 
 func requireThreadID(message rpcMessage) (string, error) {

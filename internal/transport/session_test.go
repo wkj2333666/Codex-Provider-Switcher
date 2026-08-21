@@ -1231,11 +1231,22 @@ func TestSessionAppliesSavedRouteToThreadSettingsUpdate(t *testing.T) {
 func TestSessionAcceptsAndPersistsAllowlistedModelFromSettingsUpdate(t *testing.T) {
 	t.Parallel()
 	var upstream messageRecorder
+	var current *session
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(`{"id":%s,"result":{}}`, message.idKey)))
+	}
 	selections := &fakeProviderSelections{
 		values: map[string]string{"thr-a": "glm"},
 		models: map[string]string{"thr-a": "glm-5.3"},
 	}
-	current := newTestSession(t, upstream.write, nil)
+	current = newTestSession(t, writer, nil)
 	current.provider = ""
 	current.routes = testMultiModelCatalog(t)
 	current.selections = selections
@@ -1252,6 +1263,104 @@ func TestSessionAcceptsAndPersistsAllowlistedModelFromSettingsUpdate(t *testing.
 	assertRawString(t, message.params, "model", "glm-5.2")
 	if got := selections.models["thr-a"]; got != "glm-5.2" {
 		t.Fatalf("persisted model = %q, want glm-5.2", got)
+	}
+}
+
+func TestSessionPersistsSettingsModelOnlyAfterSuccessfulResponse(t *testing.T) {
+	t.Parallel()
+	requestSeen := make(chan rpcMessage, 1)
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var current *session
+	writer := func(_ context.Context, _ websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		requestSeen <- message
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	done := make(chan error, 1)
+	request := []byte(`{"id":228,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2"}}`)
+	go func() { done <- current.handleDownstreamText(context.Background(), request) }()
+	message := <-requestSeen
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("model persisted before app-server response: %q", got)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("settings handler returned before app-server response: %v", err)
+	default:
+	}
+	if err := current.handleUpstreamText(context.Background(), []byte(fmt.Sprintf(`{"id":%s,"result":{}}`, message.idKey))); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := selections.models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("model after successful response = %q, want glm-5.2", got)
+	}
+}
+
+func TestSessionDoesNotPersistSettingsModelAfterAppServerError(t *testing.T) {
+	t.Parallel()
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var current *session
+	writer := func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+			`{"id":%s,"error":{"code":-32602,"message":"rejected"}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":229,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("rejected settings update persisted model %q", got)
+	}
+}
+
+func TestSessionDoesNotPersistSettingsModelWhenUpstreamWriteFails(t *testing.T) {
+	t.Parallel()
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	current := newTestSession(t, func(context.Context, websocket.MessageType, []byte) error {
+		return errors.New("write failed")
+	}, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":230,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err == nil {
+		t.Fatal("handleDownstreamText() error = nil")
+	}
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("failed write persisted model %q", got)
 	}
 }
 
@@ -1272,14 +1381,33 @@ func TestSessionUsesPersistedAllowlistedModelForNextTurn(t *testing.T) {
 	}
 }
 
-func TestSessionAcceptsAllowlistedModelFromTurnStart(t *testing.T) {
+func TestSessionIgnoresStaleTurnModelWhenExactSelectionExists(t *testing.T) {
 	t.Parallel()
 	var upstream messageRecorder
+	var current *session
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			var provider, model string
+			_ = json.Unmarshal(message.params["modelProvider"], &provider)
+			_ = json.Unmarshal(message.params["model"], &model)
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":%q,"model":%q}}`,
+				message.idKey, provider, model)))
+		}
+		return nil
+	}
 	selections := &fakeProviderSelections{
 		values: map[string]string{"thr-a": "glm"},
 		models: map[string]string{"thr-a": "glm-5.3"},
 	}
-	current := newTestSession(t, upstream.write, nil)
+	current = newTestSession(t, writer, nil)
 	current.provider = ""
 	current.routes = testMultiModelCatalog(t)
 	current.selections = selections
@@ -1293,13 +1421,14 @@ func TestSessionAcceptsAllowlistedModelFromTurnStart(t *testing.T) {
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	message, err := parseRPCMessage(upstream.messages()[0])
+	messages := upstream.messages()
+	message, err := parseRPCMessage(messages[len(messages)-1])
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRawString(t, message.params, "model", "glm-5.2")
-	if got := selections.models["thr-a"]; got != "glm-5.2" {
-		t.Fatalf("persisted model = %q, want glm-5.2", got)
+	assertRawString(t, message.params, "model", "glm-5.3")
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("stale turn changed persisted model to %q", got)
 	}
 }
 

@@ -266,8 +266,9 @@ command:
   configured providers remain visible.
 - `thread/settings/update` remains byte-transparent without a saved selection
   or direct provider override. With either authority, an allowlisted
-  same-provider picker model is persisted; other values are replaced with the
-  saved route. Both model fields are handled under the provider-handoff lock.
+  same-provider picker model is persisted only after app-server accepts the
+  settings update; other values are replaced with the saved route. The request,
+  response, and both model fields are handled under the provider-handoff lock.
 - Ordinary `turn/start` accepts and persists an allowlisted same-provider
   picker model, then is held until that exact provider/model route is ready.
   Both model fields are replaced while input remains semantically unchanged.

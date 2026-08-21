@@ -110,6 +110,36 @@ func TestStoreRejectsWhitespaceAroundLegacyProvider(t *testing.T) {
 	}
 }
 
+func TestStoreRoundTripsMaximumLengthModel(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Value{Provider: "glm", Model: strings.Repeat("m", 256)}
+	if err := store.SetRoute("boundary-thread", want); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := store.GetRoute("boundary-thread")
+	if err != nil || !ok || got != want {
+		t.Fatalf("GetRoute(maximum model) = %#v, %v, %v", got, ok, err)
+	}
+}
+
+func TestStoreRejectsSelectionTooLargeToRead(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRoute("oversized-thread", Value{Provider: strings.Repeat("p", 2000), Model: "glm-5.2"}); err == nil {
+		t.Fatal("SetRoute(oversized encoded selection) error = nil")
+	}
+	if _, ok, err := store.GetRoute("oversized-thread"); err != nil || ok {
+		t.Fatalf("GetRoute(after rejected set) = _, %v, %v", ok, err)
+	}
+}
+
 func TestStoreRejectsInvalidAndCorruptStateWithoutLeaking(t *testing.T) {
 	t.Parallel()
 	directory := filepath.Join(t.TempDir(), "state")

@@ -66,6 +66,7 @@ type desktopRequest struct {
 	method       string
 	threadID     string
 	responseSeen chan struct{}
+	responseOK   bool
 }
 
 type session struct {
@@ -171,6 +172,7 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 	if !selected {
 		return current.writeUpstream(ctx, websocket.MessageText, payload)
 	}
+	persistRoute := false
 	requested, present, err := requestedModel(message.params)
 	if err != nil {
 		return errRoutingPolicy
@@ -178,16 +180,38 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 	if present {
 		if route, allowed := current.routes.ResolveModel(targetRoute.Provider, requested); allowed {
 			targetRoute = route
-			if err := current.persistSelectedRoute(threadID, targetRoute); err != nil {
-				return current.writeHandoffError(ctx, message.id)
-			}
+			persistRoute = true
 		}
 	}
 	rewritten, err := rewrite.Line(payload, targetRoute)
 	if err != nil {
 		return errRoutingPolicy
 	}
-	return current.writeUpstream(ctx, websocket.MessageText, rewritten)
+	if !persistRoute {
+		return current.writeUpstream(ctx, websocket.MessageText, rewritten)
+	}
+	seen := make(chan struct{})
+	request := &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen}
+	current.trackDesktopRequest(message, request)
+	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
+		current.removeDesktopRequest(message.idKey)
+		return err
+	}
+	select {
+	case <-seen:
+		if !request.responseOK {
+			return nil
+		}
+		if err := current.persistSelectedRoute(threadID, targetRoute); err != nil {
+			return errRoutingPolicy
+		}
+		return nil
+	case <-ctx.Done():
+		current.removeDesktopRequest(message.idKey)
+		return ctx.Err()
+	case <-current.closed:
+		return nil
+	}
 }
 
 func (current *session) handleThreadUnsubscribe(ctx context.Context, message rpcMessage, payload []byte) error {
@@ -250,8 +274,8 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	targetRoute := current.routeForProvider(command.provider)
 	persistRequestedRoute := false
 	if !commandRecognized {
-		var selected bool
-		targetRoute, selected, err = current.selectedRoute(threadID)
+		var selected, exact bool
+		targetRoute, selected, exact, err = current.selectedRouteState(threadID)
 		if err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
@@ -266,7 +290,7 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		if requestErr != nil {
 			return errRoutingPolicy
 		}
-		if present {
+		if present && !exact {
 			if route, allowed := current.routes.ResolveModel(targetRoute.Provider, requested); allowed {
 				targetRoute = route
 				persistRequestedRoute = selected
@@ -646,27 +670,32 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 }
 
 func (current *session) selectedRoute(threadID string) (modelroute.Route, bool, error) {
+	route, selected, _, err := current.selectedRouteState(threadID)
+	return route, selected, err
+}
+
+func (current *session) selectedRouteState(threadID string) (modelroute.Route, bool, bool, error) {
 	if current.selections == nil {
-		return current.routeForProvider(current.provider), current.provider != "", nil
+		return current.routeForProvider(current.provider), current.provider != "", false, nil
 	}
 	selected, ok, err := current.selections.GetRoute(threadID)
 	if err != nil {
-		return modelroute.Route{}, false, errors.New("read provider selection")
+		return modelroute.Route{}, false, false, errors.New("read provider selection")
 	}
 	if !ok {
-		return current.routeForProvider(current.provider), current.provider != "", nil
+		return current.routeForProvider(current.provider), current.provider != "", false, nil
 	}
 	if !providerid.Valid(selected.Provider) {
-		return modelroute.Route{}, false, errors.New("invalid provider selection")
+		return modelroute.Route{}, false, false, errors.New("invalid provider selection")
 	}
 	if selected.Model == "" {
-		return current.routeForProvider(selected.Provider), true, nil
+		return current.routeForProvider(selected.Provider), true, false, nil
 	}
 	route, allowed := current.routes.ResolveModel(selected.Provider, selected.Model)
 	if !allowed {
-		return modelroute.Route{}, false, errors.New("invalid provider selection")
+		return modelroute.Route{}, false, false, errors.New("invalid provider selection")
 	}
-	return route, true, nil
+	return route, true, true, nil
 }
 
 func (current *session) persistSelectedRoute(threadID string, route modelroute.Route) error {
@@ -1023,6 +1052,7 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 		request := current.desktop[message.idKey]
 		if request != nil {
 			delete(current.desktop, message.idKey)
+			request.responseOK = !message.hasError
 			if threadID, route, ok := responseThreadRoute(message); ok &&
 				(request.method == "thread/start" || request.method == "thread/resume" || request.method == "thread/fork") {
 				current.effective[threadID] = route.Provider
