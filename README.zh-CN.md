@@ -105,7 +105,7 @@ model。要选择同一 provider 的多个模型，使用 `default` + `models` a
 STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 install -m 0600 /dev/null "$STATE_ROOT/models.json"
-printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]}}' \
+printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$STATE_ROOT/models.json"
 ```
 
@@ -118,7 +118,17 @@ Codex 模型目录，然后重新连接 Desktop SSH：
 
 ```toml
 model_catalog_json = "/home/your-user/.codex/models-override.json"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+wire_api = "responses"
+env_key = "OPENROUTER_API_KEY"
 ```
+
+OpenRouter 使用 `OPENROUTER_API_KEY` 环境变量。当前配置的模型是
+`stealth/ox-alpha`，同时作为任务主模型和自动 reviewer；Desktop 侧启用图像输入，
+上下文上限设为 10000 token。
 
 ### 4. 配置登录 Shell
 
@@ -183,6 +193,7 @@ Host pi
 /provider switch openai
 /provider switch sub2api
 /provider switch glm
+/provider switch openrouter
 ```
 
 面向用户的命令只有：

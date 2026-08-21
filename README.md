@@ -106,7 +106,7 @@ a `default` plus a `models` allowlist; a string still means â€œonly this modelâ€
 STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 install -m 0600 /dev/null "$STATE_ROOT/models.json"
-printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]}}' \
+printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$STATE_ROOT/models.json"
 ```
 
@@ -120,7 +120,17 @@ top-level `~/.codex/config.toml`, then reconnect Desktop SSH:
 
 ```toml
 model_catalog_json = "/home/your-user/.codex/models-override.json"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+wire_api = "responses"
+env_key = "OPENROUTER_API_KEY"
 ```
+
+OpenRouter uses the `OPENROUTER_API_KEY` environment variable. The configured
+model is `stealth/ox-alpha`, exposed as both the task model and its automatic
+reviewer, with image input enabled and a 10,000-token Desktop context cap.
 
 ### 4. Configure the login shell
 
@@ -190,11 +200,12 @@ commands:
 /provider switch openai
 /provider switch sub2api
 /provider switch glm
+/provider switch openrouter
 ```
 
 For example, use `/provider switch openai` for the native provider or
-`/provider switch sub2api` or `/provider switch glm` for configured
-alternatives.
+`/provider switch sub2api`, `/provider switch glm`, or
+`/provider switch openrouter` for configured alternatives.
 
 The user-facing commands are:
 
@@ -248,7 +259,7 @@ STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 MODELS_STAGE="$(mktemp "$STATE_ROOT/.models.json.XXXXXX")"
 install -m 0600 /dev/null "$MODELS_STAGE"
-printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]}}' \
+printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$MODELS_STAGE"
 mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
 mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"

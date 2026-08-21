@@ -1,6 +1,6 @@
 ---
 name: provider
-description: Inspect or switch the current Codex task's model provider through Codex Provider Switcher. Use only when the user explicitly invokes /provider status or /provider switch with one provider identifier such as openai or sub2api.
+description: Inspect or switch the current Codex task's model provider through Codex Provider Switcher. Use only when the user explicitly invokes /provider status or /provider switch with one provider identifier such as openai, sub2api, or openrouter.
 ---
 
 # Inspect Or Switch Provider
