@@ -403,11 +403,20 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err := current.repairRecoveryJournal(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID)
+	targetRoute, _, err := current.selectedRoute(threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	targetRoute, _, err := current.selectedRoute(threadID)
+	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID)
+	if errors.Is(err, rollout.ErrActiveWriter) {
+		// App-server keeps an idle thread's writer lock while it is loaded. A
+		// rollout that needs sanitation must therefore go through the same
+		// coordinated unsubscribe/resume path as a provider handoff.
+		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
+		rolloutPath, err = current.sanitizeThreadRollout(ctx, threadID)
+	}
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}

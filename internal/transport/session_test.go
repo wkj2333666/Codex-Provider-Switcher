@@ -2023,6 +2023,85 @@ func TestSessionResumeUsesStoredProvider(t *testing.T) {
 	}
 }
 
+func TestSessionResumeSanitizesIdleLockedRolloutThroughHandoff(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	lockDir := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_resume_stale"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(lockDir, "thr-a.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	selections := &fakeProviderSelections{values: map[string]string{"thr-a": "sub2api"}}
+	coordinator := &fakeHandoffCoordinator{unsubscribeHook: func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	}}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/read" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, rolloutPath)))
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+			`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = "openai"
+	current.codexHome = home
+	current.selections = selections
+	current.coordinator = coordinator
+
+	request := []byte(`{"id":26,"method":"thread/resume","params":{"threadId":"thr-a","path":"/stale/rollout.jsonl","modelProvider":"openai"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_resume_stale") {
+		t.Fatalf("thread/resume forwarded before sanitation: %s", cleaned)
+	}
+	if coordinator.unsubscribeCalls != 1 || coordinator.resubscribeCalls != 1 {
+		t.Fatalf("handoff calls = %#v, want one unsubscribe and resubscribe", coordinator)
+	}
+	messages := upstream.messages()
+	var sawDesktopResume bool
+	for _, payload := range messages {
+		message, parseErr := parseRPCMessage(payload)
+		if parseErr == nil && message.method == "thread/resume" && message.idKey == "26" {
+			sawDesktopResume = true
+		}
+	}
+	if !sawDesktopResume {
+		t.Fatalf("desktop resume was not forwarded after sanitation: %q", messages)
+	}
+}
+
 func TestSessionStoredProviderReadFailureFailsClosed(t *testing.T) {
 	t.Parallel()
 	var upstream, downstream messageRecorder
