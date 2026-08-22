@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -91,6 +92,9 @@ func TestDeployLocalRejectsUnsafeSources(t *testing.T) {
 }
 
 func TestDeployLocalInstallsVerifiedCandidateAtomically(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "arm64" {
+		t.Skip("local deployment target is restricted to linux/arm64")
+	}
 	repository := synchronizedRepository(t)
 	installRoot := filepath.Join(t.TempDir(), "install")
 	fakeBin := filepath.Join(t.TempDir(), "bin")
