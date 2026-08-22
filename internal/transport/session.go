@@ -29,6 +29,8 @@ const (
 	internalCallTimeout       = 30 * time.Second
 	handoffRecoveryTimeout    = 5 * time.Second
 	providerCommandErrorCode  = -32602
+	maxRolloutListPages       = 128
+	rolloutListPageSize       = 100
 )
 
 var errProviderMismatch = errors.New("provider handoff verification mismatch")
@@ -817,33 +819,72 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID stri
 	if current.codexHome == "" {
 		return "", nil
 	}
-	response, err := current.callUpstream(ctx, "thread/read", map[string]json.RawMessage{
-		"threadId":     rawJSONString(threadID),
-		"includeTurns": json.RawMessage("false"),
-	})
+	path, err := current.findRolloutPath(ctx, threadID)
 	if err != nil {
-		if rolloutNotReadyError(err, threadID) {
-			return "", nil
-		}
 		return "", err
 	}
-	var thread struct {
-		ID   string  `json:"id"`
-		Path *string `json:"path"`
-	}
-	encoded, err := json.Marshal(response.result["thread"])
-	if err != nil || json.Unmarshal(encoded, &thread) != nil || thread.ID != threadID {
-		return "", errors.New("thread/read returned invalid rollout metadata")
-	}
-	if thread.Path == nil || *thread.Path == "" {
+	if path == "" {
 		return "", nil
 	}
-	if err := rollout.ValidatePath(current.codexHome, threadID, *thread.Path); err != nil {
+	if err := rollout.ValidatePath(current.codexHome, threadID, path); err != nil {
 		return "", err
 	}
 	lockPath := filepath.Join(current.codexHome, "thread-writer-locks", threadID+".lock")
-	_, err = rollout.SanitizeFile(*thread.Path, lockPath, threadID)
-	return *thread.Path, err
+	_, err = rollout.SanitizeFile(path, lockPath, threadID)
+	return path, err
+}
+
+// findRolloutPath uses thread/list because thread/read loads the thread and
+// takes Codex's writer lock before sanitation can inspect the rollout.
+func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, error) {
+	if threadID == "" {
+		return "", errors.New("invalid rollout thread")
+	}
+	seenCursors := make(map[string]bool)
+	cursor := ""
+	for page := 0; page < maxRolloutListPages; page++ {
+		params := map[string]json.RawMessage{
+			"limit": json.RawMessage(strconv.Itoa(rolloutListPageSize)),
+		}
+		if cursor != "" {
+			params["cursor"] = rawJSONString(cursor)
+		}
+		response, err := current.callUpstream(ctx, "thread/list", params)
+		if err != nil {
+			return "", errors.New("list rollout threads")
+		}
+		var result struct {
+			Data []struct {
+				ID   string  `json:"id"`
+				Path *string `json:"path"`
+			} `json:"data"`
+			NextCursor *string `json:"nextCursor"`
+		}
+		encoded, marshalErr := json.Marshal(response.result)
+		if marshalErr != nil || json.Unmarshal(encoded, &result) != nil || result.Data == nil {
+			return "", errors.New("invalid rollout thread list")
+		}
+		for _, thread := range result.Data {
+			if thread.ID == "" {
+				return "", errors.New("invalid rollout thread list")
+			}
+			if thread.ID == threadID {
+				if thread.Path == nil {
+					return "", nil
+				}
+				return *thread.Path, nil
+			}
+		}
+		if result.NextCursor == nil || *result.NextCursor == "" {
+			return "", nil
+		}
+		if seenCursors[*result.NextCursor] {
+			return "", errors.New("invalid rollout thread cursor")
+		}
+		seenCursors[*result.NextCursor] = true
+		cursor = *result.NextCursor
+	}
+	return "", errors.New("rollout thread list exceeds limit")
 }
 
 func rewriteResumePath(payload []byte, path string) ([]byte, error) {

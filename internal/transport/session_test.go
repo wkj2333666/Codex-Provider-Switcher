@@ -691,6 +691,10 @@ func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		if message.method == "thread/list" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, path)))
+		}
 		if message.method == "thread/read" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
 				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, path)))
@@ -990,11 +994,15 @@ func newResponsiveResumeSession(t *testing.T, coordinator handoffCoordinator, pr
 		if err != nil {
 			return err
 		}
+		path := ""
+		if len(rolloutPaths) != 0 {
+			path = rolloutPaths[0]
+		}
+		if message.method == "thread/list" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, path)))
+		}
 		if message.method == "thread/read" {
-			path := ""
-			if len(rolloutPaths) != 0 {
-				path = rolloutPaths[0]
-			}
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
 				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, path)))
 		}
@@ -1979,6 +1987,10 @@ func TestSessionResumeUsesStoredProvider(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		if message.method == "thread/list" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, rolloutPath)))
+		}
 		if message.method == "thread/read" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
 				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, rolloutPath)))
@@ -2061,6 +2073,10 @@ func TestSessionResumeSanitizesIdleLockedRolloutThroughHandoff(t *testing.T) {
 		message, err := parseRPCMessage(payload)
 		if err != nil {
 			return err
+		}
+		if message.method == "thread/list" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, rolloutPath)))
 		}
 		if message.method == "thread/read" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
