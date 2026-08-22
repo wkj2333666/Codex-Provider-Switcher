@@ -9,13 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/handoff"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
 func TestSessionConsumesInternalResponse(t *testing.T) {
@@ -670,6 +673,86 @@ func TestSessionInternalResumeRewritesCollaborationModel(t *testing.T) {
 	}
 }
 
+func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_stale"}}` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var current *session
+	writer := func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/read" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, path)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.codexHome = home
+	if _, err := current.sanitizeThreadRollout(context.Background(), "thr-a"); err != nil {
+		t.Fatalf("sanitizeThreadRollout() error = %v", err)
+	}
+	cleaned, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_stale") {
+		t.Fatalf("stale reasoning survived: %s", cleaned)
+	}
+}
+
+func TestSessionHandoffSanitizesAfterUnsubscribe(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	lockDir := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_handoff_stale"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(lockDir, "thr-a.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	coordinator := &fakeHandoffCoordinator{unsubscribeHook: func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	}}
+	current := newResponsiveResumeSession(t, coordinator, "sub2api", rolloutPath)
+	current.codexHome = home
+	if err := current.handoff(context.Background(), "thr-a", modelroute.Route{Provider: "sub2api"}); err != nil {
+		t.Fatalf("handoff() error = %v", err)
+	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_handoff_stale") {
+		t.Fatalf("handoff resumed before sanitation: %s", cleaned)
+	}
+}
+
 func TestSessionInternalResumeRejectsMalformedCollaborationBeforeWrite(t *testing.T) {
 	t.Parallel()
 	var upstream messageRecorder
@@ -899,13 +982,21 @@ func TestSessionDirtyStateForcesDifferentPeerToRepairPartialResubscribe(t *testi
 	}
 }
 
-func newResponsiveResumeSession(t *testing.T, coordinator handoffCoordinator, provider string) *session {
+func newResponsiveResumeSession(t *testing.T, coordinator handoffCoordinator, provider string, rolloutPaths ...string) *session {
 	t.Helper()
 	var current *session
 	writer := func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
 		message, err := parseRPCMessage(payload)
 		if err != nil {
 			return err
+		}
+		if message.method == "thread/read" {
+			path := ""
+			if len(rolloutPaths) != 0 {
+				path = rolloutPaths[0]
+			}
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, path)))
 		}
 		if message.method == "thread/resume" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
@@ -1134,6 +1225,393 @@ func TestSessionAppliesSavedRouteToThreadSettingsUpdate(t *testing.T) {
 	}
 	if coordinator.lockCalls != 1 || coordinator.releaseCalls != 1 {
 		t.Fatalf("settings update was not serialized: %#v", coordinator)
+	}
+}
+
+func TestSessionAcceptsAndPersistsAllowlistedModelFromSettingsUpdate(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	var current *session
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(`{"id":%s,"result":{}}`, message.idKey)))
+	}
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":223,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2","collaborationMode":{"mode":"default","settings":{"model":"glm-5.2","effort":"high"}}}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	if got := selections.models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("persisted model = %q, want glm-5.2", got)
+	}
+}
+
+func TestSessionPersistsSettingsModelOnlyAfterSuccessfulResponse(t *testing.T) {
+	t.Parallel()
+	requestSeen := make(chan rpcMessage, 1)
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var current *session
+	writer := func(_ context.Context, _ websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		requestSeen <- message
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	done := make(chan error, 1)
+	request := []byte(`{"id":228,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2"}}`)
+	go func() { done <- current.handleDownstreamText(context.Background(), request) }()
+	message := <-requestSeen
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("model persisted before app-server response: %q", got)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("settings handler returned before app-server response: %v", err)
+	default:
+	}
+	if err := current.handleUpstreamText(context.Background(), []byte(fmt.Sprintf(`{"id":%s,"result":{}}`, message.idKey))); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := selections.models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("model after successful response = %q, want glm-5.2", got)
+	}
+}
+
+func TestSessionDoesNotPersistSettingsModelAfterAppServerError(t *testing.T) {
+	t.Parallel()
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var current *session
+	writer := func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+			`{"id":%s,"error":{"code":-32602,"message":"rejected"}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":229,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("rejected settings update persisted model %q", got)
+	}
+}
+
+func TestSessionDoesNotPersistSettingsModelWhenUpstreamWriteFails(t *testing.T) {
+	t.Parallel()
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	current := newTestSession(t, func(context.Context, websocket.MessageType, []byte) error {
+		return errors.New("write failed")
+	}, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+
+	request := []byte(`{"id":230,"method":"thread/settings/update","params":{"threadId":"thr-a","model":"glm-5.2"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err == nil {
+		t.Fatal("handleDownstreamText() error = nil")
+	}
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("failed write persisted model %q", got)
+	}
+}
+
+func TestSessionUsesPersistedAllowlistedModelForNextTurn(t *testing.T) {
+	t.Parallel()
+	current := newTestSession(t, nil, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.2"},
+	}
+
+	got, selected, err := current.selectedRoute("thr-a")
+	want := modelroute.Route{Provider: "glm", Model: "glm-5.2"}
+	if err != nil || !selected || got != want {
+		t.Fatalf("selectedRoute() = %#v, %v, %v; want %#v", got, selected, err, want)
+	}
+}
+
+func TestSessionIgnoresStaleTurnModelWhenExactSelectionExists(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	var current *session
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			var provider, model string
+			_ = json.Unmarshal(message.params["modelProvider"], &provider)
+			_ = json.Unmarshal(message.params["model"], &model)
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":%q,"model":%q}}`,
+				message.idKey, provider, model)))
+		}
+		return nil
+	}
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":225,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.2","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	message, err := parseRPCMessage(messages[len(messages)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.3")
+	if got := selections.models["thr-a"]; got != "glm-5.3" {
+		t.Fatalf("stale turn changed persisted model to %q", got)
+	}
+}
+
+func TestSessionRejectsForeignPickerModelForSelectedProvider(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+	}
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.3"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":226,"method":"turn/start","params":{"threadId":"thr-a","model":"deepseek-v4-pro","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.3")
+	if got := selections.models["thr-a"]; got != "" {
+		t.Fatalf("foreign model changed selection to %q", got)
+	}
+}
+
+func TestRequestedModelPrecedenceAndValidation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		params  string
+		want    string
+		present bool
+		wantErr bool
+	}{
+		{
+			name:    "nested model wins",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":{"model":"glm-5.2"}}}`,
+			want:    "glm-5.2",
+			present: true,
+		},
+		{
+			name:    "null top leaves nested model",
+			params:  `{"model":null,"collaborationMode":{"settings":{"model":"glm-5.2"}}}`,
+			want:    "glm-5.2",
+			present: true,
+		},
+		{
+			name:    "null nested falls back to top model",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":{"model":null}}}`,
+			want:    "glm-5.3",
+			present: true,
+		},
+		{
+			name:   "both models null",
+			params: `{"model":null,"collaborationMode":{"settings":{"model":null}}}`,
+		},
+		{
+			name:    "null collaboration falls back to top model",
+			params:  `{"model":"glm-5.3","collaborationMode":null}`,
+			want:    "glm-5.3",
+			present: true,
+		},
+		{
+			name:    "invalid top model type",
+			params:  `{"model":7,"collaborationMode":{"settings":{"model":"glm-5.2"}}}`,
+			wantErr: true,
+		},
+		{
+			name:    "invalid nested model type",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":{"model":false}}}`,
+			wantErr: true,
+		},
+		{
+			name:    "invalid collaboration shape",
+			params:  `{"model":"glm-5.3","collaborationMode":"unsafe"}`,
+			wantErr: true,
+		},
+		{
+			name:    "missing collaboration settings",
+			params:  `{"model":"glm-5.3","collaborationMode":{"mode":"default"}}`,
+			wantErr: true,
+		},
+		{
+			name:    "null collaboration settings",
+			params:  `{"model":"glm-5.3","collaborationMode":{"settings":null}}`,
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var params map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(test.params), &params); err != nil {
+				t.Fatal(err)
+			}
+			got, present, err := requestedModel(params)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("requestedModel() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if test.wantErr {
+				return
+			}
+			if got != test.want || present != test.present {
+				t.Fatalf("requestedModel() = %q, %v; want %q, %v", got, present, test.want, test.present)
+			}
+		})
+	}
+}
+
+func TestSessionUsesNestedPickerModelWhenDesktopFieldsConflict(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = &fakeProviderSelections{values: map[string]string{"thr-a": "glm"}}
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":227,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.3","collaborationMode":{"mode":"default","settings":{"model":"glm-5.2"}},"input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.2")
+	var collaboration struct {
+		Settings struct {
+			Model string `json:"model"`
+		} `json:"settings"`
+	}
+	if json.Unmarshal(message.params["collaborationMode"], &collaboration) != nil ||
+		collaboration.Settings.Model != "glm-5.2" {
+		t.Fatalf("collaborationMode = %s", message.params["collaborationMode"])
+	}
+	if got := current.selections.(*fakeProviderSelections).models["thr-a"]; got != "glm-5.2" {
+		t.Fatalf("persisted model = %q, want nested picker model", got)
+	}
+}
+
+func TestSessionTreatsNullPickerModelsAsAbsent(t *testing.T) {
+	t.Parallel()
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = &fakeProviderSelections{values: map[string]string{"thr-a": "glm"}}
+	current.coordinator = &fakeHandoffCoordinator{}
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.3"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":231,"method":"turn/start","params":{"threadId":"thr-a","model":null,"collaborationMode":{"mode":"default","settings":{"model":null}},"input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.3")
+	var collaboration struct {
+		Settings struct {
+			Model string `json:"model"`
+		} `json:"settings"`
+	}
+	if json.Unmarshal(message.params["collaborationMode"], &collaboration) != nil ||
+		collaboration.Settings.Model != "glm-5.3" {
+		t.Fatalf("collaborationMode = %s", message.params["collaborationMode"])
 	}
 }
 
@@ -1480,6 +1958,16 @@ func TestSessionUsesStoredProviderForNormalTurn(t *testing.T) {
 
 func TestSessionResumeUsesStoredProvider(t *testing.T) {
 	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_resume_stale"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	selections := &fakeProviderSelections{values: map[string]string{"thr-a": "sub2api"}}
 	var current *session
 	var upstream messageRecorder
@@ -1491,23 +1979,35 @@ func TestSessionResumeUsesStoredProvider(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		if message.method == "thread/read" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, rolloutPath)))
+		}
 		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
 			`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
 	}
 	current = newTestSession(t, writer, nil)
 	current.provider = "openai"
+	current.codexHome = home
 	current.selections = selections
 	current.coordinator = &fakeHandoffCoordinator{}
 
-	request := []byte(`{"id":25,"method":"thread/resume","params":{"threadId":"thr-a","modelProvider":"openai"}}`)
+	request := []byte(`{"id":25,"method":"thread/resume","params":{"threadId":"thr-a","path":"/stale/rollout.jsonl","modelProvider":"openai"}}`)
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_resume_stale") {
+		t.Fatalf("thread/resume forwarded before sanitation: %s", cleaned)
+	}
 	messages := upstream.messages()
-	if len(messages) != 1 {
+	if len(messages) != 2 {
 		t.Fatalf("upstream messages = %q", messages)
 	}
-	resume, err := parseRPCMessage(messages[0])
+	resume, err := parseRPCMessage(messages[1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1515,6 +2015,90 @@ func TestSessionResumeUsesStoredProvider(t *testing.T) {
 	_ = json.Unmarshal(resume.params["modelProvider"], &requestedProvider)
 	if requestedProvider != "sub2api" {
 		t.Fatalf("resume provider = %q", requestedProvider)
+	}
+	var requestedPath string
+	_ = json.Unmarshal(resume.params["path"], &requestedPath)
+	if requestedPath != rolloutPath {
+		t.Fatalf("resume path = %q, want %q", requestedPath, rolloutPath)
+	}
+}
+
+func TestSessionResumeSanitizesIdleLockedRolloutThroughHandoff(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "20")
+	lockDir := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(dateDir, "rollout-2026-08-20T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_resume_stale"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(lockDir, "thr-a.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	selections := &fakeProviderSelections{values: map[string]string{"thr-a": "sub2api"}}
+	coordinator := &fakeHandoffCoordinator{unsubscribeHook: func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	}}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/read" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a","path":%q}}}`, message.idKey, rolloutPath)))
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+			`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = "openai"
+	current.codexHome = home
+	current.selections = selections
+	current.coordinator = coordinator
+
+	request := []byte(`{"id":26,"method":"thread/resume","params":{"threadId":"thr-a","path":"/stale/rollout.jsonl","modelProvider":"openai"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleaned), "item_resume_stale") {
+		t.Fatalf("thread/resume forwarded before sanitation: %s", cleaned)
+	}
+	if coordinator.unsubscribeCalls != 1 || coordinator.resubscribeCalls != 1 {
+		t.Fatalf("handoff calls = %#v, want one unsubscribe and resubscribe", coordinator)
+	}
+	messages := upstream.messages()
+	var sawDesktopResume bool
+	for _, payload := range messages {
+		message, parseErr := parseRPCMessage(payload)
+		if parseErr == nil && message.method == "thread/resume" && message.idKey == "26" {
+			sawDesktopResume = true
+		}
+	}
+	if !sawDesktopResume {
+		t.Fatalf("desktop resume was not forwarded after sanitation: %q", messages)
 	}
 }
 
@@ -1624,9 +2208,29 @@ type messageRecorder struct {
 
 type fakeProviderSelections struct {
 	values   map[string]string
+	models   map[string]string
 	getErr   error
 	setErr   error
 	setCalls int
+}
+
+func (selections *fakeProviderSelections) GetRoute(threadID string) (selection.Value, bool, error) {
+	provider, ok, err := selections.Get(threadID)
+	if err != nil || !ok {
+		return selection.Value{}, ok, err
+	}
+	return selection.Value{Provider: provider, Model: selections.models[threadID]}, true, nil
+}
+
+func (selections *fakeProviderSelections) SetRoute(threadID string, value selection.Value) error {
+	if err := selections.Set(threadID, value.Provider); err != nil {
+		return err
+	}
+	if selections.models == nil {
+		selections.models = make(map[string]string)
+	}
+	selections.models[threadID] = value.Model
+	return nil
 }
 
 func (selections *fakeProviderSelections) Get(threadID string) (string, bool, error) {
@@ -1739,6 +2343,7 @@ type fakeHandoffCoordinator struct {
 	prepareErr          error
 	prepareHandoffErr   error
 	unsubscribeErr      error
+	unsubscribeHook     func()
 	resubscribeErr      error
 	restoreErr          error
 	dirty               bool
@@ -1775,6 +2380,9 @@ func (coordinator *fakeHandoffCoordinator) PrepareRecoveryAll(context.Context, s
 
 func (coordinator *fakeHandoffCoordinator) UnsubscribeAll(context.Context, string) error {
 	coordinator.unsubscribeCalls++
+	if coordinator.unsubscribeHook != nil {
+		coordinator.unsubscribeHook()
+	}
 	return coordinator.unsubscribeErr
 }
 
@@ -1821,6 +2429,20 @@ func testModelCatalog(t *testing.T) *modelroute.Catalog {
 	t.Helper()
 	directory := t.TempDir()
 	data := []byte(`{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}`)
+	if err := os.WriteFile(filepath.Join(directory, "models.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := modelroute.Load(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func testMultiModelCatalog(t *testing.T) *modelroute.Catalog {
+	t.Helper()
+	directory := t.TempDir()
+	data := []byte(`{"glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]}}`)
 	if err := os.WriteFile(filepath.Join(directory, "models.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -98,6 +98,14 @@ func TestDeployLocalInstallsVerifiedCandidateAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeExecutable(t, filepath.Join(fakeBin, "go"), fakeGoScript)
+	if err := os.MkdirAll(filepath.Join(installRoot, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleTarget := filepath.Join(t.TempDir(), "native-codex")
+	writeExecutable(t, staleTarget, "native\n")
+	if err := os.Symlink(staleTarget, filepath.Join(installRoot, "bin", "codex")); err != nil {
+		t.Fatal(err)
+	}
 
 	output, err := runDeployLocal(t, repository, installRoot, fakeBin)
 	if err != nil {
@@ -117,11 +125,19 @@ func TestDeployLocalInstallsVerifiedCandidateAtomically(t *testing.T) {
 	} else if info.Mode().Perm() != 0o755 {
 		t.Fatalf("installed mode = %o, want 755", info.Mode().Perm())
 	}
+	wrapper := filepath.Join(installRoot, "bin", "codex")
+	link, err := os.Readlink(wrapper)
+	if err != nil {
+		t.Fatalf("wrapper link: %v", err)
+	}
+	if link != "../codex-provider-switcher" {
+		t.Fatalf("wrapper link = %q, want ../codex-provider-switcher", link)
+	}
 	entries, err := os.ReadDir(installRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "codex-provider-switcher" {
+	if len(entries) != 2 || entries[0].Name() != "bin" || entries[1].Name() != "codex-provider-switcher" {
 		t.Fatalf("install directory contains unexpected artifacts: %v", entries)
 	}
 	if !strings.Contains(output, "reconnect Desktop Remote SSH") {

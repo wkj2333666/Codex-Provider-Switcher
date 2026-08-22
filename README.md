@@ -98,22 +98,39 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 
 ### 3. Configure provider-to-model routes
 
-Create the strict `models.json` catalog in the switcher state directory. Map
-every provider that users may switch to; the supported deployment uses these
-three exact routes:
+Create the strict `models.json` catalog in the switcher state directory. Give
+each provider a default model. To select multiple models for one provider, use
+a `default` plus a `models` allowlist; a string still means “only this model”:
 
 ```bash
 STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 install -m 0600 /dev/null "$STATE_ROOT/models.json"
-printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$STATE_ROOT/models.json"
 ```
 
-The catalog is a JSON object of provider names to model IDs. It is validated
-strictly: malformed JSON, invalid names or models, symlinks, and non-regular
-files make the switcher fail closed before it proxies Desktop. A missing entry
-does not inject a model, so do not leave a switchable provider unmapped.
+Provider switches use the default model. Later Desktop picker changes persist
+only when the model is in that provider's allowlist. Cross-provider or unlisted
+values do not change the route. Invalid JSON or values, symlinks, and
+non-regular files make the switcher fail closed before it proxies Desktop.
+
+To show third-party models in Desktop, also load the Codex model catalog from
+top-level `~/.codex/config.toml`, then reconnect Desktop SSH:
+
+```toml
+model_catalog_json = "/home/your-user/.codex/models-override.json"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+wire_api = "responses"
+env_key = "OPENROUTER_API_KEY"
+```
+
+OpenRouter uses the `OPENROUTER_API_KEY` environment variable. The configured
+model is `stealth/ox-alpha`, exposed as both the task model and its automatic
+reviewer, with image input enabled and a 10,000-token Desktop context cap.
 
 ### 4. Configure the login shell
 
@@ -133,6 +150,14 @@ unload its stale runtime. It keeps the thread ID, history, and descendants and
 never resends the user's message. Every client that subscribes to the same
 app-server threads must use the switcher wrapper; direct app-server subscribers
 are unsupported.
+
+When a task is resumed or handed to another provider, the switcher also checks
+its rollout for stale provider-bound reasoning IDs. Invalid reasoning records
+are removed and stale optional item IDs are stripped before app-server loads
+the history. The rewrite is atomic and keeps visible messages and tool-call
+pairs. Malformed JSONL, or an active Codex writer when a rewrite is required,
+makes the operation fail closed; clean rollouts remain a no-op and the
+switcher never invents an `rs_` ID.
 
 ### 5. Verify and reconnect Desktop
 
@@ -175,11 +200,12 @@ commands:
 /provider switch openai
 /provider switch sub2api
 /provider switch glm
+/provider switch openrouter
 ```
 
 For example, use `/provider switch openai` for the native provider or
-`/provider switch sub2api` or `/provider switch glm` for configured
-alternatives.
+`/provider switch sub2api`, `/provider switch glm`, or
+`/provider switch openrouter` for configured alternatives.
 
 The user-facing commands are:
 
@@ -193,14 +219,10 @@ model tokens. A successful alternative-provider switch reports
 same task ID and history.
 An active turn is never interrupted; wait for it to finish before switching.
 
-`models.json` controls the model sent for the current task. After a successful
-GLM switch, the current-thread label can show the verified `glm-5.2` model; this
-does not mean Desktop's model picker contains GLM. The picker is owned by
-Desktop and app-server configuration, while the switcher only validates and
-routes the provider/model pair for requests. For a task with a saved selection
-or direct provider override, the mapped model also overrides Desktop
-collaboration-mode and settings updates so the picker cannot silently replace
-the provider's required model.
+`models.json` controls the provider/model combinations allowed for the current
+task; `model_catalog_json` controls what appears in Desktop's picker. Once a
+task has a saved provider, an allowlisted same-provider picker choice is saved
+with it. Other choices are rewritten to the task's saved safe route.
 
 ## Deploy the current main checkout
 
@@ -237,7 +259,7 @@ STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 MODELS_STAGE="$(mktemp "$STATE_ROOT/.models.json.XXXXXX")"
 install -m 0600 /dev/null "$MODELS_STAGE"
-printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$MODELS_STAGE"
 mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
 mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"

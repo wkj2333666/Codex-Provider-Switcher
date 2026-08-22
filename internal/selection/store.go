@@ -5,19 +5,27 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/modelroute"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 )
 
-const maximumStateSize = 256
+const maximumStateSize = 1024
 
 // Store keeps private per-task provider selections in one directory.
 type Store struct {
 	directory string
+}
+
+// Value is the durable provider route selected for one task.
+type Value struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model,omitempty"`
 }
 
 // Open creates or validates a private state directory.
@@ -47,36 +55,62 @@ func Open(directory string) (*Store, error) {
 
 // Get returns a task's durable provider selection when one exists.
 func (store *Store) Get(threadID string) (string, bool, error) {
+	value, ok, err := store.GetRoute(threadID)
+	return value.Provider, ok, err
+}
+
+// GetRoute returns a task's durable provider/model selection when one exists.
+// Legacy provider-only state remains readable.
+func (store *Store) GetRoute(threadID string) (Value, bool, error) {
 	if store == nil || threadID == "" {
-		return "", false, errors.New("invalid provider selection lookup")
+		return Value{}, false, errors.New("invalid provider selection lookup")
 	}
 	file, err := os.Open(store.path(threadID))
 	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
+		return Value{}, false, nil
 	}
 	if err != nil {
-		return "", false, errors.New("open provider selection")
+		return Value{}, false, errors.New("open provider selection")
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() > maximumStateSize {
-		return "", false, errors.New("invalid provider selection state")
+		return Value{}, false, errors.New("invalid provider selection state")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maximumStateSize+1))
 	if err != nil || len(data) > maximumStateSize {
-		return "", false, errors.New("read provider selection")
+		return Value{}, false, errors.New("read provider selection")
 	}
-	value := string(bytes.TrimSuffix(data, []byte{'\n'}))
-	if !provider.Valid(value) {
-		return "", false, errors.New("invalid provider selection state")
+	legacy := bytes.TrimSuffix(data, []byte{'\n'})
+	if provider.Valid(string(legacy)) {
+		return Value{Provider: string(legacy)}, true, nil
+	}
+	value, err := decodeValue(data)
+	if err != nil {
+		return Value{}, false, errors.New("invalid provider selection state")
 	}
 	return value, true, nil
 }
 
 // Set atomically replaces a task's durable provider selection.
 func (store *Store) Set(threadID, value string) error {
-	if store == nil || threadID == "" || !provider.Valid(value) {
+	return store.SetRoute(threadID, Value{Provider: value})
+}
+
+// SetRoute atomically replaces a task's durable provider/model selection.
+func (store *Store) SetRoute(threadID string, value Value) error {
+	if store == nil || threadID == "" || !validValue(value) {
 		return errors.New("invalid provider selection")
+	}
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return errors.New("encode provider selection")
+	}
+	data := encoded.Bytes()
+	if len(data) > maximumStateSize {
+		return errors.New("provider selection is too large")
 	}
 	temporary, err := os.CreateTemp(store.directory, ".provider-*.tmp")
 	if err != nil {
@@ -91,7 +125,7 @@ func (store *Store) Set(threadID, value string) error {
 		cleanup()
 		return errors.New("secure provider selection state")
 	}
-	if _, err := temporary.Write(append([]byte(value), '\n')); err != nil {
+	if _, err := temporary.Write(data); err != nil {
 		cleanup()
 		return errors.New("write provider selection state")
 	}
@@ -116,6 +150,48 @@ func (store *Store) Set(threadID, value string) error {
 		return errors.New("sync provider selection state directory")
 	}
 	return nil
+}
+
+func decodeValue(data []byte) (Value, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return Value{}, errors.New("invalid selection")
+	}
+	var value Value
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		rawKey, err := decoder.Token()
+		key, ok := rawKey.(string)
+		if err != nil || !ok {
+			return Value{}, errors.New("invalid selection")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return Value{}, errors.New("invalid selection")
+		}
+		seen[key] = struct{}{}
+		switch key {
+		case "provider":
+			if decoder.Decode(&value.Provider) != nil {
+				return Value{}, errors.New("invalid selection")
+			}
+		case "model":
+			if decoder.Decode(&value.Model) != nil {
+				return Value{}, errors.New("invalid selection")
+			}
+		default:
+			return Value{}, errors.New("invalid selection")
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') || decoder.Decode(&struct{}{}) != io.EOF || !validValue(value) {
+		return Value{}, errors.New("invalid selection")
+	}
+	return value, nil
+}
+
+func validValue(value Value) bool {
+	return provider.Valid(value.Provider) && (value.Model == "" || modelroute.ValidModel(value.Model))
 }
 
 func (store *Store) path(threadID string) string {

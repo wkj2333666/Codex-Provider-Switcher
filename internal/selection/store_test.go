@@ -48,6 +48,105 @@ func TestStoreRoundTripUsesPrivateHashedState(t *testing.T) {
 	}
 }
 
+func TestStoreRoundTripPreservesSelectedModel(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Value{Provider: "glm", Model: "glm-5.2"}
+	if err := store.SetRoute("thread-model", want); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := store.GetRoute("thread-model")
+	if err != nil || !ok || got != want {
+		t.Fatalf("GetRoute() = %#v, %v, %v; want %#v", got, ok, err, want)
+	}
+}
+
+func TestStoreReadsLegacyProviderOnlySelection(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.path("legacy-thread"), []byte("glm\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := store.GetRoute("legacy-thread")
+	if err != nil || !ok || got != (Value{Provider: "glm"}) {
+		t.Fatalf("GetRoute(legacy) = %#v, %v, %v", got, ok, err)
+	}
+}
+
+func TestStoreRejectsInvalidModelSelection(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRoute("thread-secret", Value{Provider: "glm", Model: "secret model"}); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("SetRoute(invalid) error = %v", err)
+	}
+	if err := os.WriteFile(store.path("thread-secret"), []byte(`{"provider":"glm","model":"secret model"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.GetRoute("thread-secret"); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("GetRoute(corrupt) error = %v", err)
+	}
+}
+
+func TestStoreRejectsWhitespaceAroundLegacyProvider(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.path("legacy-thread"), []byte(" glm \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.GetRoute("legacy-thread"); err == nil {
+		t.Fatal("GetRoute(whitespace legacy provider) error = nil")
+	}
+}
+
+func TestStoreRoundTripsMaximumLengthModel(t *testing.T) {
+	t.Parallel()
+	for name, model := range map[string]string{
+		"plain":          strings.Repeat("m", 256),
+		"html-sensitive": strings.Repeat("<&", 128),
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := Value{Provider: "glm", Model: model}
+			if err := store.SetRoute("boundary-thread", want); err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err := store.GetRoute("boundary-thread")
+			if err != nil || !ok || got != want {
+				t.Fatalf("GetRoute(maximum model) = %#v, %v, %v", got, ok, err)
+			}
+		})
+	}
+}
+
+func TestStoreRejectsSelectionTooLargeToRead(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRoute("oversized-thread", Value{Provider: strings.Repeat("p", 2000), Model: "glm-5.2"}); err == nil {
+		t.Fatal("SetRoute(oversized encoded selection) error = nil")
+	}
+	if _, ok, err := store.GetRoute("oversized-thread"); err != nil || ok {
+		t.Fatalf("GetRoute(after rejected set) = _, %v, %v", ok, err)
+	}
+}
+
 func TestStoreRejectsInvalidAndCorruptStateWithoutLeaking(t *testing.T) {
 	t.Parallel()
 	directory := filepath.Join(t.TempDir(), "state")

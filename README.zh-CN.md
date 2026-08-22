@@ -97,20 +97,38 @@ cp -R plugins/codex-provider-switcher/skills/provider "$HOME/.agents/skills/prov
 
 ### 3. 配置 provider 到 model 的路由
 
-在 switcher 状态目录创建严格校验的 `models.json`。必须为用户可能切换到的每个
-provider 配置 model；受支持的部署使用以下三个精确路由：
+在 switcher 状态目录创建严格校验的 `models.json`，为每个 provider 配置默认
+model。要选择同一 provider 的多个模型，使用 `default` + `models` allowlist；
+字符串写法仍表示“只允许这一个模型”：
 
 ```bash
 STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 install -m 0600 /dev/null "$STATE_ROOT/models.json"
-printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$STATE_ROOT/models.json"
 ```
 
-该文件是 provider 名称到 model ID 的 JSON 对象，并会进行严格校验：JSON 格式错误、
-无效名称或 model、符号链接和非常规文件都会使 switcher 在代理 Desktop 前关闭请求。
-缺少条目时不会注入 model，因此不要遗漏任何可切换 provider。
+切换 provider 时使用默认 model。Desktop 随后选择 allowlist 内的模型时，switcher
+会保存该任务的精确 model；跨 provider 或未列出的值不会改变路由。JSON 格式错误、
+无效值、符号链接和非常规文件都会使 switcher 在代理 Desktop 前关闭请求。
+
+要让第三方模型出现在 Desktop picker 中，还需在 `~/.codex/config.toml` 顶层加载
+Codex 模型目录，然后重新连接 Desktop SSH：
+
+```toml
+model_catalog_json = "/home/your-user/.codex/models-override.json"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+wire_api = "responses"
+env_key = "OPENROUTER_API_KEY"
+```
+
+OpenRouter 使用 `OPENROUTER_API_KEY` 环境变量。当前配置的模型是
+`stealth/ox-alpha`，同时作为任务主模型和自动 reviewer；Desktop 侧启用图像输入，
+上下文上限设为 10000 token。
 
 ### 4. 配置登录 Shell
 
@@ -128,6 +146,13 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 会短暂归档并还原受影响的任务，以卸载陈旧运行时；任务 ID、历史和子任务保持
 不变，也不会重新发送用户消息。订阅同一 app-server 任务的客户端都必须使用
 switcher wrapper；不支持绕过 wrapper 直接订阅 app-server。
+
+任务恢复或转交给其他 provider 时，Switcher 还会检查 rollout 中遗留的、与旧
+provider 绑定的 reasoning ID。它会在 app-server 加载历史前删除非法 reasoning
+记录，并从普通消息和工具调用中移除可选的过期 item ID；用户可见消息和工具调用
+配对保持不变。重写采用原子替换。JSONL 损坏，或确需重写时 Codex 仍持有 writer
+lock，都会直接拒绝操作；已经干净的 rollout 只做无副作用检查，也绝不会伪造
+`rs_` ID。
 
 ### 5. 验证并重新连接 Desktop
 
@@ -168,6 +193,7 @@ Host pi
 /provider switch openai
 /provider switch sub2api
 /provider switch glm
+/provider switch openrouter
 ```
 
 面向用户的命令只有：
@@ -180,12 +206,9 @@ Host pi
 `Provider switched to sub2api using model gpt-5.6-sol.`。切换后任务 ID 和历史
 记录保持不变。运行中的 turn 不会被中断；请等待它结束后再切换。
 
-`models.json` 控制发送给当前任务的 model。成功切换到 GLM 后，当前线程标签可以
-显示已验证的 `glm-5.2`；这不表示 Desktop 的 model picker 中包含 GLM。Picker 由
-Desktop 和 app-server 配置决定，switcher 只负责校验并路由请求中的 provider/model
-组合。任务保存 provider 选择或使用 direct provider override 后，映射 model 也会覆盖
-Desktop 的 collaboration mode 和 settings 更新，防止 picker 静默替换该 provider
-所需的 model。
+`models.json` 控制当前任务允许的 provider/model 组合；`model_catalog_json` 控制
+Desktop picker 显示哪些模型。任务保存 provider 后，同 provider allowlist 内的 picker
+选择也会保存；其他选择会被改回该任务已保存的安全路由。
 
 ## 从当前 main 部署
 
@@ -221,7 +244,7 @@ STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 MODELS_STAGE="$(mktemp "$STATE_ROOT/.models.json.XXXXXX")"
 install -m 0600 /dev/null "$MODELS_STAGE"
-printf '%s\n' '{"openai":"gpt-5.6-sol","sub2api":"gpt-5.6-sol","glm":"glm-5.2"}' \
+printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]}}' \
   > "$MODELS_STAGE"
 mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
 mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"

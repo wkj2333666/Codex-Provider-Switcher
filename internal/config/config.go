@@ -21,9 +21,10 @@ const (
 // Config contains fully resolved values for one proxied connection. Provider
 // is empty when app-server should apply its own effective configuration.
 type Config struct {
-	Provider string
-	Socket   string
-	StateDir string
+	Provider  string
+	Socket    string
+	StateDir  string
+	CodexHome string
 }
 
 // Result contains either a runnable configuration or a control action.
@@ -42,6 +43,7 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 	provider := ""
 	socket := getenv(socketEnvironment)
 	stateDirectory := getenv(stateEnvironment)
+	codexHome := getenv("CODEX_HOME")
 
 	flags := flag.NewFlagSet("codex-provider-switcher", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -74,12 +76,32 @@ func ParseProxy(args []string, getenv func(string) string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	resolvedCodexHome, err := resolveCodexHome(codexHome, resolvedSocket)
+	if err != nil {
+		return Result{}, err
+	}
 
 	return Result{Config: Config{
-		Provider: provider,
-		Socket:   resolvedSocket,
-		StateDir: resolvedStateDirectory,
+		Provider:  provider,
+		Socket:    resolvedSocket,
+		StateDir:  resolvedStateDirectory,
+		CodexHome: resolvedCodexHome,
 	}}, nil
+}
+
+func resolveCodexHome(directory, socket string) (string, error) {
+	if directory == "" {
+		controlDirectory := filepath.Dir(socket)
+		if filepath.Base(socket) == "app-server-control.sock" && filepath.Base(controlDirectory) == "app-server-control" {
+			return filepath.Dir(controlDirectory), nil
+		}
+		return "", nil
+	}
+	absolute, err := filepath.Abs(directory)
+	if err != nil {
+		return "", errors.New("resolve Codex home")
+	}
+	return absolute, nil
 }
 
 func resolveStateDirectory(directory, socket string, getenv func(string) string) (string, error) {

@@ -6,6 +6,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repository="${CPS_SOURCE_DIR:-$(cd -- "$script_dir/.." && pwd -P)}"
 install_root="${CPS_INSTALL_ROOT:-${HOME}/.local/lib/codex-provider-switcher}"
 installed_binary="$install_root/codex-provider-switcher"
+wrapper_link="$install_root/bin/codex"
 temporary_root=""
 staged_binary=""
 
@@ -85,6 +86,11 @@ deploy() {
   install -m 0755 -- "$candidate" "$staged_binary"
   mv -f -- "$staged_binary" "$installed_binary"
   staged_binary=""
+
+  install -d -m 0755 -- "$(dirname -- "$wrapper_link")"
+  ln -sfn -- ../codex-provider-switcher "$wrapper_link"
+  [[ "$(readlink -- "$wrapper_link")" == "../codex-provider-switcher" ]] || \
+    fail "wrapper link does not point to the installed switcher"
 
   [[ "$("$installed_binary" --build-info)" == "$expected_info" ]] || \
     fail "installed metadata does not match candidate"

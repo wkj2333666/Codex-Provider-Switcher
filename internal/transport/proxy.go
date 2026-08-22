@@ -144,7 +144,7 @@ func serveConnection(ctx context.Context, writer http.ResponseWriter, request *h
 	downstream.SetReadLimit(limit)
 	upstream.SetReadLimit(limit)
 	return bridge(
-		ctx, downstream, upstream, options.Config.Provider, options.Config.Socket,
+		ctx, downstream, upstream, options.Config.Provider, options.Config.CodexHome, options.Config.Socket,
 		routes, selections, recoveryStore,
 	)
 }
@@ -204,7 +204,7 @@ func dialUpstream(ctx context.Context, request *http.Request, socket string) (*w
 func bridge(
 	ctx context.Context,
 	downstream, upstream *websocket.Conn,
-	provider, socket string,
+	provider, codexHome, socket string,
 	routes *modelroute.Catalog,
 	selections providerSelections,
 	recoveries recoveryJournals,
@@ -224,6 +224,7 @@ func bridge(
 	if err != nil {
 		return errors.New("initialize provider handoff session")
 	}
+	current.codexHome = codexHome
 	current.selections = selections
 	current.recoveries = recoveries
 	coordinator, err := handoff.Open(socket, current)

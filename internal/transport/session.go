@@ -1,11 +1,13 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,8 @@ import (
 	providerid "github.com/wkj2333666/Codex-Provider-Switcher/internal/provider"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rewrite"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rollout"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
 const (
@@ -49,8 +53,8 @@ type handoffCoordinator interface {
 type websocketWriteFunc func(context.Context, websocket.MessageType, []byte) error
 
 type providerSelections interface {
-	Get(string) (string, bool, error)
-	Set(string, string) error
+	GetRoute(string) (selection.Value, bool, error)
+	SetRoute(string, selection.Value) error
 }
 
 type recoveryJournals interface {
@@ -63,10 +67,12 @@ type desktopRequest struct {
 	method       string
 	threadID     string
 	responseSeen chan struct{}
+	responseOK   bool
 }
 
 type session struct {
 	provider        string
+	codexHome       string
 	routes          *modelroute.Catalog
 	appServerSocket string
 
@@ -167,11 +173,46 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 	if !selected {
 		return current.writeUpstream(ctx, websocket.MessageText, payload)
 	}
+	persistRoute := false
+	requested, present, err := requestedModel(message.params)
+	if err != nil {
+		return errRoutingPolicy
+	}
+	if present {
+		if route, allowed := current.routes.ResolveModel(targetRoute.Provider, requested); allowed {
+			targetRoute = route
+			persistRoute = true
+		}
+	}
 	rewritten, err := rewrite.Line(payload, targetRoute)
 	if err != nil {
 		return errRoutingPolicy
 	}
-	return current.writeUpstream(ctx, websocket.MessageText, rewritten)
+	if !persistRoute {
+		return current.writeUpstream(ctx, websocket.MessageText, rewritten)
+	}
+	seen := make(chan struct{})
+	request := &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen}
+	current.trackDesktopRequest(message, request)
+	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
+		current.removeDesktopRequest(message.idKey)
+		return err
+	}
+	select {
+	case <-seen:
+		if !request.responseOK {
+			return nil
+		}
+		if err := current.persistSelectedRoute(threadID, targetRoute); err != nil {
+			return errRoutingPolicy
+		}
+		return nil
+	case <-ctx.Done():
+		current.removeDesktopRequest(message.idKey)
+		return ctx.Err()
+	case <-current.closed:
+		return nil
+	}
 }
 
 func (current *session) handleThreadUnsubscribe(ctx context.Context, message rpcMessage, payload []byte) error {
@@ -232,9 +273,10 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return current.writeProviderStatus(ctx, message.id, threadID)
 	}
 	targetRoute := current.routeForProvider(command.provider)
+	persistRequestedRoute := false
 	if !commandRecognized {
-		var selected bool
-		targetRoute, selected, err = current.selectedRoute(threadID)
+		var selected, exact bool
+		targetRoute, selected, exact, err = current.selectedRouteState(threadID)
 		if err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
@@ -245,6 +287,16 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 			}
 			targetRoute = current.routeForProvider(effectiveProvider)
 		}
+		requested, present, requestErr := requestedModel(message.params)
+		if requestErr != nil {
+			return errRoutingPolicy
+		}
+		if present && !exact {
+			if route, allowed := current.routes.ResolveModel(targetRoute.Provider, requested); allowed {
+				targetRoute = route
+				persistRequestedRoute = selected
+			}
+		}
 	}
 	if current.coordinator.IsDirty(threadID) || !routeMatches(current.effectiveRoute(threadID), targetRoute) {
 		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
@@ -252,7 +304,7 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		}
 	}
 	if commandRecognized {
-		if current.selections == nil || current.selections.Set(threadID, targetRoute.Provider) != nil {
+		if current.persistSelectedRoute(threadID, targetRoute) != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
 		feedback := "Provider switched to " + targetRoute.Provider + "."
@@ -262,6 +314,11 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return current.writeProviderControlTurn(
 			ctx, message.id, threadID, "/provider switch "+targetRoute.Provider, feedback,
 		)
+	}
+	if persistRequestedRoute {
+		if err := current.persistSelectedRoute(threadID, targetRoute); err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
 	}
 
 	rewritten, err := rewrite.Line(payload, targetRoute)
@@ -350,6 +407,25 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
+	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID)
+	if errors.Is(err, rollout.ErrActiveWriter) {
+		// App-server keeps an idle thread's writer lock while it is loaded. A
+		// rollout that needs sanitation must therefore go through the same
+		// coordinated unsubscribe/resume path as a provider handoff.
+		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
+		rolloutPath, err = current.sanitizeThreadRollout(ctx, threadID)
+	}
+	if err != nil {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	if rolloutPath != "" {
+		payload, err = rewriteResumePath(payload, rolloutPath)
+		if err != nil {
+			return errRoutingPolicy
+		}
+	}
 	rewritten, err := rewrite.Line(payload, targetRoute)
 	if err != nil {
 		return errRoutingPolicy
@@ -391,6 +467,10 @@ func (current *session) handoff(ctx context.Context, threadID string, targetRout
 	if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageUnsubscribed); err != nil {
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff stage update failed")
+	}
+	if _, err := current.sanitizeThreadRollout(ctx, threadID); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
+		return errors.New("provider handoff rollout sanitation failed")
 	}
 	if err := current.internalResumeForHandoff(ctx, threadID, targetRoute); err != nil {
 		if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
@@ -599,29 +679,41 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 	return nil
 }
 
-func (current *session) selectedProvider(threadID string) (string, bool, error) {
-	if current.selections == nil {
-		return current.provider, current.provider != "", nil
-	}
-	selected, ok, err := current.selections.Get(threadID)
-	if err != nil {
-		return "", false, errors.New("read provider selection")
-	}
-	if !ok {
-		return current.provider, current.provider != "", nil
-	}
-	if !providerid.Valid(selected) {
-		return "", false, errors.New("invalid provider selection")
-	}
-	return selected, true, nil
+func (current *session) selectedRoute(threadID string) (modelroute.Route, bool, error) {
+	route, selected, _, err := current.selectedRouteState(threadID)
+	return route, selected, err
 }
 
-func (current *session) selectedRoute(threadID string) (modelroute.Route, bool, error) {
-	provider, selected, err := current.selectedProvider(threadID)
-	if err != nil {
-		return modelroute.Route{}, false, err
+func (current *session) selectedRouteState(threadID string) (modelroute.Route, bool, bool, error) {
+	if current.selections == nil {
+		return current.routeForProvider(current.provider), current.provider != "", false, nil
 	}
-	return current.routeForProvider(provider), selected, nil
+	selected, ok, err := current.selections.GetRoute(threadID)
+	if err != nil {
+		return modelroute.Route{}, false, false, errors.New("read provider selection")
+	}
+	if !ok {
+		return current.routeForProvider(current.provider), current.provider != "", false, nil
+	}
+	if !providerid.Valid(selected.Provider) {
+		return modelroute.Route{}, false, false, errors.New("invalid provider selection")
+	}
+	if selected.Model == "" {
+		return current.routeForProvider(selected.Provider), true, false, nil
+	}
+	route, allowed := current.routes.ResolveModel(selected.Provider, selected.Model)
+	if !allowed {
+		return modelroute.Route{}, false, false, errors.New("invalid provider selection")
+	}
+	return route, true, true, nil
+}
+
+func (current *session) persistSelectedRoute(threadID string, route modelroute.Route) error {
+	if current.selections == nil || !providerid.Valid(route.Provider) ||
+		(route.Model != "" && !modelroute.ValidModel(route.Model)) {
+		return errors.New("invalid provider selection")
+	}
+	return current.selections.SetRoute(threadID, selection.Value{Provider: route.Provider, Model: route.Model})
 }
 
 func (current *session) routeForProvider(provider string) modelroute.Route {
@@ -630,6 +722,54 @@ func (current *session) routeForProvider(provider string) modelroute.Route {
 
 func routeMatches(actual, expected modelroute.Route) bool {
 	return actual.Provider == expected.Provider && (expected.Model == "" || actual.Model == expected.Model)
+}
+
+func requestedModel(params map[string]json.RawMessage) (string, bool, error) {
+	if params == nil {
+		return "", false, nil
+	}
+	top, topPresent, err := rawModel(params["model"])
+	if err != nil {
+		return "", false, err
+	}
+	collaborationRaw, collaborationPresent := params["collaborationMode"]
+	if !collaborationPresent || string(collaborationRaw) == "null" {
+		return top, topPresent, nil
+	}
+	var collaboration map[string]json.RawMessage
+	if json.Unmarshal(collaborationRaw, &collaboration) != nil || collaboration == nil {
+		return "", false, errors.New("invalid collaboration mode")
+	}
+	settingsRaw, settingsPresent := collaboration["settings"]
+	if !settingsPresent || string(settingsRaw) == "null" {
+		return "", false, errors.New("invalid collaboration mode")
+	}
+	var settings map[string]json.RawMessage
+	if json.Unmarshal(settingsRaw, &settings) != nil || settings == nil {
+		return "", false, errors.New("invalid collaboration mode")
+	}
+	nested, nestedPresent, err := rawModel(settings["model"])
+	if err != nil {
+		return "", false, err
+	}
+	if nestedPresent {
+		return nested, true, nil
+	}
+	return top, topPresent, nil
+}
+
+func rawModel(raw json.RawMessage) (string, bool, error) {
+	if len(raw) == 0 {
+		return "", false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", false, nil
+	}
+	var model string
+	if json.Unmarshal(raw, &model) != nil || !modelroute.ValidModel(model) {
+		return "", false, errors.New("invalid requested model")
+	}
+	return model, true, nil
 }
 
 func (current *session) internalResumeWithRoute(ctx context.Context, threadID string, expectedRoute modelroute.Route, reuseTemplate bool) error {
@@ -642,6 +782,10 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	if params == nil {
 		params = make(map[string]json.RawMessage)
 	}
+	// A saved desktop resume template may contain an immutable rollout path
+	// from before thread/revert. Let app-server resolve the current rollout by
+	// stable thread ID instead of replaying that stale path.
+	delete(params, "path")
 	params["threadId"] = rawJSONString(threadID)
 	params["modelProvider"] = rawJSONString(expectedRoute.Provider)
 	if expectedRoute.Model != "" {
@@ -667,6 +811,65 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	delete(current.detached, threadID)
 	current.stateMu.Unlock()
 	return nil
+}
+
+func (current *session) sanitizeThreadRollout(ctx context.Context, threadID string) (string, error) {
+	if current.codexHome == "" {
+		return "", nil
+	}
+	response, err := current.callUpstream(ctx, "thread/read", map[string]json.RawMessage{
+		"threadId":     rawJSONString(threadID),
+		"includeTurns": json.RawMessage("false"),
+	})
+	if err != nil {
+		if rolloutNotReadyError(err, threadID) {
+			return "", nil
+		}
+		return "", err
+	}
+	var thread struct {
+		ID   string  `json:"id"`
+		Path *string `json:"path"`
+	}
+	encoded, err := json.Marshal(response.result["thread"])
+	if err != nil || json.Unmarshal(encoded, &thread) != nil || thread.ID != threadID {
+		return "", errors.New("thread/read returned invalid rollout metadata")
+	}
+	if thread.Path == nil || *thread.Path == "" {
+		return "", nil
+	}
+	if err := rollout.ValidatePath(current.codexHome, threadID, *thread.Path); err != nil {
+		return "", err
+	}
+	lockPath := filepath.Join(current.codexHome, "thread-writer-locks", threadID+".lock")
+	_, err = rollout.SanitizeFile(*thread.Path, lockPath, threadID)
+	return *thread.Path, err
+}
+
+func rewriteResumePath(payload []byte, path string) ([]byte, error) {
+	var message map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &message); err != nil || message == nil {
+		return nil, errors.New("invalid resume request")
+	}
+	var params map[string]json.RawMessage
+	if raw, ok := message["params"]; ok && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &params); err != nil || params == nil {
+			return nil, errors.New("resume params must be an object")
+		}
+	} else {
+		params = make(map[string]json.RawMessage)
+	}
+	params["path"] = rawJSONString(path)
+	encodedParams, err := json.Marshal(params)
+	if err != nil {
+		return nil, errors.New("encode resume params")
+	}
+	message["params"] = encodedParams
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		return nil, errors.New("encode resume request")
+	}
+	return encoded, nil
 }
 
 func (current *session) callUpstream(ctx context.Context, method string, params map[string]json.RawMessage) (rpcMessage, error) {
@@ -859,6 +1062,7 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 		request := current.desktop[message.idKey]
 		if request != nil {
 			delete(current.desktop, message.idKey)
+			request.responseOK = !message.hasError
 			if threadID, route, ok := responseThreadRoute(message); ok &&
 				(request.method == "thread/start" || request.method == "thread/resume" || request.method == "thread/fork") {
 				current.effective[threadID] = route.Provider
