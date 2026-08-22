@@ -206,8 +206,8 @@ func TestProviderPluginExposesExplicitStatusAndSwitchCommands(t *testing.T) {
 	if err := json.Unmarshal(content, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Version != "0.5.2" {
-		t.Fatalf("plugin version = %q, want 0.5.2", manifest.Version)
+	if manifest.Version != "0.5.3" {
+		t.Fatalf("plugin version = %q, want 0.5.3", manifest.Version)
 	}
 	want := []string{
 		"Use /provider status to show this task's current provider.",

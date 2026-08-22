@@ -44,7 +44,7 @@ Switcher 不会启动第二个 daemon，也不会修改任务数据库。没有�
 将 `VERSION` 改成需要安装的版本。以下命令会自动识别操作系统和 CPU 架构。
 
 ```bash
-VERSION="0.5.2"
+VERSION="0.5.3"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;

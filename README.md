@@ -46,7 +46,7 @@ Set `VERSION` to the release you want to install. The commands detect the
 current operating system and CPU architecture.
 
 ```bash
-VERSION="0.5.2"
+VERSION="0.5.3"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
