@@ -46,7 +46,7 @@ Set `VERSION` to the release you want to install. The commands detect the
 current operating system and CPU architecture.
 
 ```bash
-VERSION="0.5.3"
+VERSION="0.5.6"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -150,6 +150,16 @@ unload its stale runtime. It keeps the thread ID, history, and descendants and
 never resends the user's message. Every client that subscribes to the same
 app-server threads must use the switcher wrapper; direct app-server subscribers
 are unsupported.
+
+Short-lived Desktop or Android SSH proxy connections can leave an older proxy
+with a stale local `active` notification after app-server has already made the
+task idle. Before returning handoff error `-32090`, the switcher now checks the
+authoritative task status across all providers. It clears peer-local stale
+state only for an exact `idle` or `systemError`; a locally active turn, active
+server status, malformed response, or failed peer reconciliation still fails
+closed before the user's message is sent. The per-task fence remains held until
+app-server acknowledges a newly forwarded turn, so a genuine in-flight request
+cannot be mistaken for stale state during that acknowledgement window.
 
 When a task is handed to another provider, the switcher also checks its rollout
 for stale provider-bound reasoning IDs. Invalid reasoning records are removed
@@ -291,6 +301,11 @@ is an absolute path to the real Codex executable.
 provider is configured in the app-server and Codex CLI is 0.146.0 or newer.
 After upgrading the switcher, reconnect the Desktop SSH host so every live
 proxy uses the same version.
+
+**A later message returns JSON-RPC `-32090`:** upgrade to v0.5.6 or newer and
+reconnect every Desktop/Android SSH client once. This version reconciles stale
+peer activity only after app-server verifies that the task is idle; a genuinely
+active task remains protected.
 
 **The app-server socket is unavailable:** connect or restart Codex Desktop's
 remote host so its normal app-server is running. The switcher intentionally

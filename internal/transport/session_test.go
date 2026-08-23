@@ -595,7 +595,7 @@ func TestSessionSwitchesProviderBeforeTurnStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if coordinator.lockCalls != 1 || coordinator.prepareCalls != 1 || coordinator.prepareHandoffCalls != 1 || coordinator.unsubscribeCalls != 1 ||
-		coordinator.resubscribeCalls != 1 || coordinator.releaseCalls != 1 {
+		coordinator.resubscribeCalls != 1 || coordinator.releaseCalls != 0 {
 		t.Fatalf("coordinator calls = %#v", coordinator)
 	}
 	messages := upstream.messages()
@@ -618,6 +618,14 @@ func TestSessionSwitchesProviderBeforeTurnStart(t *testing.T) {
 	}
 	if !current.isActive("thr-a") {
 		t.Fatal("forwarded turn was not marked active")
+	}
+	if err := current.handleUpstreamText(context.Background(), []byte(
+		`{"id":9,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.releaseCalls != 1 {
+		t.Fatalf("turn/start acknowledgement release calls = %d, want 1", coordinator.releaseCalls)
 	}
 }
 
@@ -692,6 +700,10 @@ func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
 			return err
 		}
 		if message.method == "thread/list" {
+			var providers []string
+			if err := json.Unmarshal(message.params["modelProviders"], &providers); err != nil || providers == nil || len(providers) != 0 {
+				t.Fatalf("thread/list modelProviders = %s, %v; want []", message.params["modelProviders"], err)
+			}
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
 				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, path)))
 		}
@@ -806,11 +818,74 @@ func TestSessionChecksPeersBeforeSameProviderTurn(t *testing.T) {
 	}
 }
 
+func TestSessionReconcilesStalePeerBusyFromAuthoritativeQuiescence(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{"idle", "systemError"} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			coordinator := &fakeHandoffCoordinator{prepareErr: errors.New("stale peer busy")}
+			var current *session
+			var upstream, downstream messageRecorder
+			writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+				if err := upstream.write(ctx, messageType, payload); err != nil {
+					return err
+				}
+				message, err := parseRPCMessage(payload)
+				if err != nil {
+					return err
+				}
+				if message.method == "thread/list" {
+					return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+						`{"id":%s,"result":{"data":[{"id":"thr-a","path":null,"status":{"type":%q},"modelProvider":"sub2api"}],"nextCursor":null}}`,
+						message.idKey, status)))
+				}
+				return nil
+			}
+			current = newTestSession(t, writer, downstream.write)
+			current.coordinator = coordinator
+			current.stateMu.Lock()
+			current.effective["thr-a"] = "sub2api"
+			current.stateMu.Unlock()
+
+			request := []byte(`{"id":12,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+			if err := current.handleDownstreamText(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			if coordinator.reconcileCalls != 1 || coordinator.prepareCalls != 2 {
+				t.Fatalf("coordinator calls = %#v, want one reconcile and two prepares", coordinator)
+			}
+			messages := upstream.messages()
+			if len(messages) != 2 || !bytes.Equal(messages[1], request) {
+				t.Fatalf("upstream messages = %q, want status probe then ordinary turn", messages)
+			}
+			if got := downstream.messages(); len(got) != 0 {
+				t.Fatalf("quiescent reconciliation wrote error = %q", got)
+			}
+		})
+	}
+}
+
 func TestSessionReturnsStaticErrorWhenHandoffFails(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{prepareErr: errors.New("secret peer path")}
 	var upstream, downstream messageRecorder
-	current := newTestSession(t, upstream.write, downstream.write)
+	var current *session
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/list" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":null,"status":{"type":"active"},"modelProvider":"openai"}],"nextCursor":null}}`,
+				message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, downstream.write)
 	current.coordinator = coordinator
 	current.stateMu.Lock()
 	current.effective["thr-a"] = "openai"
@@ -820,8 +895,16 @@ func TestSessionReturnsStaticErrorWhenHandoffFails(t *testing.T) {
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	if len(upstream.messages()) != 0 {
-		t.Fatalf("failed handoff wrote upstream: %q", upstream.messages())
+	upstreamMessages := upstream.messages()
+	if len(upstreamMessages) != 1 {
+		t.Fatalf("failed handoff upstream messages = %q, want one status probe", upstreamMessages)
+	}
+	probe, err := parseRPCMessage(upstreamMessages[0])
+	if err != nil || probe.method != "thread/list" || bytes.Contains(upstreamMessages[0], []byte("secret prompt")) {
+		t.Fatalf("failed handoff probe = %q, %v", upstreamMessages[0], err)
+	}
+	if coordinator.reconcileCalls != 0 {
+		t.Fatalf("active app-server state reconciled %d peers", coordinator.reconcileCalls)
 	}
 	messages := downstream.messages()
 	if len(messages) != 1 {
@@ -842,6 +925,92 @@ func TestSessionReturnsStaticErrorWhenHandoffFails(t *testing.T) {
 	}
 	if bytes.Contains(messages[0], []byte("secret prompt")) || bytes.Contains(messages[0], []byte("secret peer")) {
 		t.Fatalf("handoff error leaked details: %s", messages[0])
+	}
+}
+
+func TestSessionBusyReconciliationFailsClosedWithoutVerifiedIdlePeers(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name              string
+		threadListResult  string
+		reconcileErr      error
+		wantReconcileCall int
+	}{
+		{
+			name: "unknown app-server status",
+			threadListResult: `{"result":{"data":[{"id":"thr-a","path":null,"status":{},` +
+				`"modelProvider":"sub2api"}],"nextCursor":null}}`,
+		},
+		{
+			name: "duplicate conflicting target rows",
+			threadListResult: `{"result":{"data":[` +
+				`{"id":"thr-a","path":null,"status":{"type":"idle"},"modelProvider":"sub2api"},` +
+				`{"id":"thr-a","path":null,"status":{"type":"active"},"modelProvider":"sub2api"}` +
+				`],"nextCursor":null}}`,
+		},
+		{
+			name:             "app-server query error",
+			threadListResult: `{"error":{"code":-32603,"message":"unavailable"}}`,
+		},
+		{
+			name: "peer reconciliation error",
+			threadListResult: `{"result":{"data":[{"id":"thr-a","path":null,"status":{"type":"idle"},` +
+				`"modelProvider":"sub2api"}],"nextCursor":null}}`,
+			reconcileErr:      errors.New("peer unavailable"),
+			wantReconcileCall: 1,
+		},
+		{
+			name: "peer remains busy after reconciliation",
+			threadListResult: `{"result":{"data":[{"id":"thr-a","path":null,"status":{"type":"idle"},` +
+				`"modelProvider":"sub2api"}],"nextCursor":null}}`,
+			wantReconcileCall: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			coordinator := &fakeHandoffCoordinator{
+				prepareErr: errors.New("peer busy"), reconcileErr: tt.reconcileErr,
+			}
+			if tt.name == "peer remains busy after reconciliation" {
+				coordinator.prepareAfterReconcileErr = errors.New("peer still busy")
+			}
+			var current *session
+			var upstream, downstream messageRecorder
+			writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+				if err := upstream.write(ctx, messageType, payload); err != nil {
+					return err
+				}
+				message, err := parseRPCMessage(payload)
+				if err != nil {
+					return err
+				}
+				if message.method == "thread/list" {
+					return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+						`{"id":%s,%s`, message.idKey, strings.TrimPrefix(tt.threadListResult, "{"))))
+				}
+				return nil
+			}
+			current = newTestSession(t, writer, downstream.write)
+			current.coordinator = coordinator
+			current.stateMu.Lock()
+			current.effective["thr-a"] = "sub2api"
+			current.stateMu.Unlock()
+
+			request := []byte(`{"id":14,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+			if err := current.handleDownstreamText(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			if coordinator.reconcileCalls != tt.wantReconcileCall {
+				t.Fatalf("reconcile calls = %d, want %d", coordinator.reconcileCalls, tt.wantReconcileCall)
+			}
+			if messages := upstream.messages(); len(messages) != 1 {
+				t.Fatalf("upstream messages = %q, want only status probe", messages)
+			}
+			if messages := downstream.messages(); len(messages) != 1 || !bytes.Contains(messages[0], []byte(`"code":-32090`)) {
+				t.Fatalf("downstream messages = %q, want static handoff error", messages)
+			}
+		})
 	}
 }
 
@@ -1043,6 +1212,114 @@ func TestSessionRejectsDuplicateTurnStartWithoutClearingActiveState(t *testing.T
 	}
 	if status := current.Prepare("thr-a"); status != handoff.StatusBusy {
 		t.Fatalf("Prepare() after duplicate turn = %q", status)
+	}
+}
+
+func TestSessionPendingTurnFenceReleasesOnConnectionClose(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	var upstream messageRecorder
+	current := newTestSession(t, upstream.write, nil)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":10,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.releaseCalls != 0 {
+		t.Fatalf("pending turn released fence %d times", coordinator.releaseCalls)
+	}
+	current.closeState()
+	if coordinator.releaseCalls != 1 {
+		t.Fatalf("connection close released fence %d times, want 1", coordinator.releaseCalls)
+	}
+}
+
+func TestSessionTurnWriteFailureReleasesFenceAndActiveState(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	current := newTestSession(t, func(context.Context, websocket.MessageType, []byte) error {
+		return errors.New("write failed")
+	}, nil)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":10,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err == nil {
+		t.Fatal("turn write error = nil")
+	}
+	if coordinator.releaseCalls != 1 {
+		t.Fatalf("write failure released fence %d times, want 1", coordinator.releaseCalls)
+	}
+	if current.isActive("thr-a") {
+		t.Fatal("write failure left thread active")
+	}
+}
+
+func TestSessionRejectsCrossThreadDuplicateRequestIDWithoutReplacingTurnFence(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	var upstream, downstream messageRecorder
+	current := newTestSession(t, upstream.write, downstream.write)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.effective["thr-b"] = "sub2api"
+	current.stateMu.Unlock()
+
+	first := []byte(`{"id":10,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	second := []byte(`{"id":10,"method":"turn/start","params":{"threadId":"thr-b","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := current.handleDownstreamText(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if messages := upstream.messages(); len(messages) != 1 || !bytes.Equal(messages[0], first) {
+		t.Fatalf("duplicate request reached upstream: %q", messages)
+	}
+	if messages := downstream.messages(); len(messages) != 1 || !bytes.Contains(messages[0], []byte(`"code":-32090`)) {
+		t.Fatalf("duplicate request response = %q", messages)
+	}
+	if coordinator.lockCalls != 1 || coordinator.releaseCalls != 0 {
+		t.Fatalf("duplicate request changed turn fence: %#v", coordinator)
+	}
+	if !current.isActive("thr-a") || current.isActive("thr-b") {
+		t.Fatalf("duplicate request changed active state: thr-a=%v thr-b=%v", current.isActive("thr-a"), current.isActive("thr-b"))
+	}
+}
+
+func TestSessionReservesTransparentRequestIDBeforeTrackedTurn(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	var upstream, downstream messageRecorder
+	current := newTestSession(t, upstream.write, downstream.write)
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "sub2api"
+	current.stateMu.Unlock()
+
+	transparent := []byte(`{"id":10,"method":"model/list","params":{}}`)
+	turn := []byte(`{"id":10,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), transparent); err != nil {
+		t.Fatal(err)
+	}
+	if err := current.handleDownstreamText(context.Background(), turn); err != nil {
+		t.Fatal(err)
+	}
+	if messages := upstream.messages(); len(messages) != 1 || !bytes.Equal(messages[0], transparent) {
+		t.Fatalf("request-id reuse reached upstream: %q", messages)
+	}
+	if messages := downstream.messages(); len(messages) != 1 || !bytes.Contains(messages[0], []byte(`"code":-32090`)) {
+		t.Fatalf("request-id reuse response = %q", messages)
+	}
+	if coordinator.lockCalls != 0 || coordinator.releaseCalls != 0 || current.isActive("thr-a") {
+		t.Fatalf("request-id reuse changed turn state: %#v", coordinator)
 	}
 }
 
@@ -2427,25 +2704,28 @@ func newTestSession(t *testing.T, upstreamWrite, downstreamWrite websocketWriteF
 }
 
 type fakeHandoffCoordinator struct {
-	lockCalls           int
-	prepareCalls        int
-	prepareHandoffCalls int
-	unsubscribeCalls    int
-	resubscribeCalls    int
-	restoreCalls        int
-	markDirtyCalls      int
-	clearDirtyCalls     int
-	dirtyStageCalls     []handoff.DirtyStage
-	releaseCalls        int
-	beginRecoveryCalls  int
-	prepareErr          error
-	prepareHandoffErr   error
-	unsubscribeErr      error
-	unsubscribeHook     func()
-	resubscribeErr      error
-	restoreErr          error
-	dirty               bool
-	resubscribeRoute    modelroute.Route
+	lockCalls                int
+	prepareCalls             int
+	prepareHandoffCalls      int
+	unsubscribeCalls         int
+	resubscribeCalls         int
+	restoreCalls             int
+	markDirtyCalls           int
+	clearDirtyCalls          int
+	dirtyStageCalls          []handoff.DirtyStage
+	releaseCalls             int
+	beginRecoveryCalls       int
+	prepareErr               error
+	prepareAfterReconcileErr error
+	prepareHandoffErr        error
+	unsubscribeErr           error
+	unsubscribeHook          func()
+	resubscribeErr           error
+	restoreErr               error
+	dirty                    bool
+	resubscribeRoute         modelroute.Route
+	reconcileCalls           int
+	reconcileErr             error
 }
 
 func (coordinator *fakeHandoffCoordinator) BeginRecoveryAll(context.Context, string, []string) error {
@@ -2464,7 +2744,15 @@ func (coordinator *fakeHandoffCoordinator) LockThread(context.Context, string) (
 
 func (coordinator *fakeHandoffCoordinator) PrepareAll(context.Context, string) error {
 	coordinator.prepareCalls++
+	if coordinator.reconcileCalls > 0 {
+		return coordinator.prepareAfterReconcileErr
+	}
 	return coordinator.prepareErr
+}
+
+func (coordinator *fakeHandoffCoordinator) ReconcileIdleAll(context.Context, string) error {
+	coordinator.reconcileCalls++
+	return coordinator.reconcileErr
 }
 
 func (coordinator *fakeHandoffCoordinator) PrepareHandoffAll(context.Context, string) error {

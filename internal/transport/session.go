@@ -40,6 +40,7 @@ type handoffCoordinator interface {
 	PrepareAll(context.Context, string) error
 	PrepareHandoffAll(context.Context, string) error
 	PrepareRecoveryAll(context.Context, string) error
+	ReconcileIdleAll(context.Context, string) error
 	UnsubscribeAll(context.Context, string) error
 	ResubscribeAll(context.Context, string, modelroute.Route) error
 	RestoreAll(context.Context, string) error
@@ -66,10 +67,11 @@ type recoveryJournals interface {
 }
 
 type desktopRequest struct {
-	method       string
-	threadID     string
-	responseSeen chan struct{}
-	responseOK   bool
+	method        string
+	threadID      string
+	responseSeen  chan struct{}
+	responseOK    bool
+	releaseThread func()
 }
 
 type session struct {
@@ -151,8 +153,15 @@ func (current *session) handleDownstreamText(ctx context.Context, payload []byte
 	if err != nil {
 		return errRoutingPolicy
 	}
-	if message.method == "thread/start" || message.method == "thread/fork" {
-		current.trackDesktopRequest(message, &desktopRequest{method: message.method})
+	if message.kind == rpcRequest {
+		if !current.trackDesktopRequest(message, &desktopRequest{method: message.method}) {
+			return current.writeHandoffError(ctx, message.id)
+		}
+		if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
+			current.removeDesktopRequest(message.idKey)
+			return err
+		}
+		return nil
 	}
 	return current.writeUpstream(ctx, websocket.MessageText, rewritten)
 }
@@ -162,6 +171,17 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 	if err != nil || message.idKey == "" || current.coordinator == nil || message.params == nil {
 		return errRoutingPolicy
 	}
+	seen := make(chan struct{})
+	request := &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen}
+	if !current.trackDesktopRequest(message, request) {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	forwarded := false
+	defer func() {
+		if !forwarded {
+			current.removeDesktopRequest(message.idKey)
+		}
+	}()
 	release, err := current.coordinator.LockThread(ctx, threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
@@ -173,7 +193,9 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 		return current.writeHandoffError(ctx, message.id)
 	}
 	if !selected {
-		return current.writeUpstream(ctx, websocket.MessageText, payload)
+		err := current.writeUpstream(ctx, websocket.MessageText, payload)
+		forwarded = err == nil
+		return err
 	}
 	persistRoute := false
 	requested, present, err := requestedModel(message.params)
@@ -191,15 +213,14 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 		return errRoutingPolicy
 	}
 	if !persistRoute {
-		return current.writeUpstream(ctx, websocket.MessageText, rewritten)
-	}
-	seen := make(chan struct{})
-	request := &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen}
-	current.trackDesktopRequest(message, request)
-	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
-		current.removeDesktopRequest(message.idKey)
+		err := current.writeUpstream(ctx, websocket.MessageText, rewritten)
+		forwarded = err == nil
 		return err
 	}
+	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
+		return err
+	}
+	forwarded = true
 	select {
 	case <-seen:
 		if !request.responseOK {
@@ -210,7 +231,6 @@ func (current *session) handleThreadSettingsUpdate(ctx context.Context, message 
 		}
 		return nil
 	case <-ctx.Done():
-		current.removeDesktopRequest(message.idKey)
 		return ctx.Err()
 	case <-current.closed:
 		return nil
@@ -222,25 +242,33 @@ func (current *session) handleThreadUnsubscribe(ctx context.Context, message rpc
 	if err != nil || message.idKey == "" || current.coordinator == nil {
 		return errRoutingPolicy
 	}
+	seen := make(chan struct{})
+	request := &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen}
+	if !current.trackDesktopRequest(message, request) {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	forwarded := false
+	defer func() {
+		if !forwarded {
+			current.removeDesktopRequest(message.idKey)
+		}
+	}()
 	release, err := current.coordinator.LockThread(ctx, threadID)
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
 	defer release()
 
-	seen := make(chan struct{})
-	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
 	current.clearEffectiveProvider(threadID)
 	current.setDetached(threadID, false)
 	if err := current.writeUpstream(ctx, websocket.MessageText, payload); err != nil {
-		current.removeDesktopRequest(message.idKey)
 		return err
 	}
+	forwarded = true
 	select {
 	case <-seen:
 		return nil
 	case <-ctx.Done():
-		current.removeDesktopRequest(message.idKey)
 		return ctx.Err()
 	case <-current.closed:
 		return nil
@@ -252,6 +280,16 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if err != nil || message.idKey == "" || current.coordinator == nil {
 		return errRoutingPolicy
 	}
+	request := &desktopRequest{method: message.method, threadID: threadID}
+	if !current.trackDesktopRequest(message, request) {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	forwarded := false
+	defer func() {
+		if !forwarded {
+			current.removeDesktopRequest(message.idKey)
+		}
+	}()
 	command, commandRecognized, commandErr := parseProviderCommand(message)
 	if commandErr != nil {
 		return current.writeProviderCommandError(ctx, message.id)
@@ -260,12 +298,14 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	defer release()
+	releaseOwned := true
+	defer func() {
+		if releaseOwned {
+			release()
+		}
+	}()
 
-	if current.isActive(threadID) {
-		return current.writeHandoffError(ctx, message.id)
-	}
-	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
+	if err := current.prepareTurnPeers(ctx, threadID); err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
 	if err := current.repairRecoveryJournal(ctx, threadID); err != nil {
@@ -328,11 +368,37 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return errRoutingPolicy
 	}
 	current.setActive(threadID, true)
-	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID})
+	request.releaseThread = release
+	// Keep the cross-process fence until app-server acknowledges turn/start.
+	// Otherwise a peer can observe an old idle status after this write and
+	// mistake this genuine in-flight request for a stale active cache.
+	releaseOwned = false
 	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
-		current.removeDesktopRequest(message.idKey)
 		current.setActive(threadID, false)
+		release()
 		return err
+	}
+	forwarded = true
+	return nil
+}
+
+func (current *session) prepareTurnPeers(ctx context.Context, threadID string) error {
+	if current.isActive(threadID) {
+		return errors.New("provider handoff session is active")
+	}
+	if err := current.coordinator.PrepareAll(ctx, threadID); err == nil {
+		return nil
+	}
+
+	_, _, status, err := current.findRolloutPath(ctx, threadID)
+	if err != nil || (status != "idle" && status != "systemError") {
+		return errors.New("provider handoff peers are active")
+	}
+	if err := current.coordinator.ReconcileIdleAll(ctx, threadID); err != nil {
+		return errors.New("reconcile provider handoff peers")
+	}
+	if err := current.coordinator.PrepareAll(ctx, threadID); err != nil {
+		return errors.New("provider handoff peer remained unavailable")
 	}
 	return nil
 }
@@ -393,6 +459,17 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err != nil || message.idKey == "" || current.coordinator == nil || message.params == nil {
 		return errRoutingPolicy
 	}
+	seen := make(chan struct{})
+	request := &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen}
+	if !current.trackDesktopRequest(message, request) {
+		return current.writeHandoffError(ctx, message.id)
+	}
+	forwarded := false
+	defer func() {
+		if !forwarded {
+			current.removeDesktopRequest(message.idKey)
+		}
+	}()
 	current.stateMu.Lock()
 	current.resumeTemplates[threadID] = cloneRawMap(message.params)
 	current.stateMu.Unlock()
@@ -433,19 +510,16 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		return errRoutingPolicy
 	}
 
-	seen := make(chan struct{})
-	current.trackDesktopRequest(message, &desktopRequest{method: message.method, threadID: threadID, responseSeen: seen})
 	current.clearEffectiveProvider(threadID)
 	current.setDetached(threadID, false)
 	if err := current.writeUpstream(ctx, websocket.MessageText, rewritten); err != nil {
-		current.removeDesktopRequest(message.idKey)
 		return err
 	}
+	forwarded = true
 	select {
 	case <-seen:
 		return nil
 	case <-ctx.Done():
-		current.removeDesktopRequest(message.idKey)
 		return ctx.Err()
 	case <-current.closed:
 		return nil
@@ -819,7 +893,7 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 	if current.codexHome == "" {
 		return "", nil
 	}
-	path, runtimeProvider, err := current.findRolloutPath(ctx, threadID)
+	path, runtimeProvider, _, err := current.findRolloutPath(ctx, threadID)
 	if err != nil {
 		return "", err
 	}
@@ -839,56 +913,72 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 
 // findRolloutPath uses thread/list because thread/read loads the thread and
 // takes Codex's writer lock before sanitation can inspect the rollout.
-func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, string, error) {
+func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, string, string, error) {
 	if threadID == "" {
-		return "", "", errors.New("invalid rollout thread")
+		return "", "", "", errors.New("invalid rollout thread")
 	}
 	seenCursors := make(map[string]bool)
 	cursor := ""
+	found := false
+	foundPath := ""
+	foundProvider := ""
+	foundStatus := ""
 	for page := 0; page < maxRolloutListPages; page++ {
 		params := map[string]json.RawMessage{
-			"limit": json.RawMessage(strconv.Itoa(rolloutListPageSize)),
+			"limit":          json.RawMessage(strconv.Itoa(rolloutListPageSize)),
+			"modelProviders": json.RawMessage("[]"),
 		}
 		if cursor != "" {
 			params["cursor"] = rawJSONString(cursor)
 		}
 		response, err := current.callUpstream(ctx, "thread/list", params)
 		if err != nil {
-			return "", "", errors.New("list rollout threads")
+			return "", "", "", errors.New("list rollout threads")
 		}
 		var result struct {
 			Data []struct {
 				ID            string  `json:"id"`
 				Path          *string `json:"path"`
 				ModelProvider string  `json:"modelProvider"`
+				Status        struct {
+					Type string `json:"type"`
+				} `json:"status"`
 			} `json:"data"`
 			NextCursor *string `json:"nextCursor"`
 		}
 		encoded, marshalErr := json.Marshal(response.result)
 		if marshalErr != nil || json.Unmarshal(encoded, &result) != nil || result.Data == nil {
-			return "", "", errors.New("invalid rollout thread list")
+			return "", "", "", errors.New("invalid rollout thread list")
 		}
 		for _, thread := range result.Data {
 			if thread.ID == "" {
-				return "", "", errors.New("invalid rollout thread list")
+				return "", "", "", errors.New("invalid rollout thread list")
 			}
 			if thread.ID == threadID {
-				if thread.Path == nil {
-					return "", thread.ModelProvider, nil
+				if found {
+					return "", "", "", errors.New("ambiguous rollout thread list")
 				}
-				return *thread.Path, thread.ModelProvider, nil
+				found = true
+				foundProvider = thread.ModelProvider
+				foundStatus = thread.Status.Type
+				if thread.Path != nil {
+					foundPath = *thread.Path
+				}
 			}
 		}
 		if result.NextCursor == nil || *result.NextCursor == "" {
-			return "", "", nil
+			if found {
+				return foundPath, foundProvider, foundStatus, nil
+			}
+			return "", "", "", nil
 		}
 		if seenCursors[*result.NextCursor] {
-			return "", "", errors.New("invalid rollout thread cursor")
+			return "", "", "", errors.New("invalid rollout thread cursor")
 		}
 		seenCursors[*result.NextCursor] = true
 		cursor = *result.NextCursor
 	}
-	return "", "", errors.New("rollout thread list exceeds limit")
+	return "", "", "", errors.New("rollout thread list exceeds limit")
 }
 
 func rewriteResumePath(payload []byte, path string) ([]byte, error) {
@@ -1039,13 +1129,20 @@ func (current *session) writeProviderCommandError(ctx context.Context, id json.R
 	return current.writeDownstream(ctx, websocket.MessageText, payload)
 }
 
-func (current *session) trackDesktopRequest(message rpcMessage, request *desktopRequest) {
+func (current *session) trackDesktopRequest(message rpcMessage, request *desktopRequest) bool {
 	if message.idKey == "" {
-		return
+		return false
 	}
 	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	if _, exists := current.desktop[message.idKey]; exists {
+		return false
+	}
+	if _, exists := current.internal[message.idKey]; exists {
+		return false
+	}
 	current.desktop[message.idKey] = request
-	current.stateMu.Unlock()
+	return true
 }
 
 func (current *session) removeDesktopRequest(idKey string) {
@@ -1131,6 +1228,9 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 			}
 		}
 		current.stateMu.Unlock()
+		if request != nil && request.releaseThread != nil {
+			request.releaseThread()
+		}
 		if request != nil && request.responseSeen != nil {
 			close(request.responseSeen)
 		}
@@ -1284,6 +1384,14 @@ func (current *session) Prepare(threadID string) handoff.PeerStatus {
 	return handoff.StatusReady
 }
 
+// ReconcileIdle clears a stale active notification cache after the
+// coordinating caller has verified authoritative quiescence under the shared
+// thread lock.
+func (current *session) ReconcileIdle(threadID string) handoff.PeerStatus {
+	current.setActive(threadID, false)
+	return handoff.StatusReady
+}
+
 // BeginRecovery installs exact notification suppression for one transaction.
 func (current *session) BeginRecovery(threadID string, ids []string) handoff.PeerStatus {
 	if threadID == "" || len(ids) == 0 || len(ids) > maxRecoveryThreads || current.isActive(threadID) {
@@ -1340,6 +1448,9 @@ func (current *session) closeState() {
 		current.internal = make(map[string]chan rpcMessage)
 		current.stateMu.Unlock()
 		for _, request := range requests {
+			if request.releaseThread != nil {
+				request.releaseThread()
+			}
 			if request.responseSeen != nil {
 				close(request.responseSeen)
 			}

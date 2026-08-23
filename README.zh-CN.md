@@ -44,7 +44,7 @@ Switcher 不会启动第二个 daemon，也不会修改任务数据库。没有�
 将 `VERSION` 改成需要安装的版本。以下命令会自动识别操作系统和 CPU 架构。
 
 ```bash
-VERSION="0.5.3"
+VERSION="0.5.6"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -146,6 +146,14 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 会短暂归档并还原受影响的任务，以卸载陈旧运行时；任务 ID、历史和子任务保持
 不变，也不会重新发送用户消息。订阅同一 app-server 任务的客户端都必须使用
 switcher wrapper；不支持绕过 wrapper 直接订阅 app-server。
+
+Desktop 或 Android SSH 的短连接结束后，旧 proxy 有时仍会在本地误记任务处于
+`active`，但 app-server 中的任务其实已经空闲。Switcher 在返回 handoff 错误
+`-32090` 前，现在会跨所有 provider 查询 app-server 的权威任务状态；只有状态
+精确为 `idle` 或 `systemError` 时才清除 peer 的陈旧本地状态。本连接确有活动
+turn、服务端状态仍为 active、响应异常或 peer 协调失败时，仍会在发送用户消息前
+关闭失败。新 turn 转发后，每任务 fence 会一直保留到 app-server 返回确认，因此
+确认到达前的真实在途请求不会被误判成陈旧状态。
 
 任务转交给其他 provider 时，Switcher 还会检查 rollout 中遗留的、与旧 provider
 绑定的 reasoning ID。它会在 app-server 加载历史前删除非法 reasoning 记录，并从
@@ -272,6 +280,10 @@ Codex 可执行文件的绝对路径。
 **切换被拒绝：** 先等待当前 turn 结束，同时确认 app-server 已配置目标供应商，
 并且 Codex CLI 不低于 0.146.0。升级 switcher 后请重新连接 Desktop SSH 主机，
 确保所有仍在运行的 proxy 使用同一版本。
+
+**后续消息返回 JSON-RPC `-32090`：** 升级到 v0.5.6 或更高版本，并将所有
+Desktop/Android SSH 客户端重新连接一次。该版本只会在 app-server 确认任务空闲后
+消除 peer 的陈旧 active 状态，真正运行中的任务仍会受到保护。
 
 **app-server socket 不可用：** 重新连接或重启 Codex Desktop 的远程主机，让
 它正常启动 app-server。Switcher 会按设计关闭失败，不会自行启动第二个 daemon。

@@ -64,6 +64,61 @@ func TestPrepareAllAbortsBeforeUnsubscribeWhenPeerBusy(t *testing.T) {
 	}
 }
 
+func TestReconcileIdleRequestClearsEveryPeer(t *testing.T) {
+	appSocket := filepath.Join(t.TempDir(), "app-server.sock")
+	handlers := []*testHandler{
+		{prepare: StatusBusy},
+		{prepare: StatusBusy},
+	}
+	coordinators := []*Coordinator{
+		openTestCoordinatorForSocket(t, appSocket, handlers[0]),
+		openTestCoordinatorForSocket(t, appSocket, handlers[1]),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinators[0].ReconcileIdleAll(ctx, "thr-a"); err != nil {
+		t.Fatalf("reconcile idle peers: %v", err)
+	}
+	if err := coordinators[0].PrepareAll(ctx, "thr-a"); err != nil {
+		t.Fatalf("prepare reconciled peers: %v", err)
+	}
+	for index, handler := range handlers {
+		if got := handler.reconcileCallCount(); got != 1 {
+			t.Fatalf("handler %d reconcile calls = %d, want 1", index, got)
+		}
+	}
+}
+
+func TestReconcileIdleFailsClosedWithLegacyPeer(t *testing.T) {
+	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusBusy})
+	legacyPath := filepath.Join(coordinator.directory, "session-legacy.sock")
+	listener, err := net.Listen("unix", legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(legacyPath)
+	})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		_, _ = readControlMessage(connection)
+		encoded, _ := json.Marshal(controlResponse{Error: true})
+		_, _ = connection.Write(append(encoded, '\n'))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.ReconcileIdleAll(ctx, "thr-a"); err == nil {
+		t.Fatal("ReconcileIdleAll() accepted a legacy peer")
+	}
+}
+
 func TestPrepareHandoffAllRequiresRouteCapablePeerBeforeMutation(t *testing.T) {
 	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
 	legacyPath := filepath.Join(coordinator.directory, "session-legacy.sock")
@@ -423,6 +478,7 @@ type testHandler struct {
 	recoveryEnd         int
 	recoveryIDs         []string
 	recoveryBeginStatus PeerStatus
+	reconcileCalls      int
 }
 
 func (handler *testHandler) BeginRecovery(_ string, ids []string) PeerStatus {
@@ -447,6 +503,14 @@ func (handler *testHandler) Prepare(string) PeerStatus {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	return handler.prepare
+}
+
+func (handler *testHandler) ReconcileIdle(string) PeerStatus {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	handler.reconcileCalls++
+	handler.prepare = StatusReady
+	return StatusReady
 }
 
 func (handler *testHandler) Unsubscribe(context.Context, string) (PeerStatus, error) {
@@ -493,6 +557,12 @@ func (handler *testHandler) recoveryResult() (int, int, []string) {
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	return handler.recoveryBegin, handler.recoveryEnd, append([]string(nil), handler.recoveryIDs...)
+}
+
+func (handler *testHandler) reconcileCallCount() int {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.reconcileCalls
 }
 
 func openTestCoordinator(t *testing.T, handler Handler) *Coordinator {

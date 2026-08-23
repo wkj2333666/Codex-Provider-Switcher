@@ -63,6 +63,7 @@ const (
 // Handler applies peer requests to one proxy connection.
 type Handler interface {
 	Prepare(threadID string) PeerStatus
+	ReconcileIdle(threadID string) PeerStatus
 	BeginRecovery(threadID string, ids []string) PeerStatus
 	EndRecovery(threadID string) PeerStatus
 	Unsubscribe(context.Context, string) (PeerStatus, error)
@@ -185,6 +186,14 @@ func (coordinator *Coordinator) PrepareHandoffAll(ctx context.Context, threadID 
 // PrepareRecoveryAll verifies recovery protocol support without changing state.
 func (coordinator *Coordinator) PrepareRecoveryAll(ctx context.Context, threadID string) error {
 	return coordinator.visitPeers(ctx, controlRequest{Method: "prepareRecoveryV1", ThreadID: threadID}, func(status PeerStatus) bool {
+		return status == StatusReady
+	})
+}
+
+// ReconcileIdleAll clears stale per-peer active state only after the caller
+// has verified an idle app-server state while holding the thread lock.
+func (coordinator *Coordinator) ReconcileIdleAll(ctx context.Context, threadID string) error {
+	return coordinator.visitPeers(ctx, controlRequest{Method: "reconcileIdleV1", ThreadID: threadID}, func(status PeerStatus) bool {
 		return status == StatusReady
 	})
 }
@@ -377,6 +386,8 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
 	case "prepareRecoveryV1":
 		response.Status = coordinator.handler.Prepare(request.ThreadID)
+	case "reconcileIdleV1":
+		response.Status = coordinator.handler.ReconcileIdle(request.ThreadID)
 	case "beginRecoveryV1":
 		if !validRecoveryIDs(request.ThreadID, request.IDs) {
 			response.Error = true

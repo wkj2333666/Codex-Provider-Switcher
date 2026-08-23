@@ -599,6 +599,61 @@ func TestRunRejectsConcurrentSameProviderTurnBeforePeerNotification(t *testing.T
 	waitProxyDone(t, secondDone)
 }
 
+func TestRunKeepsThreadFenceUntilAppServerAcknowledgesTurnStart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, false)
+	server.listIncludesRoot = true
+	server.turnStartGate = make(chan struct{})
+	server.firstTurnReceived = make(chan struct{})
+	first, firstDone := dialProviderProxy(t, ctx, server.socket, "openai")
+	second, secondDone := dialProviderProxy(t, ctx, server.socket, "openai")
+	defer first.CloseNow()
+	defer second.CloseNow()
+
+	initializeTestClient(t, ctx, first)
+	initializeTestClient(t, ctx, second)
+	resumeTestThread(t, ctx, first, 2)
+	resumeTestThread(t, ctx, second, 2)
+
+	sendRPC(t, ctx, first, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input":    []any{},
+	})
+	select {
+	case <-server.firstTurnReceived:
+	case <-ctx.Done():
+		t.Fatal("app-server did not receive first turn")
+	}
+	sendRPC(t, ctx, second, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input":    []any{},
+	})
+	time.Sleep(100 * time.Millisecond)
+	if calls := server.turnStartCallCount(); calls != 1 {
+		t.Fatalf("app-server turn/start calls before first acknowledgement = %d, want 1", calls)
+	}
+
+	close(server.turnStartGate)
+	firstResponse := readResponse(t, ctx, first, `3`)
+	if firstResponse.errorCode != 0 {
+		t.Fatalf("first turn response = %#v", firstResponse)
+	}
+	secondResponse := readResponse(t, ctx, second, `3`)
+	if secondResponse.errorCode != handoffErrorCode || secondResponse.errorMessage != handoffUnavailableMessage {
+		t.Fatalf("concurrent turn response = %#v", secondResponse)
+	}
+	if calls := server.turnStartCallCount(); calls != 1 {
+		t.Fatalf("app-server turn/start calls = %d, want 1", calls)
+	}
+
+	cancel()
+	_ = first.CloseNow()
+	_ = second.CloseNow()
+	waitProxyDone(t, firstDone)
+	waitProxyDone(t, secondDone)
+}
+
 func TestRunRejectsHandoffWhilePeerTurnIsActive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -794,6 +849,9 @@ type handoffAppServer struct {
 	stickyIdle              bool
 	softReloaded            bool
 	readStatus              string
+	listIncludesRoot        bool
+	turnStartGate           chan struct{}
+	firstTurnReceived       chan struct{}
 }
 
 type handoffTurnRecord struct {
@@ -992,8 +1050,20 @@ func (server *handoffAppServer) handleRead(connection *websocket.Conn, message r
 func (server *handoffAppServer) handleList(connection *websocket.Conn, message rpcMessage) {
 	server.mu.Lock()
 	descendants := append([]string(nil), server.descendants...)
+	includeRoot := server.listIncludesRoot
+	rootProvider := server.provider
+	rootStatus := "idle"
+	if server.active {
+		rootStatus = "active"
+	}
 	server.mu.Unlock()
-	data := make([]map[string]any, 0, len(descendants))
+	data := make([]map[string]any, 0, len(descendants)+1)
+	if includeRoot {
+		data = append(data, map[string]any{
+			"id": "thr-shared", "path": nil, "status": map[string]any{"type": rootStatus},
+			"modelProvider": rootProvider,
+		})
+	}
 	for _, id := range descendants {
 		data = append(data, map[string]any{"id": id, "parentThreadId": "thr-shared"})
 	}
@@ -1067,6 +1137,21 @@ func (server *handoffAppServer) handleTurnStart(connection *websocket.Conn, mess
 	input := append(json.RawMessage(nil), message.params["input"]...)
 	server.mu.Lock()
 	server.turnStarts++
+	turnNumber := server.turnStarts
+	turnStartGate := server.turnStartGate
+	firstTurnReceived := server.firstTurnReceived
+	server.mu.Unlock()
+	if turnNumber == 1 && firstTurnReceived != nil {
+		close(firstTurnReceived)
+	}
+	if turnNumber == 1 && turnStartGate != nil {
+		select {
+		case <-turnStartGate:
+		case <-server.ctx.Done():
+			return
+		}
+	}
+	server.mu.Lock()
 	if server.active {
 		server.mu.Unlock()
 		server.writeError(connection, message.id, -32001, "turn already active")

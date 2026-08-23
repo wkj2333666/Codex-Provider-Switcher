@@ -301,10 +301,23 @@ so Codex retains its full configuration precedence, profiles, project settings,
 CLI overrides, and built-in defaults. Diagnostics never format message bodies,
 prompts, handshake values, environment contents, or credentials.
 
-Provider handoff is also fail closed. A peer reporting an active turn aborts in
-the prepare phase before any unsubscribe occurs. A second-phase failure, an
-older server, or an ineligible returned provider mismatch keeps the original
-turn from reaching app-server and produces static JSON-RPC error `-32090`.
+Every downstream JSON-RPC request ID is reserved until its matching response or
+connection close, including methods otherwise passed through byte-for-byte.
+Reusing an outstanding ID is rejected before routing or handoff mutation, so a
+response cannot be associated with another request or release another task's
+thread fence.
+
+Provider handoff is also fail closed. A locally active sender aborts in the
+prepare phase before any unsubscribe occurs. If the sending connection is idle
+but another peer reports busy, the sender queries authoritative
+`thread/list` state with `modelProviders: []` while it still owns the shared
+thread lock. Only exact `idle` or `systemError` permits the versioned
+`reconcileIdleV1` request to clear peer-local active caches, after which prepare
+must succeed on every peer. A locally active sender is rejected without this
+query. Unknown, malformed, active, query-error, partial reconciliation, and
+second-prepare states all remain fail closed. A second-phase failure, an older
+server, or an ineligible returned provider mismatch keeps the original turn
+from reaching app-server and produces static JSON-RPC error `-32090`.
 Automatic recovery changes only a verified same-id mismatch whose fresh
 `thread/read` status is exactly `idle` or `systemError`; active, empty,
 malformed, RPC-error, and unknown statuses fail closed without archive. Direct
@@ -312,8 +325,13 @@ subscribers remain outside the supported deployment boundary rather than a
 condition the switcher can reliably detect.
 
 The prepare phase runs for every send, including the same-provider path. The
-sender marks its thread active before writing upstream while still holding the
-cross-process lock; a second peer therefore observes `busy` even if its
+sender marks its thread active before writing upstream and transfers ownership
+of the cross-process thread lock to the tracked desktop request. The lock is
+released only when app-server acknowledges `turn/start`, or when the connection
+closes; a write error releases it after removing the request and active marker.
+This closes the interval in which the request is already on the socket but an
+independent `thread/list` can still show the previous idle state. After a
+successful acknowledgement, a second peer observes `busy` even if its own
 app-server `turn/started` notification has not arrived yet.
 
 Cross-provider sends then use the distinct `prepareHandoffV3` control method.
