@@ -147,12 +147,12 @@ export PATH="$HOME/.local/lib/codex-provider-switcher/bin:$PATH"
 不变，也不会重新发送用户消息。订阅同一 app-server 任务的客户端都必须使用
 switcher wrapper；不支持绕过 wrapper 直接订阅 app-server。
 
-任务恢复或转交给其他 provider 时，Switcher 还会检查 rollout 中遗留的、与旧
-provider 绑定的 reasoning ID。它会在 app-server 加载历史前删除非法 reasoning
-记录，并从普通消息和工具调用中移除可选的过期 item ID；用户可见消息和工具调用
-配对保持不变。重写采用原子替换。JSONL 损坏，或确需重写时 Codex 仍持有 writer
-lock，都会直接拒绝操作；已经干净的 rollout 只做无副作用检查，也绝不会伪造
-`rs_` ID。
+任务转交给其他 provider 时，Switcher 还会检查 rollout 中遗留的、与旧 provider
+绑定的 reasoning ID。它会在 app-server 加载历史前删除非法 reasoning 记录，并从
+普通消息和工具调用中移除可选的过期 item ID；同一 provider 内恢复任务会直接透传，
+不会重写仍然有效的 provider 绑定历史。跨 provider 重写采用原子替换，并保持用户
+可见消息和工具调用配对不变。JSONL 损坏，或确需重写时 Codex 仍持有 writer lock，
+都会直接拒绝操作；已经干净的 rollout 只做无副作用检查，也绝不会伪造 `rs_` ID。
 
 ### 5. 验证并重新连接 Desktop
 

@@ -703,7 +703,7 @@ func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
 	}
 	current = newTestSession(t, writer, nil)
 	current.codexHome = home
-	if _, err := current.sanitizeThreadRollout(context.Background(), "thr-a"); err != nil {
+	if _, err := current.sanitizeThreadRollout(context.Background(), "thr-a", ""); err != nil {
 		t.Fatalf("sanitizeThreadRollout() error = %v", err)
 	}
 	cleaned, err := os.ReadFile(path)
@@ -1989,7 +1989,7 @@ func TestSessionResumeUsesStoredProvider(t *testing.T) {
 		}
 		if message.method == "thread/list" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
-				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, rolloutPath)))
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q,"modelProvider":"openai"}],"nextCursor":null}}`, message.idKey, rolloutPath)))
 		}
 		if message.method == "thread/read" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
@@ -2076,7 +2076,7 @@ func TestSessionResumeSanitizesIdleLockedRolloutThroughHandoff(t *testing.T) {
 		}
 		if message.method == "thread/list" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
-				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, rolloutPath)))
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q,"modelProvider":"openai"}],"nextCursor":null}}`, message.idKey, rolloutPath)))
 		}
 		if message.method == "thread/read" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
@@ -2115,6 +2115,88 @@ func TestSessionResumeSanitizesIdleLockedRolloutThroughHandoff(t *testing.T) {
 	}
 	if !sawDesktopResume {
 		t.Fatalf("desktop resume was not forwarded after sanitation: %q", messages)
+	}
+}
+
+func TestSessionResumeSameProviderSkipsLockedRolloutSanitation(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	dateDir := filepath.Join(home, "sessions", "2026", "08", "23")
+	lockDir := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(dateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(dateDir, "rollout-2026-08-23T00-00-00-thr-a.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thr-a"}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"reasoning","id":"item_same_provider"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(lockDir, "thr-a.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	selections := &fakeProviderSelections{values: map[string]string{"thr-a": "sub2api"}}
+	coordinator := &fakeHandoffCoordinator{}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		switch message.method {
+		case "thread/list":
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q,"modelProvider":"sub2api"}],"nextCursor":null}}`,
+				message.idKey, rolloutPath)))
+		case "thread/resume":
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"sub2api"}}`, message.idKey)))
+		default:
+			return nil
+		}
+	}
+	current = newTestSession(t, writer, nil)
+	current.codexHome = home
+	current.selections = selections
+	current.coordinator = coordinator
+
+	request := []byte(`{"id":27,"method":"thread/resume","params":{"threadId":"thr-a"}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.unsubscribeCalls != 0 || coordinator.resubscribeCalls != 0 {
+		t.Fatalf("same-provider resume triggered handoff: %#v", coordinator)
+	}
+	messages := upstream.messages()
+	var desktopResume bool
+	for _, payload := range messages {
+		message, parseErr := parseRPCMessage(payload)
+		if parseErr == nil && message.method == "thread/resume" && message.idKey == "27" {
+			desktopResume = true
+		}
+	}
+	if !desktopResume {
+		t.Fatalf("same-provider resume was not forwarded: %q", messages)
+	}
+	unchanged, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unchanged), "item_same_provider") {
+		t.Fatalf("same-provider rollout was unexpectedly rewritten: %s", unchanged)
 	}
 }
 

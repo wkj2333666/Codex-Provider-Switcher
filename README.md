@@ -151,13 +151,14 @@ never resends the user's message. Every client that subscribes to the same
 app-server threads must use the switcher wrapper; direct app-server subscribers
 are unsupported.
 
-When a task is resumed or handed to another provider, the switcher also checks
-its rollout for stale provider-bound reasoning IDs. Invalid reasoning records
-are removed and stale optional item IDs are stripped before app-server loads
-the history. The rewrite is atomic and keeps visible messages and tool-call
-pairs. Malformed JSONL, or an active Codex writer when a rewrite is required,
-makes the operation fail closed; clean rollouts remain a no-op and the
-switcher never invents an `rs_` ID.
+When a task is handed to another provider, the switcher also checks its rollout
+for stale provider-bound reasoning IDs. Invalid reasoning records are removed
+and stale optional item IDs are stripped before app-server loads the history.
+A same-provider resume is passed through without rewriting valid provider-bound
+history. Cross-provider rewrites are atomic and keep visible messages and
+tool-call pairs. Malformed JSONL, or an active Codex writer when a rewrite is
+required, makes the operation fail closed; clean rollouts remain a no-op and
+the switcher never invents an `rs_` ID.
 
 ### 5. Verify and reconnect Desktop
 

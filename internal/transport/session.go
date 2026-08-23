@@ -409,7 +409,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID)
+	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID, targetRoute.Provider)
 	if errors.Is(err, rollout.ErrActiveWriter) {
 		// App-server keeps an idle thread's writer lock while it is loaded. A
 		// rollout that needs sanitation must therefore go through the same
@@ -417,7 +417,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
-		rolloutPath, err = current.sanitizeThreadRollout(ctx, threadID)
+		rolloutPath, err = current.sanitizeThreadRollout(ctx, threadID, targetRoute.Provider)
 	}
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
@@ -470,7 +470,7 @@ func (current *session) handoff(ctx context.Context, threadID string, targetRout
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff stage update failed")
 	}
-	if _, err := current.sanitizeThreadRollout(ctx, threadID); err != nil {
+	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff rollout sanitation failed")
 	}
@@ -815,16 +815,19 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	return nil
 }
 
-func (current *session) sanitizeThreadRollout(ctx context.Context, threadID string) (string, error) {
+func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, expectedProvider string) (string, error) {
 	if current.codexHome == "" {
 		return "", nil
 	}
-	path, err := current.findRolloutPath(ctx, threadID)
+	path, runtimeProvider, err := current.findRolloutPath(ctx, threadID)
 	if err != nil {
 		return "", err
 	}
 	if path == "" {
 		return "", nil
+	}
+	if expectedProvider != "" && runtimeProvider == expectedProvider {
+		return path, nil
 	}
 	if err := rollout.ValidatePath(current.codexHome, threadID, path); err != nil {
 		return "", err
@@ -836,9 +839,9 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID stri
 
 // findRolloutPath uses thread/list because thread/read loads the thread and
 // takes Codex's writer lock before sanitation can inspect the rollout.
-func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, error) {
+func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, string, error) {
 	if threadID == "" {
-		return "", errors.New("invalid rollout thread")
+		return "", "", errors.New("invalid rollout thread")
 	}
 	seenCursors := make(map[string]bool)
 	cursor := ""
@@ -851,40 +854,41 @@ func (current *session) findRolloutPath(ctx context.Context, threadID string) (s
 		}
 		response, err := current.callUpstream(ctx, "thread/list", params)
 		if err != nil {
-			return "", errors.New("list rollout threads")
+			return "", "", errors.New("list rollout threads")
 		}
 		var result struct {
 			Data []struct {
-				ID   string  `json:"id"`
-				Path *string `json:"path"`
+				ID            string  `json:"id"`
+				Path          *string `json:"path"`
+				ModelProvider string  `json:"modelProvider"`
 			} `json:"data"`
 			NextCursor *string `json:"nextCursor"`
 		}
 		encoded, marshalErr := json.Marshal(response.result)
 		if marshalErr != nil || json.Unmarshal(encoded, &result) != nil || result.Data == nil {
-			return "", errors.New("invalid rollout thread list")
+			return "", "", errors.New("invalid rollout thread list")
 		}
 		for _, thread := range result.Data {
 			if thread.ID == "" {
-				return "", errors.New("invalid rollout thread list")
+				return "", "", errors.New("invalid rollout thread list")
 			}
 			if thread.ID == threadID {
 				if thread.Path == nil {
-					return "", nil
+					return "", thread.ModelProvider, nil
 				}
-				return *thread.Path, nil
+				return *thread.Path, thread.ModelProvider, nil
 			}
 		}
 		if result.NextCursor == nil || *result.NextCursor == "" {
-			return "", nil
+			return "", "", nil
 		}
 		if seenCursors[*result.NextCursor] {
-			return "", errors.New("invalid rollout thread cursor")
+			return "", "", errors.New("invalid rollout thread cursor")
 		}
 		seenCursors[*result.NextCursor] = true
 		cursor = *result.NextCursor
 	}
-	return "", errors.New("rollout thread list exceeds limit")
+	return "", "", errors.New("rollout thread list exceeds limit")
 }
 
 func rewriteResumePath(payload []byte, path string) ([]byte, error) {

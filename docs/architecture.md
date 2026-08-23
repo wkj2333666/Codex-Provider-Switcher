@@ -45,7 +45,7 @@ an interrupted archive/unarchive transaction after a process or machine
 restart.
 
 `internal/rollout` validates the exact JSONL rollout path returned by
-`thread/read` under `CODEX_HOME` and performs a conservative pre-load sanitation.
+`thread/list` under `CODEX_HOME` and performs a conservative pre-load sanitation.
 It removes invalid provider-bound
 reasoning records, strips stale optional `item_` IDs from other response items,
 preserves visible content and call pairs, and commits only through a same-directory
@@ -198,12 +198,15 @@ Missing runtime state is shown as `Runtime provider: unknown.`; no saved
 override is shown as `Selected provider: app-server configuration.` If
 selection and runtime differ, the response says the selection `will be applied before the next model turn`.
 
-Ordinary `thread/resume` uses the same lock, sanitizes the task rollout before
-forwarding the resume, and holds the lock through the app-server response, so a
-new subscriber cannot appear midway through handoff. A handoff sanitizes only
+Ordinary `thread/resume` uses the same lock and reads the authoritative rollout
+path and runtime provider from `thread/list` before forwarding the resume. If
+the runtime provider already matches the selected provider, it leaves valid
+provider-bound history untouched; this also allows a loaded task whose writer
+lock is still held to resume normally. A cross-provider handoff sanitizes only
 after every ready peer has unsubscribed and before the first internal resume;
-resubscribing peers do not repeat the disk rewrite. Internal request ids and
-their responses never reach Desktop.
+resubscribing peers do not repeat the disk rewrite. The lock remains held
+through the app-server response so a new subscriber cannot appear midway
+through handoff. Internal request ids and their responses never reach Desktop.
 
 Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before
