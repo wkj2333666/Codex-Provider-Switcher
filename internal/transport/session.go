@@ -47,6 +47,7 @@ type handoffCoordinator interface {
 	MarkDirty(string) error
 	SetDirtyStage(string, handoff.DirtyStage) error
 	IsDirty(string) bool
+	ReadDirtyStage(string) (handoff.DirtyStage, bool, error)
 	ClearDirty(string) error
 	BeginRecoveryAll(context.Context, string, []string) error
 	EndRecoveryAll(context.Context, string) error
@@ -69,6 +70,7 @@ type recoveryJournals interface {
 type desktopRequest struct {
 	method        string
 	threadID      string
+	targetRoute   modelroute.Route
 	responseSeen  chan struct{}
 	responseOK    bool
 	releaseThread func()
@@ -340,7 +342,19 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 			}
 		}
 	}
-	if current.coordinator.IsDirty(threadID) || !routeMatches(current.effectiveRoute(threadID), targetRoute) {
+	effectiveRoute := current.effectiveRoute(threadID)
+	if current.coordinator.IsDirty(threadID) {
+		stage, found, stageErr := current.coordinator.ReadDirtyStage(threadID)
+		if !commandRecognized && sameProvider(effectiveRoute, targetRoute) &&
+			stageErr == nil && found && stage == handoff.DirtyStageUnsubscribed {
+			if err := current.repairSameProviderDirty(ctx, threadID, targetRoute.Provider); err != nil {
+				return current.writeHandoffError(ctx, message.id)
+			}
+		} else if err := current.handoff(ctx, threadID, targetRoute); err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
+	} else if (commandRecognized && !routeMatches(effectiveRoute, targetRoute)) ||
+		(!commandRecognized && !sameProvider(effectiveRoute, targetRoute)) {
 		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
@@ -368,6 +382,7 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return errRoutingPolicy
 	}
 	current.setActive(threadID, true)
+	request.targetRoute = targetRoute
 	request.releaseThread = release
 	// Keep the cross-process fence until app-server acknowledges turn/start.
 	// Otherwise a peer can observe an old idle status after this write and
@@ -379,6 +394,23 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 		return err
 	}
 	forwarded = true
+	return nil
+}
+
+func (current *session) repairSameProviderDirty(ctx context.Context, threadID, provider string) error {
+	if !providerid.Valid(provider) {
+		return errors.New("invalid same-provider handoff repair")
+	}
+	if err := current.coordinator.PrepareHandoffAll(ctx, threadID); err != nil {
+		return errors.New("same-provider handoff repair capability check failed")
+	}
+	if err := current.coordinator.ResubscribeAll(ctx, threadID, modelroute.Route{Provider: provider}); err != nil {
+		current.restoreAfterHandoffFailure(threadID)
+		return errors.New("same-provider handoff repair resubscribe failed")
+	}
+	if err := current.coordinator.ClearDirty(threadID); err != nil {
+		return errors.New("same-provider handoff repair dirty marker clear failed")
+	}
 	return nil
 }
 
@@ -800,6 +832,10 @@ func routeMatches(actual, expected modelroute.Route) bool {
 	return actual.Provider == expected.Provider && (expected.Model == "" || actual.Model == expected.Model)
 }
 
+func sameProvider(actual, expected modelroute.Route) bool {
+	return actual.Provider != "" && actual.Provider == expected.Provider
+}
+
 func requestedModel(params map[string]json.RawMessage) (string, bool, error) {
 	if params == nil {
 		return "", false, nil
@@ -1205,6 +1241,9 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 		if request != nil {
 			delete(current.desktop, message.idKey)
 			request.responseOK = !message.hasError
+			if request.method == "turn/start" {
+				request.responseOK = responseTurnAccepted(message)
+			}
 			if threadID, route, ok := responseThreadRoute(message); ok &&
 				(request.method == "thread/start" || request.method == "thread/resume" || request.method == "thread/fork") {
 				current.effective[threadID] = route.Provider
@@ -1215,10 +1254,14 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 				}
 			}
 			if request.method == "turn/start" {
-				if message.hasError {
+				if !request.responseOK {
 					delete(current.active, request.threadID)
 				} else {
 					delete(current.fresh, request.threadID)
+					if providerid.Valid(request.targetRoute.Provider) {
+						current.effective[request.threadID] = request.targetRoute.Provider
+						current.effectiveModel[request.threadID] = request.targetRoute.Model
+					}
 				}
 			}
 			if request.method == "thread/unsubscribe" && !message.hasError {

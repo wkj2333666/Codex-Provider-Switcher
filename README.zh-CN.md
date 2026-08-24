@@ -44,7 +44,7 @@ Switcher 不会启动第二个 daemon，也不会修改任务数据库。没有�
 将 `VERSION` 改成需要安装的版本。以下命令会自动识别操作系统和 CPU 架构。
 
 ```bash
-VERSION="0.5.6"
+VERSION="0.5.7"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -110,7 +110,8 @@ printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5
 ```
 
 切换 provider 时使用默认 model。Desktop 随后选择 allowlist 内的模型时，switcher
-会保存该任务的精确 model；跨 provider 或未列出的值不会改变路由。JSON 格式错误、
+会保存该任务的精确 model；同一 provider 内换模型直接在下一轮生效，不执行 provider
+handoff。跨 provider 或未列出的值不会改变路由。JSON 格式错误、
 无效值、符号链接和非常规文件都会使 switcher 在代理 Desktop 前关闭请求。
 
 要让第三方模型出现在 Desktop picker 中，还需在 `~/.codex/config.toml` 顶层加载
@@ -281,9 +282,10 @@ Codex 可执行文件的绝对路径。
 并且 Codex CLI 不低于 0.146.0。升级 switcher 后请重新连接 Desktop SSH 主机，
 确保所有仍在运行的 proxy 使用同一版本。
 
-**后续消息返回 JSON-RPC `-32090`：** 升级到 v0.5.6 或更高版本，并将所有
-Desktop/Android SSH 客户端重新连接一次。该版本只会在 app-server 确认任务空闲后
-消除 peer 的陈旧 active 状态，真正运行中的任务仍会受到保护。
+**后续消息返回 JSON-RPC `-32090`：** 升级到 v0.5.7 或更高版本，并将所有
+Desktop/Android SSH 客户端重新连接一次。该版本既会在 app-server 确认任务空闲后
+消除 peer 的陈旧 active 状态，也不会把同一 provider 内的 model 变化误当成需要
+rollout 写锁的完整 handoff；真正运行中的任务和跨 provider 历史仍会受到保护。
 
 **app-server socket 不可用：** 重新连接或重启 Codex Desktop 的远程主机，让
 它正常启动 app-server。Switcher 会按设计关闭失败，不会自行启动第二个 daemon。

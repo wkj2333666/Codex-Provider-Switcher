@@ -158,6 +158,14 @@ thread flock
   -> forward original turn/start
 ```
 
+A model-only change inside the verified effective provider does not run this
+sequence. The switcher rewrites the next `turn/start` to the selected model and
+updates its effective route only after app-server acknowledges that request.
+If an earlier model-only handoff left a dirty marker, every peer must first pass
+the handoff capability check; detached peers are restored with a provider-only
+route and the marker is cleared before the turn is forwarded. A provider change
+still requires the full fail-closed sequence above.
+
 The exact user-facing `/provider switch <name>` command uses the same sequence
 but does not forward the original `turn/start`. Current Desktop encodes an
 invocation selected from the provider skill as one text item such as
@@ -212,16 +220,22 @@ Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before
 the turn begins, so previously open Desktop views continue receiving item and
 turn notifications. Explicit Desktop unsubscribe clears detach state and is
-never reversed. The versioned dirty marker contains only a bounded stage name
-and is removed only after the sender resume and all peer resubscribes succeed.
-Legacy empty markers remain dirty and force the same complete transaction.
+never reversed. The versioned dirty marker contains only a bounded stage name.
+On the full handoff path it is removed only after the sender resume and all peer
+resubscribes succeed.
+Legacy empty, corrupt, non-private, and non-regular markers remain dirty and
+force the same complete transaction.
 
 Any failure after the marker is created runs best-effort `restore` against all
 peers, continuing after individual errors. Detached peers resume with only the
 thread id and accept the app-server's actual provider, so recovery does not
-request another provider transition. The marker remains after failure; every
-session checks it before the same-provider fast path, forcing the next sender
-through a complete handoff.
+request another provider transition. The marker remains after failure and every
+session checks it before the same-provider fast path. An ordinary turn whose
+verified runtime provider still matches its target may repair an exact,
+strictly decoded `unsubscribed` marker by capability-checking all peers,
+restoring only detached peers with a provider-only route, and then clearing the
+marker. Every other stage, an explicit provider command, a provider mismatch,
+or an unreadable marker forces the next sender through a complete handoff.
 
 Recovery uses a separate initialized app-server connection with experimental
 API access. Before archive, every peer acknowledges the complete root and
@@ -274,8 +288,9 @@ command:
   response, and both model fields are handled under the provider-handoff lock.
 - Ordinary `turn/start` may adopt an allowlisted same-provider model only while
   migrating provider-only legacy/direct state. Once an exact route is saved,
-  stale turn fields cannot replace it. The turn is held until that exact route
-  is ready; both model fields are replaced while input remains unchanged. When
+  stale turn fields cannot replace it. Both model fields are replaced while
+  input remains unchanged, and a model-only change is committed to the runtime
+  route only after app-server accepts `turn/start`. When
   Desktop supplies different picker values, the collaboration settings model
   wins because app-server gives it precedence; a JSON `null` picker value is
   treated as absent. A picker value can never leave the selected provider's

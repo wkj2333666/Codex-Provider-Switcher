@@ -4,6 +4,7 @@ package handoff
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -272,6 +274,75 @@ func (coordinator *Coordinator) IsDirty(threadID string) bool {
 		return false
 	}
 	return true
+}
+
+// ReadDirtyStage returns the last verified boundary of an incomplete handoff.
+func (coordinator *Coordinator) ReadDirtyStage(threadID string) (DirtyStage, bool, error) {
+	if threadID == "" {
+		return "", false, errors.New("invalid dirty handoff thread")
+	}
+	path := coordinator.threadStatePath("dirty", threadID, ".state")
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, errors.New("open dirty handoff stage")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode() != 0o600 ||
+		info.Size() <= 0 || info.Size() > controlMessageLimit {
+		return "", false, errors.New("inspect dirty handoff stage")
+	}
+	encoded, err := io.ReadAll(io.LimitReader(file, controlMessageLimit+1))
+	if err != nil || len(encoded) > controlMessageLimit {
+		return "", false, errors.New("read dirty handoff stage")
+	}
+	record, err := decodeDirtyRecord(encoded)
+	if err != nil {
+		return "", false, errors.New("invalid dirty handoff stage")
+	}
+	return record.Stage, true, nil
+}
+
+func decodeDirtyRecord(encoded []byte) (dirtyRecord, error) {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return dirtyRecord{}, errors.New("invalid dirty handoff record")
+	}
+	var record dirtyRecord
+	seen := make(map[string]struct{}, 2)
+	for decoder.More() {
+		rawKey, err := decoder.Token()
+		key, ok := rawKey.(string)
+		if err != nil || !ok {
+			return dirtyRecord{}, errors.New("invalid dirty handoff record")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return dirtyRecord{}, errors.New("invalid dirty handoff record")
+		}
+		seen[key] = struct{}{}
+		switch key {
+		case "version":
+			if decoder.Decode(&record.Version) != nil {
+				return dirtyRecord{}, errors.New("invalid dirty handoff record")
+			}
+		case "stage":
+			if decoder.Decode(&record.Stage) != nil {
+				return dirtyRecord{}, errors.New("invalid dirty handoff record")
+			}
+		default:
+			return dirtyRecord{}, errors.New("invalid dirty handoff record")
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') || decoder.Decode(&struct{}{}) != io.EOF ||
+		len(seen) != 2 || record.Version != 1 || !validDirtyStage(record.Stage) {
+		return dirtyRecord{}, errors.New("invalid dirty handoff record")
+	}
+	return record, nil
 }
 
 // ClearDirty removes the marker only after every handoff phase succeeds.

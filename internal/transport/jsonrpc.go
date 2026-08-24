@@ -192,6 +192,18 @@ func responseThreadName(message rpcMessage) string {
 	return name
 }
 
+func responseTurnAccepted(message rpcMessage) bool {
+	if message.kind != rpcResponse || message.hasError || message.result == nil {
+		return false
+	}
+	turn := decodeObject(message.result["turn"])
+	if turn == nil {
+		return false
+	}
+	var turnID string
+	return json.Unmarshal(turn["id"], &turnID) == nil && turnID != ""
+}
+
 func encodeRPCRequest(id, method string, params map[string]json.RawMessage) ([]byte, error) {
 	envelope := struct {
 		JSONRPC string                     `json:"jsonrpc"`

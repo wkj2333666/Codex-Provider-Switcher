@@ -249,9 +249,47 @@ func TestDirtyStageRejectsInvalidValueAndReplacesLegacyMarker(t *testing.T) {
 	assertDirtyStage(t, coordinator, "thr-a", DirtyStageResumeMismatch)
 }
 
+func TestReadDirtyStageRejectsAmbiguousRecords(t *testing.T) {
+	t.Parallel()
+	tests := []string{
+		`{"version":1,"stage":"unsubscribed","stage":"prepared"}`,
+		`{"version":1,"stage":"unsubscribed","extra":true}`,
+		`{"version":2,"stage":"unsubscribed"}`,
+	}
+	for _, encoded := range tests {
+		coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
+		path := coordinator.threadStatePath("dirty", "thr-ambiguous", ".state")
+		if err := os.WriteFile(path, []byte(encoded), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := coordinator.ReadDirtyStage("thr-ambiguous"); err == nil || found {
+			t.Fatalf("ReadDirtyStage() accepted ambiguous record %q", encoded)
+		}
+	}
+}
+
+func TestReadDirtyStageRejectsWrongPermissions(t *testing.T) {
+	t.Parallel()
+	coordinator := openTestCoordinator(t, &testHandler{prepare: StatusReady})
+	path := coordinator.threadStatePath("dirty", "thr-permissions", ".state")
+	if err := os.WriteFile(path, []byte(`{"version":1,"stage":"unsubscribed"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := coordinator.ReadDirtyStage("thr-permissions"); err == nil || found {
+		t.Fatal("ReadDirtyStage() accepted non-private marker")
+	}
+}
+
 func assertDirtyStage(t *testing.T, coordinator *Coordinator, threadID string, want DirtyStage) {
 	t.Helper()
 	path := coordinator.threadStatePath("dirty", threadID, ".state")
+	got, found, stageErr := coordinator.ReadDirtyStage(threadID)
+	if stageErr != nil || !found || got != want {
+		t.Fatalf("ReadDirtyStage() = %q, %v, %v; want %q, true, nil", got, found, stageErr, want)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

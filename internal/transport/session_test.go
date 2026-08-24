@@ -215,7 +215,7 @@ func TestSessionDefersUnsavedProviderToAppServer(t *testing.T) {
 	}
 }
 
-func TestSessionResolvesUnsavedEffectiveProviderThroughCatalogBeforeFirstTurn(t *testing.T) {
+func TestSessionAppliesUnsavedEffectiveProviderCatalogModelOnFirstTurn(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
 	selections := &fakeProviderSelections{values: map[string]string{}}
@@ -253,10 +253,10 @@ func TestSessionResolvesUnsavedEffectiveProviderThroughCatalogBeforeFirstTurn(t 
 		t.Fatal(err)
 	}
 	messages := upstream.messages()
-	if len(messages) != 2 {
-		t.Fatalf("upstream messages = %q, want verified resume then ordinary turn", messages)
+	if len(messages) != 1 {
+		t.Fatalf("upstream messages = %q, want one ordinary turn", messages)
 	}
-	turn, err := parseRPCMessage(messages[1])
+	turn, err := parseRPCMessage(messages[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,9 +266,9 @@ func TestSessionResolvesUnsavedEffectiveProviderThroughCatalogBeforeFirstTurn(t 
 		!reflect.DeepEqual(gotDecoded, wantDecoded) {
 		t.Fatalf("turn input = %s, want semantic value %s", turn.params["input"], wantInput)
 	}
-	if coordinator.prepareHandoffCalls != 1 ||
-		coordinator.resubscribeRoute != (modelroute.Route{Provider: "glm", Model: "glm-5.2"}) {
-		t.Fatalf("coordinator calls = %#v", coordinator)
+	if coordinator.prepareHandoffCalls != 0 || coordinator.unsubscribeCalls != 0 ||
+		coordinator.resubscribeCalls != 0 || coordinator.markDirtyCalls != 0 {
+		t.Fatalf("same-provider first-turn model triggered handoff: %#v", coordinator)
 	}
 }
 
@@ -1715,6 +1715,210 @@ func TestSessionIgnoresStaleTurnModelWhenExactSelectionExists(t *testing.T) {
 	if got := selections.models["thr-a"]; got != "glm-5.3" {
 		t.Fatalf("stale turn changed persisted model to %q", got)
 	}
+	if coordinator := current.coordinator.(*fakeHandoffCoordinator); coordinator.prepareHandoffCalls != 0 ||
+		coordinator.unsubscribeCalls != 0 || coordinator.resubscribeCalls != 0 ||
+		coordinator.markDirtyCalls != 0 {
+		t.Fatalf("same-provider model change triggered handoff: %#v", coordinator)
+	}
+}
+
+func TestSessionAppliesSameProviderModelAfterTurnAcknowledgement(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"glm","model":"glm-5.3"}}`,
+				message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":232,"method":"turn/start","params":{"threadId":"thr-a","model":"glm-5.2","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := current.effectiveRoute("thr-a"); got != (modelroute.Route{Provider: "glm", Model: "glm-5.2"}) {
+		t.Fatalf("route changed before acknowledgement: %#v", got)
+	}
+	if coordinator.prepareHandoffCalls != 0 || coordinator.unsubscribeCalls != 0 ||
+		coordinator.resubscribeCalls != 0 || coordinator.markDirtyCalls != 0 {
+		t.Fatalf("same-provider model change triggered handoff: %#v", coordinator)
+	}
+	if got := upstream.messages(); len(got) != 1 {
+		t.Fatalf("upstream messages = %q, want one turn/start", got)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.3")
+
+	if err := current.handleUpstreamText(context.Background(), []byte(
+		`{"id":232,"result":{"turn":{"id":"turn-232","status":"inProgress"}}}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if got := current.effectiveRoute("thr-a"); got != (modelroute.Route{Provider: "glm", Model: "glm-5.3"}) {
+		t.Fatalf("route after acknowledgement = %#v", got)
+	}
+}
+
+func TestSessionRetainsVerifiedRouteAfterRejectedOrMalformedTurnResponse(t *testing.T) {
+	t.Parallel()
+	responses := map[string]string{
+		"app-server error": `{"id":234,"error":{"code":-32602,"message":"rejected"}}`,
+		"missing result":   `{"id":234}`,
+		"scalar result":    `{"id":234,"result":"invalid"}`,
+		"empty result":     `{"id":234,"result":{}}`,
+		"empty turn id":    `{"id":234,"result":{"turn":{"id":""}}}`,
+	}
+	for name, response := range responses {
+		name, response := name, response
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			coordinator := &fakeHandoffCoordinator{}
+			current := newTestSession(t, nil, nil)
+			current.provider = ""
+			current.routes = testMultiModelCatalog(t)
+			current.selections = &fakeProviderSelections{
+				values: map[string]string{"thr-a": "glm"},
+				models: map[string]string{"thr-a": "glm-5.3"},
+			}
+			current.coordinator = coordinator
+			current.stateMu.Lock()
+			current.effective["thr-a"] = "glm"
+			current.effectiveModel["thr-a"] = "glm-5.2"
+			current.stateMu.Unlock()
+
+			request := []byte(`{"id":234,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+			if err := current.handleDownstreamText(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			if err := current.handleUpstreamText(context.Background(), []byte(response)); err != nil {
+				t.Fatal(err)
+			}
+			if got := current.effectiveRoute("thr-a"); got != (modelroute.Route{Provider: "glm", Model: "glm-5.2"}) {
+				t.Fatalf("rejected or malformed response changed route to %#v", got)
+			}
+			if current.isActive("thr-a") {
+				t.Fatal("rejected or malformed response left turn active")
+			}
+		})
+	}
+}
+
+func TestSessionRepairsSameProviderDirtyMarkerWithoutFullHandoff(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{dirty: true, dirtyStage: handoff.DirtyStageUnsubscribed}
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/resume" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"thread":{"id":"thr-a"},"modelProvider":"glm","model":"glm-5.3"}}`,
+				message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = coordinator
+	current.stateMu.Lock()
+	current.effective["thr-a"] = "glm"
+	current.effectiveModel["thr-a"] = "glm-5.2"
+	current.stateMu.Unlock()
+
+	request := []byte(`{"id":233,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.prepareHandoffCalls != 1 || coordinator.resubscribeCalls != 1 ||
+		coordinator.clearDirtyCalls != 1 {
+		t.Fatalf("dirty repair calls = %#v", coordinator)
+	}
+	if coordinator.unsubscribeCalls != 0 || coordinator.markDirtyCalls != 0 || len(coordinator.dirtyStageCalls) != 0 {
+		t.Fatalf("same-provider dirty repair started a new handoff: %#v", coordinator)
+	}
+	if coordinator.resubscribeRoute != (modelroute.Route{Provider: "glm"}) {
+		t.Fatalf("dirty repair route = %#v, want provider-only glm route", coordinator.resubscribeRoute)
+	}
+	if coordinator.dirty {
+		t.Fatal("same-provider dirty marker was not cleared")
+	}
+	if got := upstream.messages(); len(got) != 1 {
+		t.Fatalf("upstream messages = %q, want one turn/start", got)
+	}
+	message, err := parseRPCMessage(upstream.messages()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, message.params, "model", "glm-5.3")
+}
+
+func TestSessionUsesFullHandoffForOtherDirtyStages(t *testing.T) {
+	t.Parallel()
+	stages := []handoff.DirtyStage{
+		handoff.DirtyStagePrepared,
+		handoff.DirtyStageResumeMismatch,
+		handoff.DirtyStageRecovering,
+		handoff.DirtyStageResubscribing,
+	}
+	for _, stage := range stages {
+		stage := stage
+		t.Run(string(stage), func(t *testing.T) {
+			t.Parallel()
+			coordinator := &fakeHandoffCoordinator{dirty: true, dirtyStage: stage}
+			current := newResponsiveResumeSession(t, coordinator, "sub2api")
+			current.stateMu.Lock()
+			current.effective["thr-a"] = "sub2api"
+			current.stateMu.Unlock()
+
+			request := []byte(`{"id":235,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+			if err := current.handleDownstreamText(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			if coordinator.unsubscribeCalls != 1 || coordinator.markDirtyCalls != 1 ||
+				coordinator.resubscribeCalls != 1 || coordinator.clearDirtyCalls != 1 {
+				t.Fatalf("dirty stage %q bypassed full handoff: %#v", stage, coordinator)
+			}
+		})
+	}
 }
 
 func TestSessionRejectsForeignPickerModelForSelectedProvider(t *testing.T) {
@@ -2723,6 +2927,7 @@ type fakeHandoffCoordinator struct {
 	resubscribeErr           error
 	restoreErr               error
 	dirty                    bool
+	dirtyStage               handoff.DirtyStage
 	resubscribeRoute         modelroute.Route
 	reconcileCalls           int
 	reconcileErr             error
@@ -2786,11 +2991,13 @@ func (coordinator *fakeHandoffCoordinator) RestoreAll(context.Context, string) e
 func (coordinator *fakeHandoffCoordinator) MarkDirty(string) error {
 	coordinator.markDirtyCalls++
 	coordinator.dirty = true
+	coordinator.dirtyStage = handoff.DirtyStagePrepared
 	coordinator.dirtyStageCalls = append(coordinator.dirtyStageCalls, handoff.DirtyStagePrepared)
 	return nil
 }
 
 func (coordinator *fakeHandoffCoordinator) SetDirtyStage(_ string, stage handoff.DirtyStage) error {
+	coordinator.dirtyStage = stage
 	coordinator.dirtyStageCalls = append(coordinator.dirtyStageCalls, stage)
 	return nil
 }
@@ -2799,9 +3006,14 @@ func (coordinator *fakeHandoffCoordinator) IsDirty(string) bool {
 	return coordinator.dirty
 }
 
+func (coordinator *fakeHandoffCoordinator) ReadDirtyStage(string) (handoff.DirtyStage, bool, error) {
+	return coordinator.dirtyStage, coordinator.dirty, nil
+}
+
 func (coordinator *fakeHandoffCoordinator) ClearDirty(string) error {
 	coordinator.clearDirtyCalls++
 	coordinator.dirty = false
+	coordinator.dirtyStage = ""
 	return nil
 }
 

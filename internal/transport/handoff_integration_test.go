@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
 func TestRunSwitchesProviderOnNextTurn(t *testing.T) {
@@ -130,7 +132,7 @@ func TestRunSwitchesProviderAndMappedModel(t *testing.T) {
 	waitProxyDone(t, done)
 }
 
-func TestRunResolvesDefaultProviderMappedModelBeforeFirstTurn(t *testing.T) {
+func TestRunAppliesDefaultProviderMappedModelOnFirstTurnWithoutResume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	server := newHandoffAppServer(t, ctx, true)
@@ -180,8 +182,98 @@ func TestRunResolvesDefaultProviderMappedModelBeforeFirstTurn(t *testing.T) {
 	if record.threadID != "thr-shared" || record.provider != "glm" || record.model != "glm-5.2" {
 		t.Fatalf("first ordinary turn = %#v, want glm/glm-5.2", record)
 	}
-	if record := server.lastResumeRecord(); record.provider != "glm" || record.model != "glm-5.2" {
-		t.Fatalf("verified resume = %#v, want glm/glm-5.2", record)
+	if record := server.lastResumeRecord(); record.provider != "" || record.model != "" {
+		t.Fatalf("same-provider model change forced an internal resume: %#v", record)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestRunChangesSameProviderModelWhileRolloutWriterLockIsHeld(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	home := t.TempDir()
+	rolloutDirectory := filepath.Join(home, "sessions", "2026", "08", "24")
+	lockDirectory := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(rolloutDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(rolloutDirectory, "rollout-2026-08-24T00-00-00-thr-shared.jsonl")
+	rolloutContents := `{"type":"session_meta","payload":{"id":"thr-shared"}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"reasoning","id":"item_locked"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(rolloutContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writerLock, err := os.OpenFile(filepath.Join(lockDirectory, "thr-shared.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writerLock.Close()
+	if err := syscall.Flock(int(writerLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(writerLock.Fd()), syscall.LOCK_UN)
+
+	stateDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateDirectory, "models.json"), []byte(
+		`{"glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.2"]}}`,
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := selection.Open(stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRoute("thr-shared", selection.Value{Provider: "glm", Model: "glm-5.3"}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := newHandoffAppServer(t, ctx, true)
+	server.mu.Lock()
+	server.provider = "glm"
+	server.model = "glm-5.2"
+	server.stickyIdle = true
+	server.listIncludesRoot = true
+	server.rolloutPath = rolloutPath
+	server.mu.Unlock()
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Socket: server.socket, StateDir: stateDirectory, CodexHome: home,
+	})
+	defer connection.CloseNow()
+	initializeTestClient(t, ctx, connection)
+	sendRPC(t, ctx, connection, 2, "thread/resume", map[string]any{"threadId": "thr-shared"})
+	resumed := readResponse(t, ctx, connection, "2")
+	if provider, model := responseProvider(t, resumed.raw), responseModel(t, resumed.raw); provider != "glm" || model != "glm-5.2" {
+		t.Fatalf("initial effective route = %s/%s, want glm/glm-5.2", provider, model)
+	}
+
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared", "model": "glm-5.2", "input": []any{},
+	})
+	for {
+		message := readVisibleRPC(t, ctx, connection)
+		if message.errorCode != 0 {
+			t.Fatalf("same-provider model turn failed with writer lock: %#v", message)
+		}
+		if message.method == "turn/completed" {
+			break
+		}
+	}
+	if record := <-server.turns; record.provider != "glm" || record.model != "glm-5.3" {
+		t.Fatalf("same-provider model turn = %#v, want glm/glm-5.3", record)
+	}
+	unchanged, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(unchanged, []byte("item_locked")) {
+		t.Fatalf("same-provider model turn rewrote rollout: %s", unchanged)
 	}
 
 	cancel()
@@ -850,6 +942,7 @@ type handoffAppServer struct {
 	softReloaded            bool
 	readStatus              string
 	listIncludesRoot        bool
+	rolloutPath             string
 	turnStartGate           chan struct{}
 	firstTurnReceived       chan struct{}
 }
@@ -1052,6 +1145,7 @@ func (server *handoffAppServer) handleList(connection *websocket.Conn, message r
 	descendants := append([]string(nil), server.descendants...)
 	includeRoot := server.listIncludesRoot
 	rootProvider := server.provider
+	rootPath := server.rolloutPath
 	rootStatus := "idle"
 	if server.active {
 		rootStatus = "active"
@@ -1059,8 +1153,12 @@ func (server *handoffAppServer) handleList(connection *websocket.Conn, message r
 	server.mu.Unlock()
 	data := make([]map[string]any, 0, len(descendants)+1)
 	if includeRoot {
+		var path any
+		if rootPath != "" {
+			path = rootPath
+		}
 		data = append(data, map[string]any{
-			"id": "thr-shared", "path": nil, "status": map[string]any{"type": rootStatus},
+			"id": "thr-shared", "path": path, "status": map[string]any{"type": rootStatus},
 			"modelProvider": rootProvider,
 		})
 	}

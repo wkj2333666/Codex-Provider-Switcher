@@ -46,7 +46,7 @@ Set `VERSION` to the release you want to install. The commands detect the
 current operating system and CPU architecture.
 
 ```bash
-VERSION="0.5.6"
+VERSION="0.5.7"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -111,8 +111,9 @@ printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-5.6-sol","gpt-5
 ```
 
 Provider switches use the default model. Later Desktop picker changes persist
-only when the model is in that provider's allowlist. Cross-provider or unlisted
-values do not change the route. Invalid JSON or values, symlinks, and
+only when the model is in that provider's allowlist. A model change within the
+same provider applies on the next turn without a provider handoff. Cross-provider
+or unlisted values do not change the route. Invalid JSON or values, symlinks, and
 non-regular files make the switcher fail closed before it proxies Desktop.
 
 To show third-party models in Desktop, also load the Codex model catalog from
@@ -302,10 +303,12 @@ provider is configured in the app-server and Codex CLI is 0.146.0 or newer.
 After upgrading the switcher, reconnect the Desktop SSH host so every live
 proxy uses the same version.
 
-**A later message returns JSON-RPC `-32090`:** upgrade to v0.5.6 or newer and
+**A later message returns JSON-RPC `-32090`:** upgrade to v0.5.7 or newer and
 reconnect every Desktop/Android SSH client once. This version reconciles stale
-peer activity only after app-server verifies that the task is idle; a genuinely
-active task remains protected.
+peer activity only after app-server verifies that the task is idle and no
+longer mistakes a model-only change inside one provider for a full handoff that
+needs the rollout writer lock. Active turns and cross-provider history remain
+protected.
 
 **The app-server socket is unavailable:** connect or restart Codex Desktop's
 remote host so its normal app-server is running. The switcher intentionally
