@@ -281,6 +281,96 @@ func TestRunChangesSameProviderModelWhileRolloutWriterLockIsHeld(t *testing.T) {
 	waitProxyDone(t, done)
 }
 
+func TestRunCrossProviderSanitizesLockedRolloutAfterSoftUnload(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	home := t.TempDir()
+	rolloutDirectory := filepath.Join(home, "sessions", "2026", "08", "24")
+	lockDirectory := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(rolloutDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(rolloutDirectory, "rollout-2026-08-24T00-00-00-thr-shared.jsonl")
+	rolloutContents := `{"type":"session_meta","payload":{"id":"thr-shared"}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"reasoning","id":"item_locked"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(rolloutContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writerLock, err := os.OpenFile(filepath.Join(lockDirectory, "thr-shared.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writerLock.Close()
+	if err := syscall.Flock(int(writerLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			_ = syscall.Flock(int(writerLock.Fd()), syscall.LOCK_UN)
+		}
+	}()
+
+	server := newHandoffAppServer(t, ctx, true)
+	server.mu.Lock()
+	server.systemError = true
+	server.listIncludesRoot = true
+	server.rolloutPath = rolloutPath
+	server.archiveHook = func() {
+		_ = syscall.Flock(int(writerLock.Fd()), syscall.LOCK_UN)
+		lockHeld = false
+	}
+	server.mu.Unlock()
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Provider: "openai", Socket: server.socket, StateDir: t.TempDir(), CodexHome: home,
+	})
+	defer connection.CloseNow()
+	initializeTestClient(t, ctx, connection)
+	if provider := resumeTestThread(t, ctx, connection, 2); provider != "openai" {
+		t.Fatalf("initial provider = %q, want openai", provider)
+	}
+
+	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input": []any{map[string]any{
+			"type": "text", "text": "[$provider](/home/user/.agents/skills/provider/SKILL.md) switch sub2api",
+		}},
+	})
+	response := readResponse(t, ctx, connection, "3")
+	if response.errorCode != 0 {
+		t.Fatalf("locked rollout handoff response = %#v", response)
+	}
+	for range 7 {
+		_ = readVisibleRPC(t, ctx, connection)
+	}
+
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(cleaned, []byte("item_locked")) {
+		t.Fatalf("soft unload resumed before sanitation: %s", cleaned)
+	}
+	server.mu.Lock()
+	provider := server.provider
+	archiveCalls := server.archiveCalls
+	server.mu.Unlock()
+	if provider != "sub2api" || archiveCalls != 1 {
+		t.Fatalf("provider=%q archive calls=%d, want sub2api and one archive", provider, archiveCalls)
+	}
+	if calls := server.turnStartCallCount(); calls != 0 {
+		t.Fatalf("provider control reached model turn: %d", calls)
+	}
+
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
 func TestProviderDesktopMarkdownSkillCommandSwitchesWithoutModelTurn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -507,6 +597,21 @@ func TestRunRepairsPersistedRecoveryBeforeProviderSwitch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	server := newHandoffAppServer(t, ctx, true)
+	home := t.TempDir()
+	rolloutDirectory := filepath.Join(home, "sessions", "2026", "08", "24")
+	lockDirectory := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(rolloutDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(lockDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(rolloutDirectory, "rollout-2026-08-24T00-00-00-thr-shared.jsonl")
+	rolloutContents := `{"type":"session_meta","payload":{"id":"thr-shared"}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"reasoning","id":"item_repair_stale"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(rolloutContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	stateDir := t.TempDir()
 	store, err := recovery.Open(stateDir)
 	if err != nil {
@@ -522,9 +627,11 @@ func TestRunRepairsPersistedRecoveryBeforeProviderSwitch(t *testing.T) {
 	server.mu.Lock()
 	server.archived["thr-child"] = true
 	server.archived["thr-shared"] = true
+	server.listIncludesRoot = true
+	server.rolloutPath = rolloutPath
 	server.mu.Unlock()
 	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
-		Provider: "openai", Socket: server.socket, StateDir: stateDir,
+		Provider: "openai", Socket: server.socket, StateDir: stateDir, CodexHome: home,
 	})
 	defer connection.CloseNow()
 	initializeTestClient(t, ctx, connection)
@@ -533,6 +640,13 @@ func TestRunRepairsPersistedRecoveryBeforeProviderSwitch(t *testing.T) {
 	}
 	if _, ok, err := store.Load("thr-shared"); err != nil || ok {
 		t.Fatalf("journal after resume repair = ok %v, err %v", ok, err)
+	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(cleaned, []byte("item_repair_stale")) {
+		t.Fatalf("recovery journal resumed before sanitation: %s", cleaned)
 	}
 
 	sendRPC(t, ctx, connection, 3, "turn/start", map[string]any{
@@ -930,6 +1044,7 @@ type handoffAppServer struct {
 	descendants             []string
 	history                 []string
 	archiveCalls            int
+	archiveHook             func()
 	archiveNotReadyFailures int
 	freshNeedsMaterialize   bool
 	rolloutReady            bool
@@ -1144,6 +1259,9 @@ func (server *handoffAppServer) handleList(connection *websocket.Conn, message r
 	server.mu.Lock()
 	descendants := append([]string(nil), server.descendants...)
 	includeRoot := server.listIncludesRoot
+	if _, subtreeOnly := message.params["ancestorThreadId"]; subtreeOnly {
+		includeRoot = false
+	}
 	rootProvider := server.provider
 	rootPath := server.rolloutPath
 	rootStatus := "idle"
@@ -1185,7 +1303,11 @@ func (server *handoffAppServer) handleArchive(connection *websocket.Conn, messag
 	for _, id := range ids {
 		server.archived[id] = true
 	}
+	archiveHook := server.archiveHook
 	server.mu.Unlock()
+	if archiveHook != nil {
+		archiveHook()
+	}
 	for _, id := range ids {
 		server.broadcastNotification(clients, "thread/archived", map[string]any{"threadId": id})
 	}

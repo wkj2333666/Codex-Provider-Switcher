@@ -287,10 +287,12 @@ Codex 可执行文件的绝对路径。
 并且 Codex CLI 不低于 0.146.0。升级 switcher 后请重新连接 Desktop SSH 主机，
 确保所有仍在运行的 proxy 使用同一版本。
 
-**后续消息返回 JSON-RPC `-32090`：** 升级到 v0.5.7 或更高版本，并将所有
+**后续消息返回 JSON-RPC `-32090`：** 升级到 v0.5.9 或更高版本，并将所有
 Desktop/Android SSH 客户端重新连接一次。该版本既会在 app-server 确认任务空闲后
-消除 peer 的陈旧 active 状态，也不会把同一 provider 内的 model 变化误当成需要
-rollout 写锁的完整 handoff；真正运行中的任务和跨 provider 历史仍会受到保护。
+消除 peer 的陈旧 active 状态，也不会把同一 provider 内的 model 变化误当成完整
+handoff。如果 Codex 在 unsubscribe 后仍持有失败任务的 rollout 写锁，switcher
+现在会先执行带恢复日志的软卸载，再清洗并恢复到目标 provider；真正运行中的任务和
+跨 provider 历史仍会受到保护。
 
 **app-server socket 不可用：** 重新连接或重启 Codex Desktop 的远程主机，让
 它正常启动 app-server。Switcher 会按设计关闭失败，不会自行启动第二个 daemon。

@@ -591,22 +591,36 @@ func (current *session) handoff(ctx context.Context, threadID string, targetRout
 		current.restoreAfterHandoffFailure(threadID)
 		return errors.New("provider handoff stage update failed")
 	}
+	resumed := false
 	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
-		current.restoreAfterHandoffFailure(threadID)
-		return errors.New("provider handoff rollout sanitation failed")
-	}
-	if err := current.internalResumeForHandoff(ctx, threadID, targetRoute); err != nil {
-		if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
+		if !errors.Is(err, rollout.ErrActiveWriter) || current.recoveries == nil {
 			current.restoreAfterHandoffFailure(threadID)
-			return err
+			return errors.New("provider handoff rollout sanitation failed")
 		}
-		if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageResumeMismatch); err != nil {
-			current.restoreAfterHandoffFailure(threadID)
-			return errors.New("provider handoff stage update failed")
-		}
+		// thread/unsubscribe removes subscriptions but Codex may keep the old
+		// runtime (and its rollout writer lock) loaded. Use the journaled soft
+		// unload before sanitation instead of waiting for the unload grace
+		// period or resuming provider-bound history under the new provider.
 		if err := current.recoverProviderMismatch(ctx, threadID, targetRoute); err != nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return err
+		}
+		resumed = true
+	}
+	if !resumed {
+		if err := current.internalResumeForHandoff(ctx, threadID, targetRoute); err != nil {
+			if !errors.Is(err, errProviderMismatch) || current.recoveries == nil {
+				current.restoreAfterHandoffFailure(threadID)
+				return err
+			}
+			if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageResumeMismatch); err != nil {
+				current.restoreAfterHandoffFailure(threadID)
+				return errors.New("provider handoff stage update failed")
+			}
+			if err := current.recoverProviderMismatch(ctx, threadID, targetRoute); err != nil {
+				current.restoreAfterHandoffFailure(threadID)
+				return err
+			}
 		}
 	}
 	if err := current.coordinator.SetDirtyStage(threadID, handoff.DirtyStageResubscribing); err != nil {
@@ -715,6 +729,9 @@ func (current *session) recoverProviderMismatch(ctx context.Context, threadID st
 			return errors.New("update provider recovery journal")
 		}
 	}
+	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
+		return errors.New("provider recovery rollout sanitation failed")
+	}
 	if err := current.internalResume(ctx, threadID, targetRoute); err != nil {
 		return err
 	}
@@ -779,6 +796,9 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 		if err := current.recoveries.Save(journal); err != nil {
 			return errors.New("update provider recovery repair journal")
 		}
+	}
+	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
+		return errors.New("provider recovery repair rollout sanitation failed")
 	}
 	wantedRoute := modelroute.Route{Provider: journal.Provider, Model: journal.Model}
 	route, err := client.resume(ctx, threadID, wantedRoute)

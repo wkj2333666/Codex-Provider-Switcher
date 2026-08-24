@@ -310,12 +310,14 @@ provider is configured in the app-server and Codex CLI is 0.146.0 or newer.
 After upgrading the switcher, reconnect the Desktop SSH host so every live
 proxy uses the same version.
 
-**A later message returns JSON-RPC `-32090`:** upgrade to v0.5.7 or newer and
+**A later message returns JSON-RPC `-32090`:** upgrade to v0.5.9 or newer and
 reconnect every Desktop/Android SSH client once. This version reconciles stale
 peer activity only after app-server verifies that the task is idle and no
-longer mistakes a model-only change inside one provider for a full handoff that
-needs the rollout writer lock. Active turns and cross-provider history remain
-protected.
+longer mistakes a model-only change inside one provider for a full handoff. If
+Codex keeps a failed task's rollout writer lock after unsubscribe, the switcher
+now performs its journaled soft unload before sanitation and resumes only after
+the rollout is safe for the target provider. Active turns and cross-provider
+history remain protected.
 
 **The app-server socket is unavailable:** connect or restart Codex Desktop's
 remote host so its normal app-server is running. The switcher intentionally
