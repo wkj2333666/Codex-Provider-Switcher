@@ -162,6 +162,13 @@ closed before the user's message is sent. The per-task fence remains held until
 app-server acknowledges a newly forwarded turn, so a genuine in-flight request
 cannot be mistaken for stale state during that acknowledgement window.
 
+Reconnects and explicit task unsubscription can also clear a proxy's in-memory
+route while app-server still has the task loaded. Before deciding that the next
+turn needs a provider handoff, the switcher restores the authoritative runtime
+provider and model from `thread/list`. A matching provider uses the lightweight
+same-provider path; missing, malformed, or genuinely different runtime state
+still fails closed or performs the full handoff as appropriate.
+
 When a task is handed to another provider, the switcher also checks its rollout
 for stale provider-bound reasoning IDs. Invalid reasoning records are removed
 and stale optional item IDs are stripped before app-server loads the history.

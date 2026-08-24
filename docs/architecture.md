@@ -161,6 +161,12 @@ thread flock
 A model-only change inside the verified effective provider does not run this
 sequence. The switcher rewrites the next `turn/start` to the selected model and
 updates its effective route only after app-server acknowledges that request.
+If a reconnect or explicit unsubscribe cleared the session-local effective
+route, the switcher first resolves the task's provider and optional model from
+the authoritative all-provider `thread/list`. A valid matching provider
+restores the local route before handoff policy is evaluated; an absent,
+malformed, ambiguous, or different route never bypasses the full fail-closed
+decision.
 If an earlier model-only handoff left a dirty marker, every peer must first pass
 the handoff capability check; detached peers are restored with a provider-only
 route and the marker is cleared before the turn is forwarded. A provider change

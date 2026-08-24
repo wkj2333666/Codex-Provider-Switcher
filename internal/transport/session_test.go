@@ -1891,6 +1891,111 @@ func TestSessionRepairsSameProviderDirtyMarkerWithoutFullHandoff(t *testing.T) {
 	assertRawString(t, message.params, "model", "glm-5.3")
 }
 
+func TestSessionRepairsSameProviderDirtyMarkerAfterRouteCacheLoss(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{dirty: true, dirtyStage: handoff.DirtyStageUnsubscribed}
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var current *session
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/list" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","modelProvider":"glm","model":"glm-5.3","status":{"type":"idle"}}],"nextCursor":null}}`,
+				message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, nil)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = coordinator
+
+	request := []byte(`{"id":236,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if coordinator.prepareHandoffCalls != 1 || coordinator.resubscribeCalls != 1 ||
+		coordinator.clearDirtyCalls != 1 {
+		t.Fatalf("dirty repair after route cache loss = %#v", coordinator)
+	}
+	if coordinator.unsubscribeCalls != 0 || coordinator.markDirtyCalls != 0 || len(coordinator.dirtyStageCalls) != 0 {
+		t.Fatalf("route cache loss started a full handoff: %#v", coordinator)
+	}
+	if coordinator.dirty {
+		t.Fatal("same-provider dirty marker was not cleared after route cache loss")
+	}
+	messages := upstream.messages()
+	if len(messages) != 2 {
+		t.Fatalf("upstream messages = %q, want thread/list and turn/start", messages)
+	}
+	turn, err := parseRPCMessage(messages[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turn.method != "turn/start" {
+		t.Fatalf("second upstream method = %q, want turn/start", turn.method)
+	}
+	assertRawString(t, turn.params, "model", "glm-5.3")
+}
+
+func TestSessionUsesAuthoritativeRouteAfterCacheLossWithoutSavedSelection(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	var current *session
+	var upstream, downstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		if err := upstream.write(ctx, messageType, payload); err != nil {
+			return err
+		}
+		message, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		if message.method == "thread/list" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+				`{"id":%s,"result":{"data":[{"id":"thr-a","modelProvider":"glm","model":"glm-5.3","status":{"type":"idle"}}],"nextCursor":null}}`,
+				message.idKey)))
+		}
+		return nil
+	}
+	current = newTestSession(t, writer, downstream.write)
+	current.provider = ""
+	current.routes = testMultiModelCatalog(t)
+	current.selections = &fakeProviderSelections{}
+	current.coordinator = coordinator
+
+	request := []byte(`{"id":237,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := downstream.messages(); len(got) != 0 {
+		t.Fatalf("cache loss without saved selection failed closed: %q", got)
+	}
+	if coordinator.prepareHandoffCalls != 0 || coordinator.unsubscribeCalls != 0 || coordinator.markDirtyCalls != 0 {
+		t.Fatalf("authoritative same-provider route triggered handoff: %#v", coordinator)
+	}
+	messages := upstream.messages()
+	if len(messages) != 2 {
+		t.Fatalf("upstream messages = %q, want thread/list and turn/start", messages)
+	}
+	turn, err := parseRPCMessage(messages[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRawString(t, turn.params, "model", "glm-5.3")
+}
+
 func TestSessionUsesFullHandoffForOtherDirtyStages(t *testing.T) {
 	t.Parallel()
 	stages := []handoff.DirtyStage{

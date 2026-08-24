@@ -156,6 +156,11 @@ turn、服务端状态仍为 active、响应异常或 peer 协调失败时，仍
 关闭失败。新 turn 转发后，每任务 fence 会一直保留到 app-server 返回确认，因此
 确认到达前的真实在途请求不会被误判成陈旧状态。
 
+重连和显式取消任务订阅也可能清空 proxy 的内存路由，但 app-server 仍然加载着
+该任务。Switcher 在决定下一条 turn 是否需要 provider handoff 前，会从
+`thread/list` 恢复权威运行时 provider 和 model。provider 相同时走轻量恢复；
+运行时状态缺失、异常或确实不同时，仍按情况关闭失败或执行完整 handoff。
+
 任务转交给其他 provider 时，Switcher 还会检查 rollout 中遗留的、与旧 provider
 绑定的 reasoning ID。它会在 app-server 加载历史前删除非法 reasoning 记录，并从
 普通消息和工具调用中移除可选的过期 item ID；同一 provider 内恢复任务会直接透传，

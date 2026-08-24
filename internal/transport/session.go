@@ -318,6 +318,8 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	}
 	targetRoute := current.routeForProvider(command.provider)
 	persistRequestedRoute := false
+	effectiveRoute := modelroute.Route{}
+	effectiveResolved := false
 	if !commandRecognized {
 		var selected, exact bool
 		targetRoute, selected, exact, err = current.selectedRouteState(threadID)
@@ -325,11 +327,12 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 			return current.writeHandoffError(ctx, message.id)
 		}
 		if !selected {
-			effectiveProvider := current.effectiveProvider(threadID)
-			if effectiveProvider == "" {
+			effectiveRoute, err = current.effectiveRouteForTurn(ctx, threadID)
+			if err != nil || effectiveRoute.Provider == "" {
 				return current.writeHandoffError(ctx, message.id)
 			}
-			targetRoute = current.routeForProvider(effectiveProvider)
+			effectiveResolved = true
+			targetRoute = current.routeForProvider(effectiveRoute.Provider)
 		}
 		requested, present, requestErr := requestedModel(message.params)
 		if requestErr != nil {
@@ -342,11 +345,23 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 			}
 		}
 	}
-	effectiveRoute := current.effectiveRoute(threadID)
-	if current.coordinator.IsDirty(threadID) {
-		stage, found, stageErr := current.coordinator.ReadDirtyStage(threadID)
-		if !commandRecognized && sameProvider(effectiveRoute, targetRoute) &&
-			stageErr == nil && found && stage == handoff.DirtyStageUnsubscribed {
+	dirty := current.coordinator.IsDirty(threadID)
+	var dirtyStage handoff.DirtyStage
+	var dirtyStageFound bool
+	var dirtyStageErr error
+	if dirty {
+		dirtyStage, dirtyStageFound, dirtyStageErr = current.coordinator.ReadDirtyStage(threadID)
+	}
+	forceFullDirty := dirty && (commandRecognized || dirtyStageErr != nil || !dirtyStageFound ||
+		dirtyStage != handoff.DirtyStageUnsubscribed)
+	if !forceFullDirty && !effectiveResolved {
+		effectiveRoute, err = current.effectiveRouteForTurn(ctx, threadID)
+		if err != nil {
+			return current.writeHandoffError(ctx, message.id)
+		}
+	}
+	if dirty {
+		if !forceFullDirty && sameProvider(effectiveRoute, targetRoute) {
 			if err := current.repairSameProviderDirty(ctx, threadID, targetRoute.Provider); err != nil {
 				return current.writeHandoffError(ctx, message.id)
 			}
@@ -929,14 +944,14 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 	if current.codexHome == "" {
 		return "", nil
 	}
-	path, runtimeProvider, _, err := current.findRolloutPath(ctx, threadID)
+	path, runtimeRoute, _, err := current.findRolloutPath(ctx, threadID)
 	if err != nil {
 		return "", err
 	}
 	if path == "" {
 		return "", nil
 	}
-	if expectedProvider != "" && runtimeProvider == expectedProvider {
+	if expectedProvider != "" && runtimeRoute.Provider == expectedProvider {
 		return path, nil
 	}
 	if err := rollout.ValidatePath(current.codexHome, threadID, path); err != nil {
@@ -949,15 +964,15 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 
 // findRolloutPath uses thread/list because thread/read loads the thread and
 // takes Codex's writer lock before sanitation can inspect the rollout.
-func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, string, string, error) {
+func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, modelroute.Route, string, error) {
 	if threadID == "" {
-		return "", "", "", errors.New("invalid rollout thread")
+		return "", modelroute.Route{}, "", errors.New("invalid rollout thread")
 	}
 	seenCursors := make(map[string]bool)
 	cursor := ""
 	found := false
 	foundPath := ""
-	foundProvider := ""
+	foundRoute := modelroute.Route{}
 	foundStatus := ""
 	for page := 0; page < maxRolloutListPages; page++ {
 		params := map[string]json.RawMessage{
@@ -969,13 +984,14 @@ func (current *session) findRolloutPath(ctx context.Context, threadID string) (s
 		}
 		response, err := current.callUpstream(ctx, "thread/list", params)
 		if err != nil {
-			return "", "", "", errors.New("list rollout threads")
+			return "", modelroute.Route{}, "", errors.New("list rollout threads")
 		}
 		var result struct {
 			Data []struct {
 				ID            string  `json:"id"`
 				Path          *string `json:"path"`
 				ModelProvider string  `json:"modelProvider"`
+				Model         string  `json:"model"`
 				Status        struct {
 					Type string `json:"type"`
 				} `json:"status"`
@@ -984,18 +1000,18 @@ func (current *session) findRolloutPath(ctx context.Context, threadID string) (s
 		}
 		encoded, marshalErr := json.Marshal(response.result)
 		if marshalErr != nil || json.Unmarshal(encoded, &result) != nil || result.Data == nil {
-			return "", "", "", errors.New("invalid rollout thread list")
+			return "", modelroute.Route{}, "", errors.New("invalid rollout thread list")
 		}
 		for _, thread := range result.Data {
 			if thread.ID == "" {
-				return "", "", "", errors.New("invalid rollout thread list")
+				return "", modelroute.Route{}, "", errors.New("invalid rollout thread list")
 			}
 			if thread.ID == threadID {
 				if found {
-					return "", "", "", errors.New("ambiguous rollout thread list")
+					return "", modelroute.Route{}, "", errors.New("ambiguous rollout thread list")
 				}
 				found = true
-				foundProvider = thread.ModelProvider
+				foundRoute = modelroute.Route{Provider: thread.ModelProvider, Model: thread.Model}
 				foundStatus = thread.Status.Type
 				if thread.Path != nil {
 					foundPath = *thread.Path
@@ -1004,17 +1020,17 @@ func (current *session) findRolloutPath(ctx context.Context, threadID string) (s
 		}
 		if result.NextCursor == nil || *result.NextCursor == "" {
 			if found {
-				return foundPath, foundProvider, foundStatus, nil
+				return foundPath, foundRoute, foundStatus, nil
 			}
-			return "", "", "", nil
+			return "", modelroute.Route{}, "", nil
 		}
 		if seenCursors[*result.NextCursor] {
-			return "", "", "", errors.New("invalid rollout thread cursor")
+			return "", modelroute.Route{}, "", errors.New("invalid rollout thread cursor")
 		}
 		seenCursors[*result.NextCursor] = true
 		cursor = *result.NextCursor
 	}
-	return "", "", "", errors.New("rollout thread list exceeds limit")
+	return "", modelroute.Route{}, "", errors.New("rollout thread list exceeds limit")
 }
 
 func rewriteResumePath(payload []byte, path string) ([]byte, error) {
@@ -1357,6 +1373,35 @@ func (current *session) effectiveRoute(threadID string) modelroute.Route {
 	current.stateMu.Lock()
 	defer current.stateMu.Unlock()
 	return modelroute.Route{Provider: current.effective[threadID], Model: current.effectiveModel[threadID]}
+}
+
+func (current *session) effectiveRouteForTurn(ctx context.Context, threadID string) (modelroute.Route, error) {
+	route := current.effectiveRoute(threadID)
+	if route.Provider != "" {
+		return route, nil
+	}
+
+	_, runtime, _, err := current.findRolloutPath(ctx, threadID)
+	if err != nil {
+		return modelroute.Route{}, err
+	}
+	if runtime.Provider == "" {
+		return route, nil
+	}
+	if !providerid.Valid(runtime.Provider) || (runtime.Model != "" && !modelroute.ValidModel(runtime.Model)) {
+		return modelroute.Route{}, errors.New("invalid runtime route")
+	}
+
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	if current.effective[threadID] == "" {
+		current.effective[threadID] = runtime.Provider
+		current.effectiveModel[threadID] = runtime.Model
+	}
+	return modelroute.Route{
+		Provider: current.effective[threadID],
+		Model:    current.effectiveModel[threadID],
+	}, nil
 }
 
 func (current *session) clearEffectiveProvider(threadID string) {
