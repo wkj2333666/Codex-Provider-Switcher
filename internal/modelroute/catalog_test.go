@@ -64,7 +64,7 @@ func TestLoadResolvesAllowlistedProviderModels(t *testing.T) {
 	writeModels(t, directory, `{
   "glm": {
     "default": "glm-5.3",
-    "models": ["glm-5.3", "glm-5.2"]
+    "models": ["glm-5.3", "glm-5.3-flash", "glm-5.2"]
   }
 }`)
 
@@ -77,6 +77,9 @@ func TestLoadResolvesAllowlistedProviderModels(t *testing.T) {
 	}
 	if got, ok := catalog.ResolveModel("glm", "glm-5.2"); !ok || got != (Route{Provider: "glm", Model: "glm-5.2"}) {
 		t.Fatalf("ResolveModel(glm, glm-5.2) = %#v, %v", got, ok)
+	}
+	if got, ok := catalog.ResolveModel("glm", "glm-5.3-flash"); !ok || got != (Route{Provider: "glm", Model: "glm-5.3-flash"}) {
+		t.Fatalf("ResolveModel(glm, glm-5.3-flash) = %#v, %v", got, ok)
 	}
 	if got, ok := catalog.ResolveModel("glm", "deepseek-v4-pro"); ok || got != (Route{}) {
 		t.Fatalf("ResolveModel(glm, foreign model) = %#v, %v", got, ok)
