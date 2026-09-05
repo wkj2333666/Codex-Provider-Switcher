@@ -3,6 +3,7 @@ package rewrite
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -52,6 +53,29 @@ func TestLineRewritesRoutingMethods(t *testing.T) {
 				t.Errorf("unrelated params were not preserved: %#v", params)
 			}
 		})
+	}
+}
+
+func TestLineAddsUnknownSourceKindToList(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{"jsonrpc":"2.0","id":4,"method":"thread/list","params":{"limit":10}}`)
+	got, err := Line(input, modelroute.Route{Provider: "provider-a"})
+	if err != nil {
+		t.Fatalf("Line() error = %v", err)
+	}
+
+	var message struct {
+		Params struct {
+			SourceKinds []string `json:"sourceKinds"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(got, &message); err != nil {
+		t.Fatalf("rewritten message is invalid JSON: %v", err)
+	}
+	want := []string{"cli", "vscode", "unknown"}
+	if !slices.Equal(message.Params.SourceKinds, want) {
+		t.Fatalf("sourceKinds = %#v, want %#v", message.Params.SourceKinds, want)
 	}
 }
 

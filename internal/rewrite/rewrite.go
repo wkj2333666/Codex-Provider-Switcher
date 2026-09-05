@@ -66,6 +66,7 @@ func Line(line []byte, route modelroute.Route) ([]byte, error) {
 	}
 	if method == "thread/list" {
 		params["modelProviders"] = json.RawMessage("[]")
+		params["sourceKinds"] = json.RawMessage(`["cli","vscode","unknown"]`)
 	}
 
 	encodedParams, err := json.Marshal(params)
