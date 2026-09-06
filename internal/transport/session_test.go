@@ -704,8 +704,13 @@ func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
 			if err := json.Unmarshal(message.params["modelProviders"], &providers); err != nil || providers == nil || len(providers) != 0 {
 				t.Fatalf("thread/list modelProviders = %s, %v; want []", message.params["modelProviders"], err)
 			}
+			// Codex's default source filter can hide this otherwise readable task.
+			if !strings.Contains(string(message.params["sourceKinds"]), `"unknown"`) {
+				return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
+					`{"id":%s,"result":{"data":[],"nextCursor":null}}`, message.idKey)))
+			}
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
-				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q}],"nextCursor":null}}`, message.idKey, path)))
+				`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q,"modelProvider":"openai"}],"nextCursor":null}}`, message.idKey, path)))
 		}
 		if message.method == "thread/read" {
 			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(
@@ -715,7 +720,7 @@ func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
 	}
 	current = newTestSession(t, writer, nil)
 	current.codexHome = home
-	if _, err := current.sanitizeThreadRollout(context.Background(), "thr-a", ""); err != nil {
+	if _, err := current.sanitizeThreadRollout(context.Background(), "thr-a", "openai"); err != nil {
 		t.Fatalf("sanitizeThreadRollout() error = %v", err)
 	}
 	cleaned, err := os.ReadFile(path)
@@ -724,6 +729,21 @@ func TestSessionSanitizesRolloutBeforeResume(t *testing.T) {
 	}
 	if strings.Contains(string(cleaned), "item_stale") {
 		t.Fatalf("stale reasoning survived: %s", cleaned)
+	}
+}
+
+func TestSessionSanitationRejectsMissingExistingRollout(t *testing.T) {
+	var current *session
+	current = newTestSession(t, func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
+		m, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(`{"id":%s,"result":{"data":[],"nextCursor":null}}`, m.idKey)))
+	}, nil)
+	current.codexHome = t.TempDir()
+	if _, err := current.sanitizeThreadRollout(context.Background(), "existing-task", "openai"); err == nil {
+		t.Fatal("missing task was treated as clean")
 	}
 }
 

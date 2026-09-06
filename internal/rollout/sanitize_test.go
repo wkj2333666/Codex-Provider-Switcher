@@ -1,6 +1,8 @@
 package rollout
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,6 +10,71 @@ import (
 	"syscall"
 	"testing"
 )
+
+func TestSanitizePaginatedPreservesOffsetsAndUIHistory(t *testing.T) {
+	lines := []string{
+		`{"ordinal":0,"type":"session_meta","payload":{"id":"thr-a","history_mode":"paginated"}}`,
+		`{"ordinal":1,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning","id":"item_stale","summary_text":["visible"]}}}`,
+		`{"ordinal":2,"type":"response_item","payload":{"type":"reasoning","id":"item_stale","summary":[]}}`,
+		`{"ordinal":3,"type":"response_item","payload":{"type":"message","id":"item_msg","role":"assistant","content":[{"type":"output_text","text":"keep <text> 中文"}]}}`,
+		`{"ordinal":4,"type":"compacted","payload":{"replacement_history":[{"type":"reasoning","id":"item_checkpoint","summary":[]},{"type":"message","id":"item_msg","role":"assistant","content":[]}],"window_number":1}}`,
+	}
+	input := strings.Join(lines, "\n") + "\n"
+	var out bytes.Buffer
+	result, err := rewriteJSONL(strings.NewReader(input), &out, "thr-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ReasoningRemoved != 2 || result.IDsStripped != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	got := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(got) != len(lines) {
+		t.Fatalf("record count changed: %d", len(got))
+	}
+	for i := range lines {
+		if len(got[i]) != len(lines[i]) {
+			t.Fatalf("record %d shifted byte offsets", i)
+		}
+		var v map[string]any
+		if err := json.Unmarshal([]byte(got[i]), &v); err != nil {
+			t.Fatal(err)
+		}
+		if v["ordinal"] != float64(i) {
+			t.Fatalf("ordinal changed: %v", v)
+		}
+	}
+	if got[1] != lines[1] {
+		t.Fatal("UI event changed")
+	}
+	if strings.Contains(got[2], "item_stale") || !strings.Contains(got[2], `"type":"other"`) {
+		t.Fatal("reasoning not neutralized")
+	}
+	if strings.Contains(got[4], "item_checkpoint") || strings.Contains(got[4], "item_msg") {
+		t.Fatal("compact history was not cleaned")
+	}
+	var second bytes.Buffer
+	again, err := rewriteJSONL(strings.NewReader(out.String()), &second, "thr-a")
+	if err != nil || again.Changed || second.String() != out.String() {
+		t.Fatalf("not idempotent: %#v %v", again, err)
+	}
+}
+
+func TestSanitizePaginatedRejectsUnnumberedRecordWithoutWriting(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "rollout.jsonl")
+	original := `{"ordinal":0,"type":"session_meta","payload":{"id":"thr-a","history_mode":"paginated"}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"reasoning","id":"item_bad","summary":[]}}` + "\n"
+	if err := os.WriteFile(file, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SanitizeFile(file, "", "thr-a"); err == nil {
+		t.Fatal("accepted missing paginated ordinal")
+	}
+	got, err := os.ReadFile(file)
+	if err != nil || string(got) != original {
+		t.Fatal("malformed paginated file changed")
+	}
+}
 
 func TestSanitizeFileRemovesProviderBoundReasoningAndStripsStaleItemIDs(t *testing.T) {
 	dir := t.TempDir()

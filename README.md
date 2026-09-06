@@ -172,8 +172,12 @@ still fails closed or performs the full handoff as appropriate.
 When a task is handed to another provider, the switcher also checks its rollout
 for stale provider-bound reasoning IDs. Invalid reasoning records are removed
 and stale optional item IDs are stripped before app-server loads the history.
-A same-provider resume is passed through without rewriting valid provider-bound
-history. Cross-provider rewrites are atomic and keep visible messages and
+Compaction replacement history is checked too. OpenAI resumes also inspect history
+to repair contamination left by older switchers; other same-provider resumes pass through.
+Paginated rewrites preserve each record's byte length and ordinal, replacing invalid
+reasoning with model-ignored placeholders so UI history and SQLite offsets remain valid.
+A missing rollout for an existing task fails closed instead of being treated as clean.
+Cross-provider rewrites are atomic and keep visible messages and
 tool-call pairs. Malformed JSONL, or an active Codex writer when a rewrite is
 required, makes the operation fail closed; clean rollouts remain a no-op and
 the switcher never invents an `rs_` ID.

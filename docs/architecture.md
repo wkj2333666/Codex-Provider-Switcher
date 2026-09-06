@@ -214,13 +214,24 @@ selection and runtime differ, the response says the selection `will be applied b
 
 Ordinary `thread/resume` uses the same lock and reads the authoritative rollout
 path and runtime provider from `thread/list` before forwarding the resume. If
-the runtime provider already matches the selected provider, it leaves valid
+the runtime provider already matches the selected non-OpenAI provider, it leaves valid
 provider-bound history untouched; this also allows a loaded task whose writer
 lock is still held to resume normally. A cross-provider handoff sanitizes only
 after every ready peer has unsubscribed and before the first internal resume;
 resubscribing peers do not repeat the disk rewrite. The lock remains held
 through the app-server response so a new subscriber cannot appear midway
 through handoff. Internal request ids and their responses never reach Desktop.
+
+Internal rollout lookup supplies explicit interactive source kinds, including
+`unknown`, because internal RPCs bypass the Desktop request rewriter. An existing
+task missing from the lookup cannot be treated as sanitized. OpenAI resumes also
+inspect same-provider history to repair contamination that older versions skipped.
+Paginated sanitation replaces invalid response reasoning with `ResponseItem::Other`
+(ignored by Codex's context manager), strips stale optional response IDs, and cleans
+compaction replacement history. It preserves each numbered record's byte length
+with JSON whitespace and keeps its ordinal, so SQLite projection offsets and fork
+history boundaries remain valid. UI `item_completed` events are not model input
+and remain unchanged. No history database writes are required.
 
 Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before

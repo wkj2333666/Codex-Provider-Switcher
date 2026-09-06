@@ -172,10 +172,26 @@ func rewriteJSONL(input io.Reader, output io.Writer, threadID string) (Result, e
 	reader := bufio.NewReader(input)
 	var result Result
 	lineNumber := 0
+	paginated := false
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) != 0 {
 			lineNumber++
+			var record struct {
+				Ordinal *uint64 `json:"ordinal"`
+				Payload struct {
+					HistoryMode string `json:"history_mode"`
+				} `json:"payload"`
+			}
+			if err := json.Unmarshal(line, &record); err != nil {
+				return Result{}, errors.New("invalid rollout JSONL")
+			}
+			if lineNumber == 1 {
+				paginated = record.Payload.HistoryMode == "paginated" || record.Ordinal != nil
+			}
+			if paginated && record.Ordinal == nil {
+				return Result{}, errors.New("paginated rollout has missing ordinal")
+			}
 			cleaned, keep, changed, removed, stripped, parseErr := sanitizeLine(line)
 			if parseErr != nil {
 				return Result{}, errors.New("invalid rollout JSONL")
@@ -233,43 +249,132 @@ func sanitizeLine(line []byte) ([]byte, bool, bool, int, int, error) {
 			return nil, false, false, 0, 0, err
 		}
 	}
-	if envelopeType != "response_item" {
+	if envelopeType != "response_item" && envelopeType != "compacted" {
 		return line, true, false, 0, 0, nil
 	}
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(envelope["payload"], &payload); err != nil {
+	removed, stripped := 0, 0
+	if envelopeType == "compacted" {
+		var compact map[string]json.RawMessage
+		if err := json.Unmarshal(envelope["payload"], &compact); err != nil {
+			return nil, false, false, 0, 0, err
+		}
+		raw, exists := compact["replacement_history"]
+		if !exists || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return line, true, false, 0, 0, nil
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil, false, false, 0, 0, err
+		}
+		clean := make([]json.RawMessage, 0, len(items))
+		for _, item := range items {
+			encoded, drop, changed, err := sanitizeResponseItem(item)
+			if err != nil {
+				return nil, false, false, 0, 0, err
+			}
+			if drop {
+				removed++
+				continue
+			}
+			if changed {
+				stripped++
+			}
+			clean = append(clean, encoded)
+		}
+		if removed+stripped == 0 {
+			return line, true, false, 0, 0, nil
+		}
+		var err error
+		compact["replacement_history"], err = marshalUnescaped(clean)
+		if err != nil {
+			return nil, false, false, 0, 0, err
+		}
+		envelope["payload"], err = marshalUnescaped(compact)
+		if err != nil {
+			return nil, false, false, 0, 0, err
+		}
+	} else {
+		encoded, drop, changed, err := sanitizeResponseItem(envelope["payload"])
+		if err != nil {
+			return nil, false, false, 0, 0, err
+		}
+		if !changed {
+			return line, true, false, 0, 0, nil
+		}
+		if drop {
+			if _, numbered := envelope["ordinal"]; !numbered {
+				return nil, false, true, 1, 0, nil
+			}
+			// Codex discards ResponseItem::Other from model context. Keep a
+			// numbered no-op instead of shifting every downstream ordinal.
+			encoded = json.RawMessage(`{"type":"other"}`)
+			removed = 1
+		} else {
+			stripped = 1
+		}
+		envelope["payload"] = encoded
+	}
+	encoded, err := marshalUnescaped(envelope)
+	if err != nil {
 		return nil, false, false, 0, 0, err
+	}
+	if raw, numbered := envelope["ordinal"]; numbered {
+		var ordinal uint64
+		if err := json.Unmarshal(raw, &ordinal); err != nil || bytes.Equal(raw, []byte("null")) {
+			return nil, false, false, 0, 0, errors.New("invalid rollout ordinal")
+		}
+		// SQLite page cursors and fork history_base reference absolute bytes.
+		// JSON trailing whitespace preserves them without modifying the DB.
+		if len(encoded) > len(trimmed) {
+			return nil, false, false, 0, 0, errors.New("sanitation would shift rollout offsets")
+		}
+		encoded = append(encoded, bytes.Repeat([]byte{' '}, len(trimmed)-len(encoded))...)
+	}
+	if bytes.HasSuffix(line, []byte{'\n'}) {
+		encoded = append(encoded, '\n')
+	}
+	return encoded, true, true, removed, stripped, nil
+}
+
+func marshalUnescaped(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte{'\n'}), nil
+}
+
+// The UI's item_completed events deliberately remain unchanged: they do not
+// feed model context, and their IDs are valid keys in the history projection.
+func sanitizeResponseItem(raw json.RawMessage) (json.RawMessage, bool, bool, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, false, false, err
 	}
 	var itemType, id string
 	if rawType, present := payload["type"]; present {
 		if err := json.Unmarshal(rawType, &itemType); err != nil {
-			return nil, false, false, 0, 0, err
+			return nil, false, false, err
 		}
 	} else {
-		return nil, false, false, 0, 0, errors.New("response item has no type")
+		return nil, false, false, errors.New("response item has no type")
 	}
 	if rawID, present := payload["id"]; present && !bytes.Equal(bytes.TrimSpace(rawID), []byte("null")) {
 		if err := json.Unmarshal(rawID, &id); err != nil {
-			return nil, false, false, 0, 0, err
+			return nil, false, false, err
 		}
 	}
 	if id == "" || !strings.HasPrefix(id, "item_") {
-		return line, true, false, 0, 0, nil
+		return raw, false, false, nil
 	}
 	if itemType == "reasoning" {
-		return nil, false, true, 1, 0, nil
+		return nil, true, true, nil
 	}
 	delete(payload, "id")
-	encodedPayload, err := json.Marshal(payload)
-	if err != nil {
-		return nil, false, false, 0, 0, err
-	}
-	envelope["payload"] = encodedPayload
-	encodedEnvelope, err := json.Marshal(envelope)
-	if err != nil {
-		return nil, false, false, 0, 0, err
-	}
-	return append(encodedEnvelope, '\n'), true, true, 0, 1, nil
+	encoded, err := marshalUnescaped(payload)
+	return encoded, false, true, err
 }
 
 func acquireWriterLock(path string) (func(), error) {

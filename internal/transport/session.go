@@ -969,9 +969,12 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 		return "", err
 	}
 	if path == "" {
-		return "", nil
+		if current.isFresh(threadID) {
+			return "", nil
+		}
+		return "", errors.New("existing thread rollout unavailable for sanitation")
 	}
-	if expectedProvider != "" && runtimeRoute.Provider == expectedProvider {
+	if expectedProvider != "" && expectedProvider != "openai" && runtimeRoute.Provider == expectedProvider {
 		return path, nil
 	}
 	if err := rollout.ValidatePath(current.codexHome, threadID, path); err != nil {
@@ -998,6 +1001,9 @@ func (current *session) findRolloutPath(ctx context.Context, threadID string) (s
 		params := map[string]json.RawMessage{
 			"limit":          json.RawMessage(strconv.Itoa(rolloutListPageSize)),
 			"modelProviders": json.RawMessage("[]"),
+			// Internal RPCs bypass rewrite.Line; they need the same source
+			// compatibility as Desktop lists to find migrated interactive tasks.
+			"sourceKinds": json.RawMessage(`["cli","vscode","exec","appServer","unknown"]`),
 		}
 		if cursor != "" {
 			params["cursor"] = rawJSONString(cursor)

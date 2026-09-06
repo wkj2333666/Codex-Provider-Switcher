@@ -163,8 +163,11 @@ turn、服务端状态仍为 active、响应异常或 peer 协调失败时，仍
 
 任务转交给其他 provider 时，Switcher 还会检查 rollout 中遗留的、与旧 provider
 绑定的 reasoning ID。它会在 app-server 加载历史前删除非法 reasoning 记录，并从
-普通消息和工具调用中移除可选的过期 item ID；同一 provider 内恢复任务会直接透传，
-不会重写仍然有效的 provider 绑定历史。跨 provider 重写采用原子替换，并保持用户
+普通消息和工具调用中移除可选的过期 item ID，并检查 compact 保存的历史。
+OpenAI 恢复任务也会检查历史，防止旧版漏洗的记录继续报错；其他同 provider 恢复仍直接透传。
+分页 rollout 保持每行字节长度和 ordinal 不变，非法 reasoning 改为不进入模型上下文的占位记录，
+保留界面历史和 SQLite 分页偏移。已有任务的 rollout 查找失败会拒绝继续，不会视作“已清洗”。
+跨 provider 重写采用原子替换，并保持用户
 可见消息和工具调用配对不变。JSONL 损坏，或确需重写时 Codex 仍持有 writer lock，
 都会直接拒绝操作；已经干净的 rollout 只做无副作用检查，也绝不会伪造 `rs_` ID。
 
