@@ -355,9 +355,22 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	forceFullDirty := dirty && (commandRecognized || dirtyStageErr != nil || !dirtyStageFound ||
 		dirtyStage != handoff.DirtyStageUnsubscribed)
 	if !forceFullDirty && !effectiveResolved {
-		effectiveRoute, err = current.effectiveRouteForTurn(ctx, threadID)
-		if err != nil {
+		_, selected, exact, selectErr := current.selectedRouteState(threadID)
+		if selectErr != nil {
 			return current.writeHandoffError(ctx, message.id)
+		}
+		// An exact selection is the durable result of a verified switch or
+		// runtime resume. Treat it as authoritative instead of scanning
+		// thread/list: very large rollouts can make that reconcile slower
+		// than the client timeout and turn provider switching unusable.
+		if selected && exact {
+			effectiveRoute = targetRoute
+			effectiveResolved = true
+		} else {
+			effectiveRoute, err = current.effectiveRouteForTurn(ctx, threadID)
+			if err != nil {
+				return current.writeHandoffError(ctx, message.id)
+			}
 		}
 	}
 	if dirty {

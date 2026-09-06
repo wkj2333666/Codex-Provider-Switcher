@@ -1956,15 +1956,15 @@ func TestSessionRepairsSameProviderDirtyMarkerAfterRouteCacheLoss(t *testing.T) 
 		t.Fatal("same-provider dirty marker was not cleared after route cache loss")
 	}
 	messages := upstream.messages()
-	if len(messages) != 2 {
-		t.Fatalf("upstream messages = %q, want thread/list and turn/start", messages)
+	if len(messages) != 1 {
+		t.Fatalf("upstream messages = %q, want one turn/start without thread/list", messages)
 	}
-	turn, err := parseRPCMessage(messages[1])
+	turn, err := parseRPCMessage(messages[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if turn.method != "turn/start" {
-		t.Fatalf("second upstream method = %q, want turn/start", turn.method)
+	if err != nil || turn.method != "turn/start" {
+		t.Fatalf("upstream method = %#v, %v; want turn/start", turn, err)
 	}
 	assertRawString(t, turn.params, "model", "glm-5.3")
 }
@@ -2567,6 +2567,40 @@ func TestSessionUsesStoredProviderForNormalTurn(t *testing.T) {
 	turn, _ := parseRPCMessage(messages[1])
 	if requestedProvider != "sub2api" || turn.method != "turn/start" || turn.idKey != "24" {
 		t.Fatalf("resume provider = %q, turn = %#v", requestedProvider, turn)
+	}
+}
+
+func TestSessionExactSelectionAvoidsThreadListReconcile(t *testing.T) {
+	t.Parallel()
+	coordinator := &fakeHandoffCoordinator{}
+	selections := &fakeProviderSelections{
+		values: map[string]string{"thr-a": "glm"},
+		models: map[string]string{"thr-a": "glm-5.3"},
+	}
+	var upstream messageRecorder
+	writer := func(ctx context.Context, messageType websocket.MessageType, payload []byte) error {
+		return upstream.write(ctx, messageType, payload)
+	}
+	current := newTestSession(t, writer, nil)
+	current.routes = testMultiModelCatalog(t)
+	current.selections = selections
+	current.coordinator = coordinator
+
+	request := []byte(`{"id":31,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
+	if err := current.handleDownstreamText(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	messages := upstream.messages()
+	if len(messages) != 1 {
+		t.Fatalf("upstream messages = %q, want only turn/start", messages)
+	}
+	turn, err := parseRPCMessage(messages[0])
+	if err != nil || turn.method != "turn/start" {
+		t.Fatalf("upstream turn = %#v, %v", turn, err)
+	}
+	assertRawString(t, turn.params, "model", "glm-5.3")
+	if _, present := turn.params["modelProvider"]; present {
+		t.Fatalf("turn/start gained modelProvider: %#v", turn.params)
 	}
 }
 

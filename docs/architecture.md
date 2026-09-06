@@ -226,6 +226,10 @@ Internal rollout lookup supplies explicit interactive source kinds, including
 `unknown`, because internal RPCs bypass the Desktop request rewriter. An existing
 task missing from the lookup cannot be treated as sanitized. OpenAI resumes also
 inspect same-provider history to repair contamination that older versions skipped.
+When a task has an exact provider-and-model selection, ordinary turn starts treat
+that durable selection as authoritative and skip the authoritative `thread/list`
+reconcile. This keeps very large tasks responsive after reconnects; dirty stages
+other than `unsubscribed` still force the full coordinated handoff path.
 Paginated sanitation replaces invalid response reasoning with `ResponseItem::Other`
 (ignored by Codex's context manager), strips stale optional response IDs, and cleans
 compaction replacement history. It preserves each numbered record's byte length
