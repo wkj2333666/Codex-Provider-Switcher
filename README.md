@@ -180,6 +180,8 @@ A missing rollout for an existing task fails closed instead of being treated as 
 Recovery journals record the sanitized rollout fingerprint. Unchanged retries skip the
 completed history pass; changed rollouts are sanitized again. The sanitizer scans
 envelopes first and deeply parses only records that can contain stale IDs.
+Recovery runtime verification resumes with `excludeTurns`, so very large paginated
+threads are not hydrated just to complete a provider reload.
 Cross-provider rewrites are atomic and keep visible messages and
 tool-call pairs. Malformed JSONL, or an active Codex writer when a rewrite is
 required, makes the operation fail closed; clean rollouts remain a no-op and

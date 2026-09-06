@@ -669,6 +669,12 @@ func TestRunRepairsPersistedRecoveryBeforeProviderSwitch(t *testing.T) {
 	if fmt.Sprint(unarchived) != fmt.Sprint([]string{"thr-child", "thr-shared"}) {
 		t.Fatalf("repair unarchived = %v", unarchived)
 	}
+	server.mu.Lock()
+	resumes := append([]handoffResumeRecord(nil), server.resumes...)
+	server.mu.Unlock()
+	if len(resumes) == 0 || !resumes[0].excludeTurns {
+		t.Fatalf("recovery resume excludeTurns = %#v", resumes)
+	}
 	if calls := server.turnStartCallCount(); calls != 0 {
 		t.Fatalf("repair turn/start calls = %d", calls)
 	}
@@ -1136,9 +1142,10 @@ type handoffTurnRecord struct {
 }
 
 type handoffResumeRecord struct {
-	threadID string
-	provider string
-	model    string
+	threadID     string
+	provider     string
+	model        string
+	excludeTurns bool
 }
 
 func newHandoffAppServer(t *testing.T, ctx context.Context, autoComplete bool) *handoffAppServer {
@@ -1248,11 +1255,14 @@ func (server *handoffAppServer) handleResume(connection *websocket.Conn, clientI
 	requestedModel := ""
 	_ = json.Unmarshal(message.params["model"], &requestedModel)
 	threadID, _ := requireThreadID(message)
+	excludeTurns := false
+	_ = json.Unmarshal(message.params["excludeTurns"], &excludeTurns)
 	server.mu.Lock()
 	server.resumes = append(server.resumes, handoffResumeRecord{
-		threadID: threadID,
-		provider: requestedProvider,
-		model:    requestedModel,
+		threadID:     threadID,
+		provider:     requestedProvider,
+		model:        requestedModel,
+		excludeTurns: excludeTurns,
 	})
 	if requestedProvider != "" && requestedProvider != server.provider &&
 		server.freshNeedsMaterialize && !server.rolloutReady {

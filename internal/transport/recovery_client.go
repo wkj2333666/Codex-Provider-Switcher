@@ -261,6 +261,9 @@ func (client *recoveryClient) resume(ctx context.Context, threadID string, expec
 	params := map[string]json.RawMessage{
 		"threadId":      rawJSONString(threadID),
 		"modelProvider": rawJSONString(expectedRoute.Provider),
+		// Recovery only needs runtime verification. Full-turn hydration can
+		// make very large paginated threads fail or time out.
+		"excludeTurns": json.RawMessage("true"),
 	}
 	if expectedRoute.Model != "" {
 		params["model"] = rawJSONString(expectedRoute.Model)

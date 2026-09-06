@@ -238,6 +238,8 @@ nanosecond mtime). A retry whose rollout is unchanged skips the completed histor
 pass instead of rescanning a multi-gigabyte rollout; any changed file forces a
 fresh sanitation pass. The sanitizer performs a lightweight envelope scan first
 and decodes only response or compaction records that can contain stale IDs.
+Recovery runtime verification resumes with `excludeTurns`, so a very large
+paginated thread is never hydrated just to finish a provider reload.
 
 Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before
