@@ -106,7 +106,7 @@ a `default` plus a `models` allowlist; a string still means â€œonly this modelâ€
 STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 install -m 0600 /dev/null "$STATE_ROOT/models.json"
-printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-6-astra","gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.3-flash","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
+printf '%s\n' '{"openai":{"default":"gpt-6-astra","models":["gpt-6-astra","gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.3-flash","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$STATE_ROOT/models.json"
 ```
 
@@ -278,7 +278,7 @@ STATE_ROOT="${CODEX_HOME:-$HOME/.codex}/codex-provider-switcher"
 install -d -m 0700 "$STATE_ROOT"
 MODELS_STAGE="$(mktemp "$STATE_ROOT/.models.json.XXXXXX")"
 install -m 0600 /dev/null "$MODELS_STAGE"
-printf '%s\n' '{"openai":{"default":"gpt-5.6-sol","models":["gpt-6-astra","gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.3-flash","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
+printf '%s\n' '{"openai":{"default":"gpt-6-astra","models":["gpt-6-astra","gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna","gpt-5.5","gpt-5.4","gpt-5.4-mini","gpt-5.3-codex-spark"]},"sub2api":"gpt-5.6-sol","glm":{"default":"glm-5.3","models":["glm-5.3","glm-5.3-flash","glm-5.2"]},"kimi":"k3","deepseek":{"default":"deepseek-v4-flash","models":["deepseek-v4-flash","deepseek-v4-pro"]},"openrouter":{"default":"stealth/ox-alpha","models":["stealth/ox-alpha"]}}' \
   > "$MODELS_STAGE"
 mv -f "$MODELS_STAGE" "$STATE_ROOT/models.json"
 mv -f "$BINARY_STAGE" "$INSTALL_ROOT/codex-provider-switcher"
