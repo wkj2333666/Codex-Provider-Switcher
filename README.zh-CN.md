@@ -167,6 +167,8 @@ turn、服务端状态仍为 active、响应异常或 peer 协调失败时，仍
 OpenAI 恢复任务也会检查历史，防止旧版漏洗的记录继续报错；其他同 provider 恢复仍直接透传。
 分页 rollout 保持每行字节长度和 ordinal 不变，非法 reasoning 改为不进入模型上下文的占位记录，
 保留界面历史和 SQLite 分页偏移。已有任务的 rollout 查找失败会拒绝继续，不会视作“已清洗”。
+恢复 journal 还会记录已清洗 rollout 的文件指纹；文件未变化时重试不再重复扫描超大 rollout，
+文件变化则重新清洗。sanitizer 会先做轻量 envelope 扫描，只深入解析可能含过期 ID 的记录。
 跨 provider 重写采用原子替换，并保持用户
 可见消息和工具调用配对不变。JSONL 损坏，或确需重写时 Codex 仍持有 writer lock，
 都会直接拒绝操作；已经干净的 rollout 只做无副作用检查，也绝不会伪造 `rs_` ID。

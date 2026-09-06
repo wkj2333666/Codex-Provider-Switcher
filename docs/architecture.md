@@ -233,6 +233,12 @@ with JSON whitespace and keeps its ordinal, so SQLite projection offsets and for
 history boundaries remain valid. UI `item_completed` events are not model input
 and remain unchanged. No history database writes are required.
 
+Recovery journals also record the sanitized rollout fingerprint (inode, size, and
+nanosecond mtime). A retry whose rollout is unchanged skips the completed history
+pass instead of rescanning a multi-gigabyte rollout; any changed file forces a
+fresh sanitation pass. The sanitizer performs a lightweight envelope scan first
+and decodes only response or compaction records that can contain stale IDs.
+
 Only peers whose coordinator unsubscribe actually detached an existing
 subscription are resumed. That resume restores the app-server listener before
 the turn begins, so previously open Desktop views continue receiving item and

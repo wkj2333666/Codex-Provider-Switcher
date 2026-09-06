@@ -732,6 +732,14 @@ func (current *session) recoverProviderMismatch(ctx context.Context, threadID st
 	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
 		return errors.New("provider recovery rollout sanitation failed")
 	}
+	if path, _, _, pathErr := current.findRolloutPath(ctx, threadID); pathErr == nil && path != "" {
+		if fingerprint, fingerprintErr := rollout.Fingerprint(path); fingerprintErr == nil {
+			journal.SanitizedFingerprint = fingerprint
+			if err := current.recoveries.Save(journal); err != nil {
+				return errors.New("record provider recovery sanitation")
+			}
+		}
+	}
 	if err := current.internalResume(ctx, threadID, targetRoute); err != nil {
 		return err
 	}
@@ -797,10 +805,35 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 			return errors.New("update provider recovery repair journal")
 		}
 	}
-	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
-		return errors.New("provider recovery repair rollout sanitation failed")
-	}
 	wantedRoute := modelroute.Route{Provider: journal.Provider, Model: journal.Model}
+	path, _, _, err := current.findRolloutPath(ctx, threadID)
+	if err != nil {
+		return err
+	}
+	var fingerprint string
+	if path != "" {
+		if err := rollout.ValidatePath(current.codexHome, threadID, path); err != nil {
+			return err
+		}
+		fingerprint, err = rollout.Fingerprint(path)
+		if err != nil {
+			return err
+		}
+		if fingerprint != journal.SanitizedFingerprint {
+			if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
+				return errors.New("provider recovery repair rollout sanitation failed")
+			}
+			fingerprint, err = rollout.Fingerprint(path)
+			if err != nil {
+				return err
+			}
+			journal.SanitizedFingerprint = fingerprint
+			journal.Phase = "restoring"
+			if err := current.recoveries.Save(journal); err != nil {
+				return errors.New("record provider recovery repair sanitation")
+			}
+		}
+	}
 	route, err := client.resume(ctx, threadID, wantedRoute)
 	if err != nil {
 		return err

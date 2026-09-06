@@ -177,6 +177,9 @@ to repair contamination left by older switchers; other same-provider resumes pas
 Paginated rewrites preserve each record's byte length and ordinal, replacing invalid
 reasoning with model-ignored placeholders so UI history and SQLite offsets remain valid.
 A missing rollout for an existing task fails closed instead of being treated as clean.
+Recovery journals record the sanitized rollout fingerprint. Unchanged retries skip the
+completed history pass; changed rollouts are sanitized again. The sanitizer scans
+envelopes first and deeply parses only records that can contain stale IDs.
 Cross-provider rewrites are atomic and keep visible messages and
 tool-call pairs. Malformed JSONL, or an active Codex writer when a rewrite is
 required, makes the operation fail closed; clean rollouts remain a no-op and

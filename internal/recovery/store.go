@@ -22,13 +22,14 @@ const (
 
 // Journal is the minimal durable state needed to repair an interrupted reload.
 type Journal struct {
-	Version   int      `json:"version"`
-	RootID    string   `json:"rootId"`
-	Provider  string   `json:"provider"`
-	Model     string   `json:"model,omitempty"`
-	Phase     string   `json:"phase"`
-	Threads   []string `json:"threads"`
-	Remaining []string `json:"remaining"`
+	Version              int      `json:"version"`
+	RootID               string   `json:"rootId"`
+	Provider             string   `json:"provider"`
+	Model                string   `json:"model,omitempty"`
+	Phase                string   `json:"phase"`
+	SanitizedFingerprint string   `json:"sanitizedFingerprint,omitempty"`
+	Threads              []string `json:"threads"`
+	Remaining            []string `json:"remaining"`
 }
 
 // Store owns recovery journals under one provider selection directory.
@@ -169,6 +170,7 @@ func validateJournal(journal Journal) error {
 	if !validRouteVersion || journal.RootID == "" || len(journal.RootID) > 1024 ||
 		!providerid.Valid(journal.Provider) ||
 		(journal.Phase != "prepared" && journal.Phase != "restoring") ||
+		len(journal.SanitizedFingerprint) > 128 ||
 		len(journal.Threads) == 0 || len(journal.Threads) > maxThreadIDs ||
 		len(journal.Remaining) > len(journal.Threads) {
 		return errors.New("invalid recovery journal")

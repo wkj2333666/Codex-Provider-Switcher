@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/config"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/recovery"
+	"github.com/wkj2333666/Codex-Provider-Switcher/internal/rollout"
 	"github.com/wkj2333666/Codex-Provider-Switcher/internal/selection"
 )
 
@@ -672,6 +673,71 @@ func TestRunRepairsPersistedRecoveryBeforeProviderSwitch(t *testing.T) {
 		t.Fatalf("repair turn/start calls = %d", calls)
 	}
 
+	cancel()
+	_ = connection.CloseNow()
+	waitProxyDone(t, done)
+}
+
+func TestRunRepairSkipsRecordedSanitationWhenRolloutUnchanged(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server := newHandoffAppServer(t, ctx, true)
+	home := t.TempDir()
+	rolloutDirectory := filepath.Join(home, "sessions", "2026", "08", "24")
+	if err := os.MkdirAll(rolloutDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(rolloutDirectory, "rollout-2026-08-24T00-00-00-thr-shared.jsonl")
+	rolloutContents := `{"type":"session_meta","payload":{"id":"thr-shared"}}` + "\n" +
+		`{"type":"response_item","payload":{"type":"reasoning","id":"item_already_sanitized_marker"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(rolloutContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	store, err := recovery.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := rollout.Fingerprint(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := recovery.Journal{
+		Version: 1, RootID: "thr-shared", Provider: "sub2api", Phase: "restoring",
+		Threads: []string{"thr-shared"}, SanitizedFingerprint: fingerprint,
+	}
+	if err := store.Save(journal); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.provider = "sub2api"
+	server.listIncludesRoot = true
+	server.rolloutPath = rolloutPath
+	server.mu.Unlock()
+	connection, done := dialProviderProxyOptions(t, ctx, config.Config{
+		Provider: "sub2api", Socket: server.socket, StateDir: stateDir, CodexHome: home,
+	})
+	defer connection.CloseNow()
+	initializeTestClient(t, ctx, connection)
+	if provider := resumeTestThread(t, ctx, connection, 2); provider != "sub2api" {
+		t.Fatalf("provider after fingerprinted repair = %q", provider)
+	}
+	server.mu.Lock()
+	resumes := append([]handoffResumeRecord(nil), server.resumes...)
+	server.mu.Unlock()
+	if len(resumes) != 2 || resumes[0].provider != "sub2api" || resumes[1].provider != "sub2api" {
+		t.Fatalf("fingerprinted repair resumes = %#v", resumes)
+	}
+	cleaned, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(cleaned, []byte("item_already_sanitized_marker")) {
+		t.Fatalf("recorded sanitation was repeated: %s", cleaned)
+	}
+	if _, found, err := store.Load("thr-shared"); err != nil || found {
+		t.Fatalf("fingerprinted journal after repair = found %v, err %v", found, err)
+	}
 	cancel()
 	_ = connection.CloseNow()
 	waitProxyDone(t, done)

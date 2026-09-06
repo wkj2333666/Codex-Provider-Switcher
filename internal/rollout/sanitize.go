@@ -22,6 +22,21 @@ var (
 	ErrUnsafeThread = errors.New("unsafe thread ID")
 )
 
+// Fingerprint identifies the durable rollout file without reading its bytes.
+// Recovery uses it to skip a sanitation pass that already completed against
+// exactly this file version.
+func Fingerprint(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("fingerprint rollout")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", errors.New("unsupported rollout fingerprint")
+	}
+	return fmt.Sprintf("%d:%d:%d", stat.Ino, info.Size(), stat.Mtim.Nano()), nil
+}
+
 // Result describes one sanitation pass.
 type Result struct {
 	Changed          bool
@@ -177,22 +192,19 @@ func rewriteJSONL(input io.Reader, output io.Writer, threadID string) (Result, e
 		line, err := reader.ReadBytes('\n')
 		if len(line) != 0 {
 			lineNumber++
-			var record struct {
-				Ordinal *uint64 `json:"ordinal"`
-				Payload struct {
-					HistoryMode string `json:"history_mode"`
-				} `json:"payload"`
-			}
-			if err := json.Unmarshal(line, &record); err != nil {
-				return Result{}, errors.New("invalid rollout JSONL")
-			}
 			if lineNumber == 1 {
+				var record struct {
+					Ordinal *uint64 `json:"ordinal"`
+					Payload struct {
+						HistoryMode string `json:"history_mode"`
+					} `json:"payload"`
+				}
+				if err := json.Unmarshal(line, &record); err != nil {
+					return Result{}, errors.New("invalid rollout JSONL")
+				}
 				paginated = record.Payload.HistoryMode == "paginated" || record.Ordinal != nil
 			}
-			if paginated && record.Ordinal == nil {
-				return Result{}, errors.New("paginated rollout has missing ordinal")
-			}
-			cleaned, keep, changed, removed, stripped, parseErr := sanitizeLine(line)
+			cleaned, keep, changed, removed, stripped, parseErr := sanitizeLine(line, paginated)
 			if parseErr != nil {
 				return Result{}, errors.New("invalid rollout JSONL")
 			}
@@ -234,11 +246,33 @@ func validateSessionMeta(line []byte, threadID string) error {
 	return nil
 }
 
-func sanitizeLine(line []byte) ([]byte, bool, bool, int, int, error) {
+func sanitizeLine(line []byte, paginated bool) ([]byte, bool, bool, int, int, error) {
 	trimmed := bytes.TrimSuffix(line, []byte{'\n'})
 	if len(bytes.TrimSpace(trimmed)) == 0 {
 		return nil, false, false, 0, 0, errors.New("empty rollout line")
 	}
+	// Parse only the small envelope first. A large rollout contains many
+	// event records; decoding every payload into maps made recovery scans
+	// unnecessarily expensive.
+	var probe struct {
+		Type    string          `json:"type"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return nil, false, false, 0, 0, err
+	}
+	if probe.Type != "response_item" && probe.Type != "compacted" {
+		return line, true, false, 0, 0, nil
+	}
+	if probe.Type == "response_item" {
+		if !bytes.Contains(probe.Payload, []byte(`"id":`)) {
+			return line, true, false, 0, 0, nil
+		}
+	} else if !bytes.Contains(probe.Payload, []byte(`"replacement_history"`)) ||
+		!bytes.Contains(probe.Payload, []byte(`"id":`)) {
+		return line, true, false, 0, 0, nil
+	}
+
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &envelope); err != nil {
 		return nil, false, false, 0, 0, err
@@ -248,9 +282,6 @@ func sanitizeLine(line []byte) ([]byte, bool, bool, int, int, error) {
 		if err := json.Unmarshal(rawType, &envelopeType); err != nil {
 			return nil, false, false, 0, 0, err
 		}
-	}
-	if envelopeType != "response_item" && envelopeType != "compacted" {
-		return line, true, false, 0, 0, nil
 	}
 	removed, stripped := 0, 0
 	if envelopeType == "compacted" {
@@ -302,8 +333,8 @@ func sanitizeLine(line []byte) ([]byte, bool, bool, int, int, error) {
 			return line, true, false, 0, 0, nil
 		}
 		if drop {
-			if _, numbered := envelope["ordinal"]; !numbered {
-				return nil, false, true, 1, 0, nil
+			if _, numbered := envelope["ordinal"]; paginated && !numbered {
+				return nil, false, false, 0, 0, errors.New("paginated rollout has missing ordinal")
 			}
 			// Codex discards ResponseItem::Other from model context. Keep a
 			// numbered no-op instead of shifting every downstream ordinal.
