@@ -360,6 +360,33 @@ fails closed instead of starting a second daemon.
 For transport and handoff details, see
 [docs/architecture.md](docs/architecture.md).
 
+## Optional cold history maintenance (Linux)
+
+Compressed native `.jsonl.zst` histories are restored under Codex's maintenance
+and writer locks before provider sanitation. Install `zstd` to restore them.
+The first restore includes decompression and sanitation; subsequent opens use
+the ordinary JSONL and sanitation cache.
+
+After a matching local deployment, run `scripts/install-history-maintenance.sh`
+to install an optional daily systemd user timer (Python 3.11+ required). It only
+compresses archived tasks unused for at least 30 days, with an initial 30-day
+observation period. Archive/update dates, filesystem access and proxy task RPC
+access are checked; bypass clients depend on native metadata, atime and locks.
+Each run handles at most five files / 2 GiB of source history. Busy or newly
+accessed histories are skipped. Full SHA-256 roundtrip verification precedes
+publication. History content, indexes, attachments and migration backups remain
+intact. Leave native `local_thread_store_compression` disabled.
+
+The installer targets `~/.codex`; adjust the service's `--home` argument for a
+custom home. `sqlite_home` is read from its `config.toml`, defaulting to Codex
+home. Reports live at `codex-provider-switcher/history-maintenance-last-run.json`
+inside that home. The timer runs while the user service manager is available.
+Disable before uninstalling:
+
+```bash
+systemctl --user disable --now codex-history-maintenance.timer
+```
+
 ## Uninstall
 
 Remove the switcher exports from the remote login-shell profile, then remove the

@@ -25,7 +25,7 @@ import (
 
 const (
 	handoffErrorCode          = -32090
-	handoffUnavailableMessage = "provider handoff unavailable; retry after the active turn finishes"
+	handoffUnavailableMessage = "provider handoff unavailable; retry or check history restoration and task activity"
 	internalCallTimeout       = 30 * time.Second
 	handoffRecoveryTimeout    = 5 * time.Second
 	providerCommandErrorCode  = -32602
@@ -138,6 +138,12 @@ func (current *session) handleDownstreamText(ctx context.Context, payload []byte
 	message, err := parseRPCMessage(payload)
 	if err != nil {
 		return errRoutingPolicy
+	}
+
+	if message.kind == rpcRequest {
+		if threadID, err := requireThreadID(message); err == nil {
+			rollout.NoteAccess(current.codexHome, threadID)
+		}
 	}
 
 	switch message.method {
@@ -537,6 +543,13 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		return current.writeHandoffError(ctx, message.id)
 	}
 	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID, targetRoute.Provider)
+	if errors.Is(err, rollout.ErrCompressedHistory) {
+		encoded, encodeErr := encodeRPCError(message.id, handoffErrorCode, err.Error())
+		if encodeErr != nil {
+			return encodeErr
+		}
+		return current.writeDownstream(ctx, websocket.MessageText, encoded)
+	}
 	if errors.Is(err, rollout.ErrActiveWriter) {
 		// App-server keeps an idle thread's writer lock while it is loaded. A
 		// rollout that needs sanitation must therefore go through the same
@@ -1029,10 +1042,11 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 	if expectedProvider != "" && expectedProvider != "openai" && runtimeRoute.Provider == expectedProvider {
 		return path, nil
 	}
-	if err := rollout.ValidatePath(current.codexHome, threadID, path); err != nil {
+	lockPath := filepath.Join(current.codexHome, "thread-writer-locks", threadID+".lock")
+	path, err = rollout.PreparePlain(ctx, current.codexHome, threadID, path, lockPath)
+	if err != nil {
 		return "", err
 	}
-	lockPath := filepath.Join(current.codexHome, "thread-writer-locks", threadID+".lock")
 	_, err = rollout.SanitizeFile(path, lockPath, threadID)
 	return path, err
 }
@@ -1048,7 +1062,7 @@ func (current *session) findRolloutPath(ctx context.Context, threadID string) (s
 // paths; preserve the normal scan-and-repair lookup as a fallback.
 func (current *session) findSanitationPath(ctx context.Context, threadID string) (string, error) {
 	path, _, _, err := current.listRolloutPath(ctx, threadID, true)
-	if err == nil && rollout.ValidatePath(current.codexHome, threadID, path) == nil {
+	if _, resolveErr := rollout.ResolvePath(current.codexHome, threadID, path); err == nil && resolveErr == nil {
 		return path, nil
 	}
 	if ctx.Err() != nil {
@@ -1064,6 +1078,7 @@ func (current *session) listRolloutPath(ctx context.Context, threadID string, st
 	}
 	seenCursors := make(map[string]bool)
 	cursor := ""
+	archived := false
 	found := false
 	foundPath := ""
 	foundRoute := modelroute.Route{}
@@ -1075,6 +1090,9 @@ func (current *session) listRolloutPath(ctx context.Context, threadID string, st
 			// Internal RPCs bypass rewrite.Line; they need the same source
 			// compatibility as Desktop lists to find migrated interactive tasks.
 			"sourceKinds": json.RawMessage(`["cli","vscode","exec","appServer","unknown"]`),
+		}
+		if archived {
+			params["archived"] = json.RawMessage("true")
 		}
 		if cursor != "" {
 			params["cursor"] = rawJSONString(cursor)
@@ -1121,6 +1139,12 @@ func (current *session) listRolloutPath(ctx context.Context, threadID string, st
 		if result.NextCursor == nil || *result.NextCursor == "" {
 			if found {
 				return foundPath, foundRoute, foundStatus, nil
+			}
+			if !archived {
+				archived = true
+				cursor = ""
+				seenCursors = make(map[string]bool)
+				continue
 			}
 			return "", modelroute.Route{}, "", nil
 		}

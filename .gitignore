@@ -4,3 +4,4 @@
 /codex-provider-switcher
 *.out
 coverage.*
+__pycache__/

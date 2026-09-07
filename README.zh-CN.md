@@ -315,8 +315,41 @@ handoff。如果 Codex 在 unsubscribe 后仍持有失败任务的 rollout 写�
 传输和 handoff 的技术细节见
 [docs/architecture.md](docs/architecture.md)。
 
+## 冷历史压缩（可选，Linux）
+
+Switcher 支持原生 `.jsonl.zst` 历史：恢复前在 Codex 写锁保护下解压，随后执行
+原有 provider 清理。需要系统安装 `zstd`。首次恢复包含完整解压和清理开销，
+恢复后保留普通 JSONL，后续打开和切换继续使用缓存。
+
+本地部署后可启用独立的每日维护（Python 3.11+、systemd user）：
+
+```bash
+scripts/install-history-maintenance.sh
+systemctl --user status codex-history-maintenance.timer
+```
+
+策略只处理 **已归档且至少 30 天未使用** 的历史，同时检查归档时间、更新时间、
+文件访问时间及 switcher 记录的 task RPC 访问。首次启用先观察 30 天；未知访问
+记录不会立即按旧文件日期推断。访问跟踪覆盖经 switcher 的客户端请求；旁路客户端
+依赖原生索引、文件访问时间和写锁。此维护器面向本地 `CODEX_HOME`，读取其中
+`config.toml` 的 `sqlite_home`，未设置时使用原生默认 `CODEX_HOME`。
+
+维护在用户服务运行时每天执行，最多处理 5 份、总输入 2 GiB，跳过正在写入或
+刚被访问的历史。输出逐字节 SHA-256 校验通过后才替换；不删除对话内容，不清理
+历史索引、附件或迁移备份。不要同时开启范围更广的原生
+`local_thread_store_compression` 功能。安装器使用默认 `~/.codex`；自定义 home
+需要相应调整服务的 `--home` 参数。
+
+查看上次报告：`~/.codex/codex-provider-switcher/history-maintenance-last-run.json`。
+禁用维护：
+
+```bash
+systemctl --user disable --now codex-history-maintenance.timer
+```
+
 ## 卸载
 
+如果启用过冷历史维护，先禁用上面的 timer。
 先从远程登录 Shell 配置文件中删除安装时加入的 switcher export，然后删除 wrapper
 和 skill：
 

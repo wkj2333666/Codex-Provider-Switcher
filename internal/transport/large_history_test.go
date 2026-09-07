@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -99,5 +100,45 @@ func TestInternalResumesNeverHydrateHistory(t *testing.T) {
 				t.Fatal("internal resume changed Desktop history preference")
 			}
 		})
+	}
+}
+
+func TestSanitationFindsCompressedArchivedHistory(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd required")
+	}
+	home := t.TempDir()
+	dir := filepath.Join(home, "archived_sessions")
+	os.Mkdir(dir, 0700)
+	path := filepath.Join(dir, "rollout.jsonl")
+	os.WriteFile(path, []byte("{\"type\":\"session_meta\",\"payload\":{\"id\":\"thr-a\"}}\n"), 0600)
+	if out, err := exec.Command("zstd", "-q", "--rm", path).CombinedOutput(); err != nil {
+		t.Fatalf("zstd: %v %s", err, out)
+	}
+	var current *session
+	current = newTestSession(t, func(ctx context.Context, _ websocket.MessageType, data []byte) error {
+		m, err := parseRPCMessage(data)
+		if err != nil {
+			return err
+		}
+		if string(m.params["archived"]) != "true" {
+			return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(`{"id":%s,"result":{"data":[],"nextCursor":null}}`, m.idKey)))
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(`{"id":%s,"result":{"data":[{"id":"thr-a","path":%q,"modelProvider":"openai"}],"nextCursor":null}}`, m.idKey, path)))
+	}, nil)
+	current.codexHome = home
+	if got, err := current.sanitizeThreadRollout(context.Background(), "thr-a", "openai"); err != nil || got != path {
+		t.Fatalf("archived resume sanitation: %q %v", got, err)
+	}
+}
+
+func TestReadOnlyTaskRPCRecordsAccess(t *testing.T) {
+	current := newTestSession(t, func(context.Context, websocket.MessageType, []byte) error { return nil }, nil)
+	current.codexHome = t.TempDir()
+	if err := current.handleDownstreamText(context.Background(), []byte(`{"id":1,"method":"thread/read","params":{"threadId":"thr-a","includeTurns":false}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(current.codexHome, "codex-provider-switcher", "history-access", "thr-a")); err != nil {
+		t.Fatal("read-only access not recorded:", err)
 	}
 }

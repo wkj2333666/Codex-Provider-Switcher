@@ -51,6 +51,12 @@ jobs:
       - name: Run vet
         run: go vet ./...
 
+      - name: Install history compression test dependency
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Test history maintenance
+        run: python3 -m unittest discover -s scripts -p test_history_maintenance.py
+
       - name: Run tests
         run: go test ./...
 
