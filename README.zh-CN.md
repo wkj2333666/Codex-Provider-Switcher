@@ -170,7 +170,8 @@ OpenAI 恢复任务也会检查历史，防止旧版漏洗的记录继续报错�
 恢复 journal 还会记录已清洗 rollout 的文件指纹；文件未变化时重试不再重复扫描超大 rollout，
 文件变化则重新清洗。sanitizer 会先做轻量 envelope 扫描，只深入解析可能含过期 ID 的记录。
 recovery 的 runtime 校验 resume 会带 `excludeTurns`，超大分页任务不会为了完成 provider 切换而水合完整历史。
-已有精确 provider+model 选择时，普通 turn 不再为了 reconcile 扫描 `thread/list`；
+保存的 provider+model 是目标选择，不能证明运行时已切换。普通 turn 和切换命令
+都会与已观测的运行路由比较；有运行路由缓存时不扫描 `thread/list`，否则仍需查询。
 除 `unsubscribed` 以外的 dirty 阶段仍走完整 handoff。
 跨 provider 重写采用原子替换，并保持用户
 可见消息和工具调用配对不变。JSONL 损坏，或确需重写时 Codex 仍持有 writer lock，

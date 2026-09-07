@@ -182,9 +182,10 @@ completed history pass; changed rollouts are sanitized again. The sanitizer scan
 envelopes first and deeply parses only records that can contain stale IDs.
 Recovery runtime verification resumes with `excludeTurns`, so very large paginated
 threads are not hydrated just to complete a provider reload.
-An exact provider-and-model selection is authoritative for ordinary turn starts;
-they skip `thread/list` reconciliation. Dirty stages other than `unsubscribed`
-still use the full coordinated handoff path.
+A saved provider-and-model selection is the desired route, not proof of the
+loaded runtime. Turn starts and provider commands compare it with the observed
+runtime route; a cached route avoids `thread/list`, otherwise discovery is required.
+Dirty stages other than `unsubscribed` still use the full coordinated handoff path.
 Cross-provider rewrites are atomic and keep visible messages and
 tool-call pairs. Malformed JSONL, or an active Codex writer when a rewrite is
 required, makes the operation fail closed; clean rollouts remain a no-op and

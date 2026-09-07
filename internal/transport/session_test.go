@@ -1956,13 +1956,14 @@ func TestSessionRepairsSameProviderDirtyMarkerAfterRouteCacheLoss(t *testing.T) 
 		t.Fatal("same-provider dirty marker was not cleared after route cache loss")
 	}
 	messages := upstream.messages()
-	if len(messages) != 1 {
-		t.Fatalf("upstream messages = %q, want one turn/start without thread/list", messages)
+	if len(messages) != 2 {
+		t.Fatalf("upstream messages = %q, want route discovery then turn/start", messages)
 	}
-	turn, err := parseRPCMessage(messages[0])
-	if err != nil {
-		t.Fatal(err)
+	lookup, err := parseRPCMessage(messages[0])
+	if err != nil || lookup.method != "thread/list" {
+		t.Fatalf("route discovery = %#v, %v", lookup, err)
 	}
+	turn, err := parseRPCMessage(messages[1])
 	if err != nil || turn.method != "turn/start" {
 		t.Fatalf("upstream method = %#v, %v; want turn/start", turn, err)
 	}
@@ -2570,7 +2571,7 @@ func TestSessionUsesStoredProviderForNormalTurn(t *testing.T) {
 	}
 }
 
-func TestSessionExactSelectionAvoidsThreadListReconcile(t *testing.T) {
+func TestSessionObservedRouteAvoidsThreadListReconcile(t *testing.T) {
 	t.Parallel()
 	coordinator := &fakeHandoffCoordinator{}
 	selections := &fakeProviderSelections{
@@ -2586,6 +2587,11 @@ func TestSessionExactSelectionAvoidsThreadListReconcile(t *testing.T) {
 	current.selections = selections
 	current.coordinator = coordinator
 
+	// Only a route observed from app-server can justify skipping discovery.
+	current.desktop["30"] = &desktopRequest{method: "thread/resume", threadID: "thr-a"}
+	if err := current.handleUpstreamText(context.Background(), []byte(`{"id":30,"result":{"thread":{"id":"thr-a"},"modelProvider":"glm","model":"glm-5.3"}}`)); err != nil {
+		t.Fatal(err)
+	}
 	request := []byte(`{"id":31,"method":"turn/start","params":{"threadId":"thr-a","input":[]}}`)
 	if err := current.handleDownstreamText(context.Background(), request); err != nil {
 		t.Fatal(err)

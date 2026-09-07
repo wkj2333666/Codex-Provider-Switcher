@@ -128,6 +128,22 @@ func TestRunSwitchesProviderAndMappedModel(t *testing.T) {
 		t.Fatalf("GLM turn = %#v, want glm/glm-5.2 with unchanged input", record)
 	}
 
+	// Switch back after GLM was durably selected. The control response alone
+	// is insufficient: the following user turn must actually run on OpenAI.
+	sendRPC(t, ctx, connection, 5, "turn/start", map[string]any{
+		"threadId": "thr-shared",
+		"input":    []any{map[string]any{"type": "text", "text": "/provider switch openai"}},
+	})
+	responseSeen, methods, feedback = readProviderControlLifecycle(t, ctx, connection, "5")
+	if !responseSeen || feedback != "Provider switched to openai using model gpt-5.6-sol." {
+		t.Fatalf("OpenAI switch lifecycle response=%v methods=%v feedback=%q", responseSeen, methods, feedback)
+	}
+	visible = sendTestTurnAndCollect(t, ctx, connection, 6)
+	assertNoInternalMessages(t, visible)
+	if record := <-server.turns; record.provider != "openai" || record.model != "gpt-5.6-sol" {
+		t.Fatalf("turn after switching back = %#v, want openai/gpt-5.6-sol", record)
+	}
+
 	cancel()
 	_ = connection.CloseNow()
 	waitProxyDone(t, done)

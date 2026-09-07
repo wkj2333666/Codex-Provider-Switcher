@@ -355,22 +355,12 @@ func (current *session) handleTurnStart(ctx context.Context, message rpcMessage,
 	forceFullDirty := dirty && (commandRecognized || dirtyStageErr != nil || !dirtyStageFound ||
 		dirtyStage != handoff.DirtyStageUnsubscribed)
 	if !forceFullDirty && !effectiveResolved {
-		_, selected, exact, selectErr := current.selectedRouteState(threadID)
-		if selectErr != nil {
+		// A saved selection describes the requested route, not the loaded
+		// runtime. Reuse an observed route or resolve it before deciding
+		// whether a handoff is needed, including for explicit switch commands.
+		effectiveRoute, err = current.effectiveRouteForTurn(ctx, threadID)
+		if err != nil {
 			return current.writeHandoffError(ctx, message.id)
-		}
-		// An exact selection is the durable result of a verified switch or
-		// runtime resume. Treat it as authoritative instead of scanning
-		// thread/list: very large rollouts can make that reconcile slower
-		// than the client timeout and turn provider switching unusable.
-		if selected && exact {
-			effectiveRoute = targetRoute
-			effectiveResolved = true
-		} else {
-			effectiveRoute, err = current.effectiveRouteForTurn(ctx, threadID)
-			if err != nil {
-				return current.writeHandoffError(ctx, message.id)
-			}
 		}
 	}
 	if dirty {
@@ -1346,8 +1336,11 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 					delete(current.active, request.threadID)
 				} else {
 					delete(current.fresh, request.threadID)
-					if providerid.Valid(request.targetRoute.Provider) {
-						current.effective[request.threadID] = request.targetRoute.Provider
+					// turn/start can update the model but cannot switch providers.
+					// Its acknowledgement must not turn a desired provider into
+					// an observed runtime provider.
+					if providerid.Valid(request.targetRoute.Provider) &&
+						current.effective[request.threadID] == request.targetRoute.Provider {
 						current.effectiveModel[request.threadID] = request.targetRoute.Model
 					}
 				}
