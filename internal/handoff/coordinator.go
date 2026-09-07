@@ -28,6 +28,7 @@ import (
 const (
 	controlMessageLimit = 4 << 10
 	peerTimeout         = 2 * time.Second
+	peerResumeTimeout   = 35 * time.Second
 	lockRetryInterval   = 10 * time.Millisecond
 )
 
@@ -448,6 +449,9 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 		coordinator.writeControlResponse(connection, controlResponse{Error: true})
 		return
 	}
+	// Keep the short read/prepare timeout for dead peers, but allow runtime
+	// resumes the same time budget as app-server RPCs plus response overhead.
+	_ = connection.SetDeadline(time.Now().Add(controlTimeout(request.Method)))
 
 	response := controlResponse{}
 	switch request.Method {
@@ -482,7 +486,7 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 			response.Error = true
 			break
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), controlTimeout(request.Method))
 		defer cancel()
 		status, err := coordinator.handler.Resubscribe(ctx, request.ThreadID, route)
 		if err != nil {
@@ -491,7 +495,7 @@ func (coordinator *Coordinator) handleConnection(connection net.Conn) {
 			response.Status = status
 		}
 	case "restore":
-		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), controlTimeout(request.Method))
 		defer cancel()
 		status, err := coordinator.handler.Restore(ctx, request.ThreadID)
 		if err != nil {
@@ -565,6 +569,13 @@ func (coordinator *Coordinator) threadStatePath(prefix, threadID, suffix string)
 	return filepath.Join(coordinator.directory, prefix+"-"+hex.EncodeToString(digest[:16])+suffix)
 }
 
+func controlTimeout(method string) time.Duration {
+	if method == "resubscribe" || method == "restore" {
+		return peerResumeTimeout
+	}
+	return peerTimeout
+}
+
 func callPeer(ctx context.Context, path string, request controlRequest) (PeerStatus, bool, error) {
 	dialer := net.Dialer{Timeout: peerTimeout}
 	connection, err := dialer.DialContext(ctx, "unix", path)
@@ -575,7 +586,9 @@ func callPeer(ctx context.Context, path string, request controlRequest) (PeerSta
 		return "", false, errors.New("connect provider handoff peer")
 	}
 	defer connection.Close()
-	deadline := time.Now().Add(peerTimeout)
+	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stopCancellation()
+	deadline := time.Now().Add(controlTimeout(request.Method))
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}

@@ -4,12 +4,49 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 )
+
+func BenchmarkLockedDirtyRollout(b *testing.B) {
+	dir := b.TempDir()
+	path, lockPath := filepath.Join(dir, "rollout.jsonl"), filepath.Join(dir, "thread.lock")
+	f, err := os.Create(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := io.WriteString(f, `{"type":"response_item","payload":{"type":"reasoning","id":"item_stale"}}`+"\n"); err != nil {
+		b.Fatal(err)
+	}
+	line := []byte(`{"type":"event_msg","payload":{"text":"` + strings.Repeat("x", 64*1024) + `"}}` + "\n")
+	for i := 0; i < 2048; i++ {
+		if _, err := f.Write(line); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		b.Fatal(err)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := SanitizeFile(path, lockPath, ""); !errors.Is(err, ErrActiveWriter) {
+			b.Fatal(err)
+		}
+	}
+}
 
 func TestSanitizePaginatedPreservesOffsetsAndUIHistory(t *testing.T) {
 	lines := []string{
@@ -176,6 +213,38 @@ func TestSanitizeFileRefusesActiveWriterLock(t *testing.T) {
 	_, err = SanitizeFile(path, lockPath, "")
 	if !errors.Is(err, ErrActiveWriter) {
 		t.Fatalf("SanitizeFile() error = %v, want ErrActiveWriter", err)
+	}
+}
+
+func TestSanitizeLockedDirtyPrefixDoesNotScanTail(t *testing.T) {
+	dir := t.TempDir()
+	path, lockPath := filepath.Join(dir, "rollout.jsonl"), filepath.Join(dir, "thread.lock")
+	// Once a dirty record is found, a locked writer already prevents repair.
+	// A partial tail must not make the preliminary scan read all remaining history.
+	original := []byte(`{"type":"response_item","payload":{"type":"reasoning","id":"item_stale"}}` + "\n" + `{"partial":`)
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SanitizeFile(path, lockPath, ""); !errors.Is(err, ErrActiveWriter) {
+		t.Fatalf("locked dirty prefix error = %v", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SanitizeFile(path, lockPath, ""); err == nil {
+		t.Fatal("unlocked rewrite accepted malformed tail")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatal("failed rewrite changed original history")
 	}
 }
 

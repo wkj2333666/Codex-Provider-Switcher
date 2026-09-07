@@ -115,7 +115,7 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 	if err != nil {
 		return Result{}, errors.New("open rollout")
 	}
-	preview, inspectErr := rewriteJSONL(inspection, io.Discard, threadID)
+	preview, inspectErr := scanJSONL(inspection, io.Discard, threadID, true)
 	closeErr := inspection.Close()
 	if inspectErr != nil {
 		return Result{}, inspectErr
@@ -184,6 +184,10 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 }
 
 func rewriteJSONL(input io.Reader, output io.Writer, threadID string) (Result, error) {
+	return scanJSONL(input, output, threadID, false)
+}
+
+func scanJSONL(input io.Reader, output io.Writer, threadID string, stopOnChange bool) (Result, error) {
 	reader := bufio.NewReader(input)
 	var result Result
 	lineNumber := 0
@@ -221,6 +225,12 @@ func rewriteJSONL(input io.Reader, output io.Writer, threadID string) (Result, e
 			result.Changed = result.Changed || changed
 			result.ReasoningRemoved += removed
 			result.IDsStripped += stripped
+			// A preliminary scan only decides whether to acquire the writer
+			// lock. The rewrite under that lock still validates every record
+			// before atomically replacing the original file.
+			if stopOnChange && result.Changed {
+				return result, nil
+			}
 		}
 		if errors.Is(err, io.EOF) {
 			break

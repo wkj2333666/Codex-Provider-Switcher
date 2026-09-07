@@ -182,6 +182,15 @@ completed history pass; changed rollouts are sanitized again. The sanitizer scan
 envelopes first and deeply parses only records that can contain stale IDs.
 Recovery runtime verification resumes with `excludeTurns`, so very large paginated
 threads are not hydrated just to complete a provider reload.
+All internal handoff, peer resubscribe, and restore calls also exclude turns;
+Desktop's own history request is preserved. Peer resume/restore allows up to 35 seconds,
+while connection and readiness checks retain their short timeout. Caller cancellation
+still interrupts waiting; best-effort failure restoration retains its 5-second total
+budget. Path-only sanitation lookups prefer the state DB and fall
+back to normal discovery for missing or unusable paths; DB metadata is never used
+as runtime proof. A locked dirty rollout stops its preliminary scan at the first
+required edit. The complete rewrite still validates every record before replacement,
+and opening a task does not rescan history after a successful handoff.
 A saved provider-and-model selection is the desired route, not proof of the
 loaded runtime. Turn starts and provider commands compare it with the observed
 runtime route; a cached route avoids `thread/list`, otherwise discovery is required.

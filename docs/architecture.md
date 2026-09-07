@@ -232,6 +232,21 @@ using the session cache when available and `thread/list` discovery otherwise.
 A successful `turn/start` acknowledgement can update the model of a matching
 observed provider, but cannot establish or change the provider itself. Dirty
 stages other than `unsubscribed` still force the full coordinated handoff path.
+Path-only discovery for unconditional/OpenAI sanitation and recovery fingerprints
+first uses `thread/list(useStateDbOnly=true)`. Missing or invalid paths fall back
+to scan-and-repair discovery. These index rows never populate runtime route or
+activity caches, and the non-OpenAI same-provider skip still requires normal
+runtime discovery. A successful handoff already sanitized history; the subsequent
+Desktop resume removes its obsolete path and resolves the current rollout by ID.
+Every internal resume (including peer resubscribe and restore) uses `excludeTurns`,
+overriding any full-history Desktop template without changing that template. Peer
+resume/restore has a 35-second budget, separate from the 2-second connection/readiness
+budget, and respects caller deadlines and cancellation. Best-effort failure
+restoration still has its shorter 5-second total recovery budget.
+The preliminary sanitation scan stops at the first record requiring an edit and
+then attempts the writer lock. Clean files are still fully inspected. The actual
+rewrite under the lock validates the full file and commits atomically; a malformed
+tail leaves the source unchanged.
 Paginated sanitation replaces invalid response reasoning with `ResponseItem::Other`
 (ignored by Codex's context manager), strips stale optional response IDs, and cleans
 compaction replacement history. It preserves each numbered record's byte length

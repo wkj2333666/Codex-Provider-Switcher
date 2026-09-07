@@ -544,7 +544,11 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
 			return current.writeHandoffError(ctx, message.id)
 		}
-		rolloutPath, err = current.sanitizeThreadRollout(ctx, threadID, targetRoute.Provider)
+		// Handoff already sanitized and verified the runtime. Recovery can
+		// move its rollout, so resolve by stable ID instead of scanning again
+		// or replaying the path from before the handoff.
+		rolloutPath = ""
+		payload, err = rewriteResumePath(payload, "")
 	}
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
@@ -735,7 +739,7 @@ func (current *session) recoverProviderMismatch(ctx context.Context, threadID st
 	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
 		return errors.New("provider recovery rollout sanitation failed")
 	}
-	if path, _, _, pathErr := current.findRolloutPath(ctx, threadID); pathErr == nil && path != "" {
+	if path, pathErr := current.findSanitationPath(ctx, threadID); pathErr == nil && path != "" {
 		if fingerprint, fingerprintErr := rollout.Fingerprint(path); fingerprintErr == nil {
 			journal.SanitizedFingerprint = fingerprint
 			if err := current.recoveries.Save(journal); err != nil {
@@ -809,7 +813,7 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 		}
 	}
 	wantedRoute := modelroute.Route{Provider: journal.Provider, Model: journal.Model}
-	path, _, _, err := current.findRolloutPath(ctx, threadID)
+	path, err := current.findSanitationPath(ctx, threadID)
 	if err != nil {
 		return err
 	}
@@ -970,6 +974,9 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	// stable thread ID instead of replaying that stale path.
 	delete(params, "path")
 	params["threadId"] = rawJSONString(threadID)
+	// Internal resumes verify routing and restore subscriptions only. Returning
+	// every turn can exceed the transport limit or hydrate gigabytes of history.
+	params["excludeTurns"] = json.RawMessage("true")
 	params["modelProvider"] = rawJSONString(expectedRoute.Provider)
 	if expectedRoute.Model != "" {
 		if err := rewrite.ApplyModel(params, expectedRoute.Model); err != nil {
@@ -1000,7 +1007,16 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 	if current.codexHome == "" {
 		return "", nil
 	}
-	path, runtimeRoute, _, err := current.findRolloutPath(ctx, threadID)
+	var path string
+	var runtimeRoute modelroute.Route
+	var err error
+	if expectedProvider == "" || expectedProvider == "openai" {
+		// These paths always inspect history; only the location is needed.
+		path, err = current.findSanitationPath(ctx, threadID)
+	} else {
+		// The same-provider skip needs live discovery, not stale DB metadata.
+		path, runtimeRoute, _, err = current.findRolloutPath(ctx, threadID)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -1024,6 +1040,25 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 // findRolloutPath uses thread/list because thread/read loads the thread and
 // takes Codex's writer lock before sanitation can inspect the rollout.
 func (current *session) findRolloutPath(ctx context.Context, threadID string) (string, modelroute.Route, string, error) {
+	return current.listRolloutPath(ctx, threadID, false)
+}
+
+// findSanitationPath uses the index only for file location, never as evidence
+// of the runtime provider or activity. Older/migrated indexes can have stale
+// paths; preserve the normal scan-and-repair lookup as a fallback.
+func (current *session) findSanitationPath(ctx context.Context, threadID string) (string, error) {
+	path, _, _, err := current.listRolloutPath(ctx, threadID, true)
+	if err == nil && rollout.ValidatePath(current.codexHome, threadID, path) == nil {
+		return path, nil
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	path, _, _, err = current.findRolloutPath(ctx, threadID)
+	return path, err
+}
+
+func (current *session) listRolloutPath(ctx context.Context, threadID string, stateOnly bool) (string, modelroute.Route, string, error) {
 	if threadID == "" {
 		return "", modelroute.Route{}, "", errors.New("invalid rollout thread")
 	}
@@ -1043,6 +1078,9 @@ func (current *session) findRolloutPath(ctx context.Context, threadID string) (s
 		}
 		if cursor != "" {
 			params["cursor"] = rawJSONString(cursor)
+		}
+		if stateOnly {
+			params["useStateDbOnly"] = json.RawMessage("true")
 		}
 		response, err := current.callUpstream(ctx, "thread/list", params)
 		if err != nil {
@@ -1108,7 +1146,11 @@ func rewriteResumePath(payload []byte, path string) ([]byte, error) {
 	} else {
 		params = make(map[string]json.RawMessage)
 	}
-	params["path"] = rawJSONString(path)
+	if path == "" {
+		delete(params, "path")
+	} else {
+		params["path"] = rawJSONString(path)
+	}
 	encodedParams, err := json.Marshal(params)
 	if err != nil {
 		return nil, errors.New("encode resume params")
@@ -1210,7 +1252,8 @@ func (current *session) Restore(ctx context.Context, threadID string) (handoff.P
 		return handoff.StatusNotSubscribed, nil
 	}
 	response, err := current.callUpstream(ctx, "thread/resume", map[string]json.RawMessage{
-		"threadId": rawJSONString(threadID),
+		"threadId":     rawJSONString(threadID),
+		"excludeTurns": json.RawMessage("true"),
 	})
 	if err != nil {
 		return "", errors.New("restore app-server thread")

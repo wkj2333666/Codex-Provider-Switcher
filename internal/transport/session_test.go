@@ -2753,11 +2753,21 @@ func TestSessionResumeSanitizesIdleLockedRolloutThroughHandoff(t *testing.T) {
 	}
 	messages := upstream.messages()
 	var sawDesktopResume bool
+	lookups := 0
 	for _, payload := range messages {
 		message, parseErr := parseRPCMessage(payload)
+		if message.method == "thread/list" {
+			lookups++
+		}
 		if parseErr == nil && message.method == "thread/resume" && message.idKey == "26" {
 			sawDesktopResume = true
+			if _, hasPath := message.params["path"]; hasPath {
+				t.Fatal("post-handoff resume reused an obsolete rollout path")
+			}
 		}
+	}
+	if lookups != 2 {
+		t.Fatalf("rollout lookups = %d, want initial inspection plus handoff sanitation only", lookups)
 	}
 	if !sawDesktopResume {
 		t.Fatalf("desktop resume was not forwarded after sanitation: %q", messages)

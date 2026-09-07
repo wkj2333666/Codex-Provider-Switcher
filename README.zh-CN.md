@@ -170,6 +170,12 @@ OpenAI 恢复任务也会检查历史，防止旧版漏洗的记录继续报错�
 恢复 journal 还会记录已清洗 rollout 的文件指纹；文件未变化时重试不再重复扫描超大 rollout，
 文件变化则重新清洗。sanitizer 会先做轻量 envelope 扫描，只深入解析可能含过期 ID 的记录。
 recovery 的 runtime 校验 resume 会带 `excludeTurns`，超大分页任务不会为了完成 provider 切换而水合完整历史。
+内部 handoff、peer 重订阅和失败恢复也统一只取元数据；Desktop 自己请求的历史保持原样。
+peer 重订阅/恢复最多允许 35 秒，连接和就绪检查仍使用短超时，调用方取消会立即打断等待；
+失败后的 best-effort 恢复仍受原有 5 秒总预算限制。
+只需定位清洗文件时优先查询 state DB，路径缺失或不可用时回退到正常查询；DB 元数据不作为实际 provider 的证明。
+清洗预检查发现第一处待修改记录后先检查写锁，避免扫描完整大文件才报锁占用；
+实际重写仍完整校验每条记录，成功 handoff 后打开任务不再重复清洗。
 保存的 provider+model 是目标选择，不能证明运行时已切换。普通 turn 和切换命令
 都会与已观测的运行路由比较；有运行路由缓存时不扫描 `thread/list`，否则仍需查询。
 除 `unsubscribed` 以外的 dirty 阶段仍走完整 handoff。
