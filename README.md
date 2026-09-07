@@ -372,7 +372,9 @@ to install an optional daily systemd user timer (Python 3.11+ required). It only
 compresses archived tasks unused for at least 30 days, with an initial 30-day
 observation period. Archive/update dates, filesystem access and proxy task RPC
 access are checked; bypass clients depend on native metadata, atime and locks.
-Each run handles at most five files / 2 GiB of source history. Busy or newly
+Compression uses a 128 MiB long-distance window to deduplicate images repeated
+across compact snapshots. Each run handles at most five files / 2 GiB of source
+history. Busy or newly
 accessed histories are skipped. Full SHA-256 roundtrip verification precedes
 publication. History content, indexes, attachments and migration backups remain
 intact. Leave native `local_thread_store_compression` disabled.

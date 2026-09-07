@@ -61,7 +61,7 @@ def writer_lock(home,tid):
 
 def encode(source,destination):
     with destination.open('wb') as out:
-        subprocess.run(['zstd','-q','-T1','-3','-c','--',str(source)],stdout=out,stderr=subprocess.DEVNULL,check=True,timeout=180)
+        subprocess.run(['zstd','-q','-T1','-3','--long=27','-c','--',str(source)],stdout=out,stderr=subprocess.DEVNULL,check=True,timeout=180)
         out.flush();os.fsync(out.fileno())
 
 

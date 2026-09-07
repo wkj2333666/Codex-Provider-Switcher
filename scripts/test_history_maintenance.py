@@ -87,4 +87,14 @@ class HistoryMaintenanceTest(unittest.TestCase):
         (self.home/'sqlite/state_5.sqlite').rename(self.home/'state_5.sqlite')
         self.assertEqual(m.run(self.home,True,self.now)['compressed'],1)
 
+    def test_distant_repeated_images_compress_without_losing_bytes(self):
+        import base64
+        image=base64.b64encode(os.urandom(2*1024*1024)).decode()
+        gap=base64.b64encode(os.urandom(2*1024*1024)).decode()
+        p=self.home/'distant-images.jsonl'
+        p.write_text(json.dumps({'images':[image,gap,image]}))
+        compressed=self.home/'distant-images.jsonl.zst'
+        m.encode(p,compressed);m.verify(p,compressed)
+        self.assertLess(compressed.stat().st_size,p.stat().st_size*.60)
+
 if __name__=='__main__':unittest.main()

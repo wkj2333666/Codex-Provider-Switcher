@@ -334,6 +334,7 @@ systemctl --user status codex-history-maintenance.timer
 依赖原生索引、文件访问时间和写锁。此维护器面向本地 `CODEX_HOME`，读取其中
 `config.toml` 的 `sqlite_home`，未设置时使用原生默认 `CODEX_HOME`。
 
+压缩采用 128 MiB 窗口的长距离匹配，减少不同 compact 快照中的重复图片。
 维护在用户服务运行时每天执行，最多处理 5 份、总输入 2 GiB，跳过正在写入或
 刚被访问的历史。输出逐字节 SHA-256 校验通过后才替换；不删除对话内容，不清理
 历史索引、附件或迁移备份。不要同时开启范围更广的原生
