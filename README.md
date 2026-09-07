@@ -178,8 +178,20 @@ Paginated rewrites preserve each record's byte length and ordinal, replacing inv
 reasoning with model-ignored placeholders so UI history and SQLite offsets remain valid.
 A missing rollout for an existing task fails closed instead of being treated as clean.
 Recovery journals record the sanitized rollout fingerprint. Unchanged retries skip the
-completed history pass; changed rollouts are sanitized again. The sanitizer scans
-envelopes first and deeply parses only records that can contain stale IDs.
+completed history pass; changed rollouts are sanitized again. Successful clean scans
+also write a private `.sanitized` certificate beside the thread writer lock. Reopens and handoffs reuse it only when the path, thread ID,
+device, inode, size, mtime, ctime, and sanitation version still match. Appends,
+replacements, truncations, and edits invalidate the exact match. For a larger file
+with the same identity, the switcher hashes the entire previously checked prefix;
+only a matching SHA-256 digest and a complete newline boundary allow JSON parsing
+to resume at the suffix, with the original pagination mode. A changed prefix or
+incomplete boundary falls back to a full scan. There is no assumption that history
+is append-only, and any required edit still uses a complete atomic rewrite. Cache
+failures fall back to a full scan. The sanitizer reuses line buffers and checks clean records in one JSON decoding pass, allocating
+full maps only for possible repairs. Escaped keys, case aliases, and duplicate
+sensitive fields use the conservative parser; all records still receive complete
+JSON validation. The first check of a new file version remains proportional to
+history size, while an unchanged version needs only metadata checks.
 Recovery runtime verification resumes with `excludeTurns`, so very large paginated
 threads are not hydrated just to complete a provider reload.
 All internal handoff, peer resubscribe, and restore calls also exclude turns;

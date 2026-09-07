@@ -5,6 +5,7 @@ package rollout
 import (
 	"bufio"
 	"bytes"
+
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,9 +40,12 @@ func Fingerprint(path string) (string, error) {
 
 // Result describes one sanitation pass.
 type Result struct {
-	Changed          bool
-	ReasoningRemoved int
-	IDsStripped      int
+	paginated           bool
+	Cached              bool
+	VerifiedPrefixBytes int64
+	Changed             bool
+	ReasoningRemoved    int
+	IDsStripped         int
 }
 
 // ValidatePath accepts only a regular, non-symlink rollout below CODEX_HOME's
@@ -111,11 +115,18 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return Result{}, errors.New("invalid rollout file")
 	}
+	stamp := sanitationStamp(info, path, threadID)
+	certificate := cachedSanitation(lockPath)
+	if stamp != "" && certificate.Stamp == stamp {
+		if after, err := os.Lstat(path); err == nil && sanitationStamp(after, path, threadID) == stamp {
+			return Result{Cached: true}, nil
+		}
+	}
 	inspection, err := os.Open(path)
 	if err != nil {
 		return Result{}, errors.New("open rollout")
 	}
-	preview, inspectErr := scanJSONL(inspection, io.Discard, threadID, true)
+	preview, updatedCertificate, inspectErr := inspectSanitation(inspection, info, path, threadID, certificate)
 	closeErr := inspection.Close()
 	if inspectErr != nil {
 		return Result{}, inspectErr
@@ -124,6 +135,11 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 		return Result{}, errors.New("close rollout")
 	}
 	if !preview.Changed {
+		// Never certify bytes appended/replaced while the inspection was running.
+		after, statErr := os.Lstat(path)
+		if statErr == nil && stamp != "" && sanitationStamp(after, path, threadID) == stamp {
+			rememberSanitation(lockPath, updatedCertificate)
+		}
 		return preview, nil
 	}
 
@@ -188,15 +204,27 @@ func rewriteJSONL(input io.Reader, output io.Writer, threadID string) (Result, e
 }
 
 func scanJSONL(input io.Reader, output io.Writer, threadID string, stopOnChange bool) (Result, error) {
-	reader := bufio.NewReader(input)
-	var result Result
+	return scanJSONLFrom(input, output, threadID, stopOnChange, true, false)
+}
+
+func scanJSONLFrom(input io.Reader, output io.Writer, threadID string, stopOnChange, hasHeader, paginated bool) (Result, error) {
+	reader := bufio.NewReaderSize(input, 64*1024)
+	var spill []byte
+	result := Result{paginated: paginated}
 	lineNumber := 0
-	paginated := false
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := reader.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			spill = append(spill[:0], line...)
+			for err == bufio.ErrBufferFull {
+				line, err = reader.ReadSlice('\n')
+				spill = append(spill, line...)
+			}
+			line = spill
+		}
 		if len(line) != 0 {
 			lineNumber++
-			if lineNumber == 1 {
+			if lineNumber == 1 && hasHeader {
 				var record struct {
 					Ordinal *uint64 `json:"ordinal"`
 					Payload struct {
@@ -207,6 +235,7 @@ func scanJSONL(input io.Reader, output io.Writer, threadID string, stopOnChange 
 					return Result{}, errors.New("invalid rollout JSONL")
 				}
 				paginated = record.Payload.HistoryMode == "paginated" || record.Ordinal != nil
+				result.paginated = paginated
 			}
 			cleaned, keep, changed, removed, stripped, parseErr := sanitizeLine(line, paginated)
 			if parseErr != nil {
@@ -256,33 +285,130 @@ func validateSessionMeta(line []byte, threadID string) error {
 	return nil
 }
 
+// Go struct decoding also accepts case-insensitive field aliases. Only use
+// that fast path for unescaped lowercase ASCII keys; all other spellings use
+// exact map lookup, so an unknown "ID" cannot hide a stale lowercase "id".
+func canonicalJSONKeys(line []byte) bool {
+	var objects []uint8
+	for offset := 0; offset < len(line); {
+		at := bytes.IndexByte(line[offset:], '"')
+		if at < 0 {
+			return true
+		}
+		for _, value := range line[offset : offset+at] {
+			switch value {
+			case '{', '[':
+				objects = append(objects, 0)
+			case '}', ']':
+				if len(objects) == 0 {
+					return false
+				}
+				objects = objects[:len(objects)-1]
+			}
+		}
+		start := offset + at + 1
+		end := start
+		for {
+			at = bytes.IndexByte(line[end:], '"')
+			if at < 0 {
+				return false
+			}
+			end += at
+			slashes := 0
+			for i := end - 1; i >= start && line[i] == '\\'; i-- {
+				slashes++
+			}
+			if slashes%2 == 0 {
+				break
+			}
+			end++
+		}
+		offset = end + 1
+		for offset < len(line) && (line[offset] == ' ' || line[offset] == '\t' || line[offset] == '\r' || line[offset] == '\n') {
+			offset++
+		}
+		if offset < len(line) && line[offset] == ':' {
+			var bit uint8
+			switch string(line[start:end]) {
+			case "type":
+				bit = 1
+			case "id":
+				bit = 2
+			case "payload":
+				bit = 4
+			case "replacement_history":
+				bit = 8
+			}
+			if bit != 0 {
+				if len(objects) == 0 || objects[len(objects)-1]&bit != 0 {
+					return false
+				}
+				objects[len(objects)-1] |= bit
+			}
+			for _, value := range line[start:end] {
+				if value == '\\' || value >= 128 || (value >= 'A' && value <= 'Z') {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// Inspect routing-sensitive fields in one decoding pass. A clean record does
+// not need raw payload slices or a second parse of every compacted item.
+// Unsupported shapes fall back to the conservative rewriting parser below.
+func cleanEnvelope(line []byte) bool {
+	if !canonicalJSONKeys(line) {
+		return false
+	}
+	type item struct {
+		Type *string `json:"type"`
+		ID   *string `json:"id"`
+	}
+	var envelope struct {
+		Type    string `json:"type"`
+		Payload *struct {
+			item
+			Items []item `json:"replacement_history"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(line, &envelope) != nil {
+		return false
+	}
+	clean := func(value item) bool {
+		return value.Type != nil && (value.ID == nil || !strings.HasPrefix(*value.ID, "item_"))
+	}
+	switch envelope.Type {
+	case "response_item":
+		return envelope.Payload != nil && clean(envelope.Payload.item)
+	case "compacted":
+		if envelope.Payload == nil {
+			return false
+		}
+		for _, value := range envelope.Payload.Items {
+			if !clean(value) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func sanitizeLine(line []byte, paginated bool) ([]byte, bool, bool, int, int, error) {
 	trimmed := bytes.TrimSuffix(line, []byte{'\n'})
 	if len(bytes.TrimSpace(trimmed)) == 0 {
 		return nil, false, false, 0, 0, errors.New("empty rollout line")
 	}
-	// Parse only the small envelope first. A large rollout contains many
-	// event records; decoding every payload into maps made recovery scans
-	// unnecessarily expensive.
-	var probe struct {
-		Type    string          `json:"type"`
-		Payload json.RawMessage `json:"payload"`
-	}
-	if err := json.Unmarshal(trimmed, &probe); err != nil {
-		return nil, false, false, 0, 0, err
-	}
-	if probe.Type != "response_item" && probe.Type != "compacted" {
-		return line, true, false, 0, 0, nil
-	}
-	if probe.Type == "response_item" {
-		if !bytes.Contains(probe.Payload, []byte(`"id":`)) {
-			return line, true, false, 0, 0, nil
-		}
-	} else if !bytes.Contains(probe.Payload, []byte(`"replacement_history"`)) ||
-		!bytes.Contains(probe.Payload, []byte(`"id":`)) {
+	if cleanEnvelope(trimmed) {
 		return line, true, false, 0, 0, nil
 	}
 
+	return sanitizeLineConservative(line, paginated)
+}
+
+func sanitizeLineConservative(line []byte, paginated bool) ([]byte, bool, bool, int, int, error) {
+	trimmed := bytes.TrimSuffix(line, []byte{'\n'})
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &envelope); err != nil {
 		return nil, false, false, 0, 0, err
@@ -292,6 +418,9 @@ func sanitizeLine(line []byte, paginated bool) ([]byte, bool, bool, int, int, er
 		if err := json.Unmarshal(rawType, &envelopeType); err != nil {
 			return nil, false, false, 0, 0, err
 		}
+	}
+	if envelopeType != "response_item" && envelopeType != "compacted" {
+		return line, true, false, 0, 0, nil
 	}
 	removed, stripped := 0, 0
 	if envelopeType == "compacted" {
