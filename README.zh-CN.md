@@ -258,6 +258,20 @@ scripts/deploy-local.sh
 proxy；部署后请重新连接 Desktop Remote SSH 主机，让新的 proxy 进程加载替换后的
 二进制。
 
+## 分页 fork 在列表中不可见
+
+部分原生 Codex 版本创建分页 fork 后会留下空摘要，而 `thread/list` 会过滤空摘要。
+Switcher 在成功的持久化 fork 响应返回前，根据继承历史补齐缺失的 SQLite 摘要，
+并同步补齐响应中的摘要。已有摘要、真正没有历史的 fork 和临时 fork 保持原样；
+此修复不会改写历史文件或共享历史的字节偏移，也支持对尚未发送消息的 fork 再次 fork。
+
+该兼容修复需要 Python 3.11+（含 `sqlite3`），读取 `CODEX_HOME/config.toml` 中的
+`sqlite_home`，未配置时依次使用 `CODEX_SQLITE_HOME` 和 `CODEX_HOME`；环境变量中的
+相对路径以 proxy 工作目录为基准。辅助程序内嵌于二进制，最多等待三秒。
+修复不可用时仍保留已经创建成功的 fork，并显示列表修复失败的警告，避免误以为
+fork 未创建而重复操作。升级后重新连接 Desktop SSH 主机以加载新 proxy。
+该处理针对新 fork；旧的隐藏副本需要另外补齐元数据。
+
 ## 从 Release 压缩包升级
 
 使用新的 `VERSION` 重复下载和校验步骤，进入解压后的目录，然后原子替换已安装的

@@ -104,6 +104,7 @@ type session struct {
 	coordinator       handoffCoordinator
 	selections        providerSelections
 	recoveries        recoveryJournals
+	repairForkPreview func(context.Context, string, string) (string, error)
 }
 
 func newSessionState(provider string, routes *modelroute.Catalog, appServerSocket string, upstreamWrite, downstreamWrite websocketWriteFunc) (*session, error) {
@@ -115,22 +116,23 @@ func newSessionState(provider string, routes *modelroute.Catalog, appServerSocke
 		return nil, errors.New("generate internal request prefix")
 	}
 	return &session{
-		provider:        provider,
-		routes:          routes,
-		appServerSocket: appServerSocket,
-		upstreamWrite:   upstreamWrite,
-		downstreamWrite: downstreamWrite,
-		internal:        make(map[string]chan rpcMessage),
-		desktop:         make(map[string]*desktopRequest),
-		resumeTemplates: make(map[string]map[string]json.RawMessage),
-		effective:       make(map[string]string),
-		effectiveModel:  make(map[string]string),
-		fresh:           make(map[string]string),
-		detached:        make(map[string]bool),
-		active:          make(map[string]bool),
-		recovery:        make(map[string]map[string]bool),
-		internalPrefix:  "cps-" + hex.EncodeToString(prefixBytes),
-		closed:          make(chan struct{}),
+		provider:          provider,
+		routes:            routes,
+		appServerSocket:   appServerSocket,
+		upstreamWrite:     upstreamWrite,
+		downstreamWrite:   downstreamWrite,
+		internal:          make(map[string]chan rpcMessage),
+		desktop:           make(map[string]*desktopRequest),
+		resumeTemplates:   make(map[string]map[string]json.RawMessage),
+		effective:         make(map[string]string),
+		effectiveModel:    make(map[string]string),
+		fresh:             make(map[string]string),
+		detached:          make(map[string]bool),
+		active:            make(map[string]bool),
+		recovery:          make(map[string]map[string]bool),
+		internalPrefix:    "cps-" + hex.EncodeToString(prefixBytes),
+		closed:            make(chan struct{}),
+		repairForkPreview: rollout.RepairForkPreview,
 	}, nil
 }
 
@@ -1370,6 +1372,7 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 	if current.suppressRecoveryNotification(message) {
 		return nil
 	}
+	var forkWarning []byte
 
 	if message.kind == rpcResponse {
 		current.stateMu.Lock()
@@ -1419,6 +1422,9 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 			}
 		}
 		current.stateMu.Unlock()
+		if request != nil && request.method == "thread/fork" && !message.hasError {
+			payload, forkWarning = current.completeForkPreview(ctx, payload)
+		}
 		if request != nil && request.releaseThread != nil {
 			request.releaseThread()
 		}
@@ -1444,7 +1450,13 @@ func (current *session) handleUpstreamText(ctx context.Context, payload []byte) 
 		}
 	}
 
-	return current.writeDownstream(ctx, websocket.MessageText, payload)
+	if err := current.writeDownstream(ctx, websocket.MessageText, payload); err != nil {
+		return err
+	}
+	if len(forkWarning) != 0 {
+		return current.writeDownstream(ctx, websocket.MessageText, forkWarning)
+	}
+	return nil
 }
 
 func (current *session) pumpDownstream(ctx context.Context, source *websocket.Conn) error {

@@ -297,6 +297,25 @@ The output must report `source` as `main` and the pushed commit you intended to
 deploy. The script never stops an existing proxy; reconnect the Desktop Remote
 SSH host so new proxy processes load the replacement.
 
+## Paginated fork visibility
+
+Some native Codex versions create paginated forks with an empty preview and
+then omit them from `thread/list`. After a successful persisted fork, the
+switcher fills only a missing SQLite preview from verified inherited history
+and includes that preview in the reply before Desktop refreshes its task list.
+Existing previews, genuinely empty forks, and ephemeral forks are unchanged.
+Rollout files and their shared-history byte offsets are never rewritten by
+this repair. It also handles forking an untouched fork.
+
+This compatibility repair requires Python 3.11+ with `sqlite3` and reads
+`sqlite_home` from `CODEX_HOME/config.toml`, then `CODEX_SQLITE_HOME`, then
+`CODEX_HOME`. Relative environment paths use the proxy's working directory. Its helper is
+embedded in the binary and is bounded to three seconds. If repair is unavailable,
+the successful fork is retained and a task warning explains that its list entry
+could not be repaired. Reconnect Desktop Remote SSH after upgrading to load the
+new proxy. This hook repairs new forks; older hidden forks need a separate
+metadata repair.
+
 ## Upgrade from a release archive
 
 Repeat the download and checksum steps with the new `VERSION`, enter the
