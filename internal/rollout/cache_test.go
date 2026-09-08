@@ -8,7 +8,7 @@ import (
 )
 
 func TestCleanScanCacheInvalidation(t *testing.T) {
-	for _, mutation := range []string{"append", "rewrite-and-grow", "truncate", "replace", "partial-tail", "same-size-restored-mtime", "malformed-tail"} {
+	for _, mutation := range []string{"append", "truncate", "replace", "partial-tail", "same-size-restored-mtime", "malformed-tail"} {
 		t.Run(mutation, func(t *testing.T) {
 			dir := t.TempDir()
 			path, lock := filepath.Join(dir, "rollout.jsonl"), filepath.Join(dir, "locks", "thread.lock")
@@ -33,8 +33,6 @@ func TestCleanScanCacheInvalidation(t *testing.T) {
 			switch mutation {
 			case "append":
 				next = append(append([]byte{}, clean...), dirty...)
-			case "rewrite-and-grow":
-				next = append(append([]byte{}, dirty...), clean...)
 			case "truncate":
 				next = clean[:len(clean)/2]
 			case "replace":
@@ -92,7 +90,7 @@ func TestCleanScanCacheIsBoundToThreadAndFailsOpenToScanning(t *testing.T) {
 	}
 }
 
-func TestCleanAppendVerifiesPrefixAndOnlyParsesSuffix(t *testing.T) {
+func TestCleanAppendReusesCursorAndOnlyParsesSuffix(t *testing.T) {
 	dir := t.TempDir()
 	path, lock := filepath.Join(dir, "rollout.jsonl"), filepath.Join(dir, "locks", "thread.lock")
 	line := []byte(`{"type":"event_msg","payload":{"text":"clean"}}` + "\n")
@@ -106,7 +104,7 @@ func TestCleanAppendVerifiesPrefixAndOnlyParsesSuffix(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := SanitizeFile(path, lock, "")
-	if err != nil || result.Cached || result.Changed || result.VerifiedPrefixBytes != int64(len(line)) {
+	if err != nil || result.Cached || result.Changed || result.CachedPrefixBytes != int64(len(line)) {
 		t.Fatalf("append=%+v err=%v", result, err)
 	}
 	result, err = SanitizeFile(path, lock, "")
@@ -135,7 +133,7 @@ func TestAppendPreservesOriginalPaginationContext(t *testing.T) {
 		if err := os.WriteFile(path, []byte(header+clean), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if result, err := SanitizeFile(path, lock, "thread-a"); err != nil || result.VerifiedPrefixBytes != int64(len(header)) {
+		if result, err := SanitizeFile(path, lock, "thread-a"); err != nil || result.CachedPrefixBytes != int64(len(header)) {
 			t.Fatalf("pagination=%v result=%+v err=%v", paginated, result, err)
 		}
 		dirty := `{"type":"response_item","payload":{"type":"reasoning","id":"item_dirty"}}` + "\n"
@@ -149,5 +147,126 @@ func TestAppendPreservesOriginalPaginationContext(t *testing.T) {
 		if !paginated && err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// A sparse prefix makes any accidental re-read observable as invalid JSON.
+// The cursor is trusted: previously scanned content is append-only.
+func TestAppendScanSeeksPastCachedPrefix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout.jsonl")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	const prefix = int64(64 << 20)
+	if _, err := file.Seek(prefix, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(`{"type":"event_msg","payload":{"type":"token_count"}}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	previous := sanitationCertificate{Identity: sanitationIdentity(info, path, ""), Size: prefix, EndsInNewline: true}
+	result, _, err := inspectSanitation(file, path, "", previous)
+	if err != nil || result.Changed || result.CachedPrefixBytes != prefix {
+		t.Fatalf("append read cached bytes: result=%+v err=%v", result, err)
+	}
+}
+
+func TestScanCursorDoesNotStoreContentHash(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout.jsonl")
+	lock := filepath.Join(dir, "locks", "thread.lock")
+	if err := os.WriteFile(path, []byte(`{"type":"event_msg","payload":{}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SanitizeFile(path, lock, ""); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(lock + ".sanitized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"sha256"`)) {
+		t.Fatal("cursor still stores a full-content hash")
+	}
+}
+
+func TestLegacyHashCertificateReusesCursor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout.jsonl")
+	lock := filepath.Join(dir, "locks", "thread.lock")
+	line := []byte(`{"type":"event_msg","payload":{}}` + "\n")
+	if err := os.WriteFile(path, line, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SanitizeFile(path, lock, ""); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(lock + ".sanitized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An old digest is intentionally ignored; migration needs no content reads.
+	legacy := append([]byte(`{"sha256":"0000000000000000000000000000000000000000000000000000000000000000",`), data[1:]...)
+	if err := os.WriteFile(lock+".sanitized", legacy, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(append([]byte{}, line...), line...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := SanitizeFile(path, lock, "")
+	if err != nil || got.CachedPrefixBytes != int64(len(line)) {
+		t.Fatalf("legacy cursor not reused: %+v %v", got, err)
+	}
+	data, err = os.ReadFile(lock + ".sanitized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"sha256"`)) {
+		t.Fatal("legacy digest retained after cursor update")
+	}
+}
+
+func TestAppendCursorUsesOpenedFileIdentity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout.jsonl")
+	clean := []byte(`{"type":"response_item","payload":{"type":"message","id":"safe_clean"}}` + "\n")
+	dirty := []byte(`{"type":"response_item","payload":{"type":"message","id":"item_dirty"}}` + "\n")
+	if len(clean) != len(dirty) {
+		t.Fatal("fixture lengths differ")
+	}
+	if err := os.WriteFile(path, append(append([]byte{}, clean...), clean...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := sanitationCertificate{Identity: sanitationIdentity(stale, path, ""), Size: int64(len(clean)), EndsInNewline: true}
+	replacement := filepath.Join(dir, "replacement")
+	if err := os.WriteFile(replacement, append(dirty, clean...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	// Simulate replacement after pathname stat and before open.
+	got, _, err := inspectSanitation(opened, path, "", previous)
+	if err != nil || !got.Changed || got.CachedPrefixBytes != 0 {
+		t.Fatalf("replacement reused old cursor: %+v %v", got, err)
 	}
 }

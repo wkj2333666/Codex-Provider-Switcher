@@ -40,12 +40,12 @@ func Fingerprint(path string) (string, error) {
 
 // Result describes one sanitation pass.
 type Result struct {
-	paginated           bool
-	Cached              bool
-	VerifiedPrefixBytes int64
-	Changed             bool
-	ReasoningRemoved    int
-	IDsStripped         int
+	paginated         bool
+	Cached            bool
+	CachedPrefixBytes int64
+	Changed           bool
+	ReasoningRemoved  int
+	IDsStripped       int
 }
 
 // ValidatePath accepts only a regular, non-symlink rollout below CODEX_HOME's
@@ -126,7 +126,7 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 	if err != nil {
 		return Result{}, errors.New("open rollout")
 	}
-	preview, updatedCertificate, inspectErr := inspectSanitation(inspection, info, path, threadID, certificate)
+	preview, updatedCertificate, inspectErr := inspectSanitation(inspection, path, threadID, certificate)
 	closeErr := inspection.Close()
 	if inspectErr != nil {
 		return Result{}, inspectErr

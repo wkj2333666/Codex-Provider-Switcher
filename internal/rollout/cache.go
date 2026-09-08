@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,13 +14,12 @@ type sanitationCertificate struct {
 	Stamp         string `json:"stamp"`
 	Identity      string `json:"identity"`
 	Size          int64  `json:"size"`
-	Digest        string `json:"sha256"`
 	Paginated     bool   `json:"paginated"`
 	EndsInNewline bool   `json:"ends_in_newline"`
 }
 
 // ctime detects edits that restore size and mtime. The version invalidates
-// certificates when sanitation rules change; identity binds prefix hashes to
+// certificates when sanitation rules change; identity binds the scan cursor to
 // this file and thread even when their metadata changes after an append.
 func sanitationStamp(info os.FileInfo, path, threadID string) string {
 	identity := sanitationIdentity(info, path, threadID)
@@ -57,7 +55,7 @@ func cachedSanitation(lockPath string) sanitationCertificate {
 	}
 	data, err := io.ReadAll(io.LimitReader(file, 2049))
 	var certificate sanitationCertificate
-	if err != nil || json.Unmarshal(data, &certificate) != nil || len(certificate.Stamp) != 64 || len(certificate.Identity) != 64 || len(certificate.Digest) != 64 || certificate.Size < 0 {
+	if err != nil || json.Unmarshal(data, &certificate) != nil || len(certificate.Stamp) != 64 || len(certificate.Identity) != 64 || certificate.Size < 0 {
 		return sanitationCertificate{}
 	}
 	return certificate
@@ -79,40 +77,43 @@ func rememberSanitation(lockPath string, certificate sanitationCertificate) {
 	}
 }
 
-type digestWithTail struct {
-	hash.Hash
-	last byte
-}
+// tailByte records whether the inspected suffix ends at a complete JSONL line.
+type tailByte struct{ last byte }
 
-func (digest *digestWithTail) Write(data []byte) (int, error) {
+func (tail *tailByte) Write(data []byte) (int, error) {
 	if len(data) > 0 {
-		digest.last = data[len(data)-1]
+		tail.last = data[len(data)-1]
 	}
-	return digest.Hash.Write(data)
+	return len(data), nil
 }
 
-func inspectSanitation(file *os.File, info os.FileInfo, path, threadID string, previous sanitationCertificate) (Result, sanitationCertificate, error) {
-	digest := &digestWithTail{Hash: sha256.New()}
+func inspectSanitation(file *os.File, path, threadID string, previous sanitationCertificate) (Result, sanitationCertificate, error) {
+	// The path may have been replaced after the caller's stat. Only the opened
+	// descriptor can establish whether the saved cursor belongs to this file.
+	info, err := file.Stat()
+	if err != nil {
+		return Result{}, sanitationCertificate{}, err
+	}
 	identity := sanitationIdentity(info, path, threadID)
-	verified := int64(0)
+	cached := int64(0)
 	if previous.Identity == identity && identity != "" && previous.EndsInNewline && previous.Size > 0 && previous.Size < info.Size() {
-		// Do not assume append-only history: verify every previously certified byte
-		// with a digest before skipping its more expensive JSON decoding.
-		if _, err := io.CopyN(digest, file, previous.Size); err == nil && fmt.Sprintf("%x", digest.Sum(nil)) == previous.Digest {
-			verified = previous.Size
-		} else {
-			if _, err := file.Seek(0, io.SeekStart); err != nil {
-				return Result{}, sanitationCertificate{}, err
-			}
-			digest = &digestWithTail{Hash: sha256.New()}
+		// Rollouts are append-only. Trust the saved cursor without reading or
+		// hashing previously scanned bytes. Keep v3 identity compatibility so
+		// existing hash-backed certificates also upgrade without a full scan.
+		if _, err := file.Seek(previous.Size, io.SeekStart); err != nil {
+			return Result{}, sanitationCertificate{}, err
 		}
+		cached = previous.Size
 	}
 	checkThread := threadID
-	if verified > 0 {
+	if cached > 0 {
 		checkThread = ""
-	} // The verified prefix already contains session_meta.
-	result, err := scanJSONLFrom(io.TeeReader(file, digest), io.Discard, checkThread, true, verified == 0, verified > 0 && previous.Paginated)
-	result.VerifiedPrefixBytes = verified
-	certificate := sanitationCertificate{Stamp: sanitationStamp(info, path, threadID), Identity: identity, Size: info.Size(), Digest: fmt.Sprintf("%x", digest.Sum(nil)), EndsInNewline: digest.last == '\n', Paginated: result.paginated}
+	} // The cached prefix includes session_meta.
+	tail := &tailByte{}
+	// Do not chase a live writer beyond this inspection's initial file size.
+	input := io.TeeReader(io.LimitReader(file, info.Size()-cached), tail)
+	result, err := scanJSONLFrom(input, io.Discard, checkThread, true, cached == 0, cached > 0 && previous.Paginated)
+	result.CachedPrefixBytes = cached
+	certificate := sanitationCertificate{Stamp: sanitationStamp(info, path, threadID), Identity: identity, Size: info.Size(), EndsInNewline: tail.last == '\n', Paginated: result.paginated}
 	return result, certificate, err
 }

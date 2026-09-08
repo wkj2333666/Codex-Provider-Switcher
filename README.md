@@ -182,16 +182,19 @@ completed history pass; changed rollouts are sanitized again. Successful clean s
 also write a private `.sanitized` certificate beside the thread writer lock. Reopens and handoffs reuse it only when the path, thread ID,
 device, inode, size, mtime, ctime, and sanitation version still match. Appends,
 replacements, truncations, and edits invalidate the exact match. For a larger file
-with the same identity, the switcher hashes the entire previously checked prefix;
-only a matching SHA-256 digest and a complete newline boundary allow JSON parsing
-to resume at the suffix, with the original pagination mode. A changed prefix or
-incomplete boundary falls back to a full scan. There is no assumption that history
-is append-only, and any required edit still uses a complete atomic rewrite. Cache
-failures fall back to a full scan. The sanitizer reuses line buffers and checks clean records in one JSON decoding pass, allocating
-full maps only for possible repairs. Escaped keys, case aliases, and duplicate
-sensitive fields use the conservative parser; all records still receive complete
-JSON validation. The first check of a new file version remains proportional to
-history size, while an unchanged version needs only metadata checks.
+with the same identity, history is treated as append-only: the switcher seeks
+directly to the saved newline boundary and scans only new records, preserving
+the original pagination mode. It does not hash or re-read the cached prefix.
+Existing hash-backed certificates remain readable, so upgrades reuse their
+saved positions. Same-inode edits followed by growth are outside this append-only
+assumption. Replacements, truncations, changed same-size files, missing cursors,
+and incomplete boundaries still require a full scan. Any required edit still
+uses a complete atomic rewrite under the writer lock. The sanitizer reuses line
+buffers and checks clean records in one JSON decoding pass, allocating full maps
+only for possible repairs. Escaped keys, case aliases, and duplicate sensitive
+fields use the conservative parser; all scanned records receive complete JSON
+validation. A first scan remains proportional to history size; subsequent
+appends are proportional only to newly added content.
 Recovery runtime verification resumes with `excludeTurns`, so very large paginated
 threads are not hydrated just to complete a provider reload.
 All internal handoff, peer resubscribe, and restore calls also exclude turns;
