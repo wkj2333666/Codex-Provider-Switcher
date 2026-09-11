@@ -544,7 +544,7 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
 	}
-	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID, targetRoute.Provider)
+	rolloutPath, err := current.sanitizeThreadRollout(ctx, threadID, targetRoute.Provider, targetRoute)
 	if errors.Is(err, rollout.ErrCompressedHistory) {
 		encoded, encodeErr := encodeRPCError(message.id, handoffErrorCode, err.Error())
 		if encodeErr != nil {
@@ -614,7 +614,7 @@ func (current *session) handoff(ctx context.Context, threadID string, targetRout
 		return errors.New("provider handoff stage update failed")
 	}
 	resumed := false
-	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
+	if _, err := current.sanitizeThreadRollout(ctx, threadID, "", targetRoute); err != nil {
 		if !errors.Is(err, rollout.ErrActiveWriter) || current.recoveries == nil {
 			current.restoreAfterHandoffFailure(threadID)
 			return errors.New("provider handoff rollout sanitation failed")
@@ -751,7 +751,7 @@ func (current *session) recoverProviderMismatch(ctx context.Context, threadID st
 			return errors.New("update provider recovery journal")
 		}
 	}
-	if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
+	if _, err := current.sanitizeThreadRollout(ctx, threadID, "", targetRoute); err != nil {
 		return errors.New("provider recovery rollout sanitation failed")
 	}
 	if path, pathErr := current.findSanitationPath(ctx, threadID); pathErr == nil && path != "" {
@@ -832,28 +832,20 @@ func (current *session) repairRecoveryJournal(ctx context.Context, threadID stri
 	if err != nil {
 		return err
 	}
-	var fingerprint string
 	if path != "" {
-		if err := rollout.ValidatePath(current.codexHome, threadID, path); err != nil {
-			return err
+		// Recheck lineage and policy; sanitation certificates skip unchanged bytes.
+		repairedPath, err := current.sanitizeThreadRollout(ctx, threadID, "", wantedRoute)
+		if err != nil {
+			return errors.New("provider recovery repair rollout sanitation failed")
 		}
-		fingerprint, err = rollout.Fingerprint(path)
+		fingerprint, err := rollout.Fingerprint(repairedPath)
 		if err != nil {
 			return err
 		}
-		if fingerprint != journal.SanitizedFingerprint {
-			if _, err := current.sanitizeThreadRollout(ctx, threadID, ""); err != nil {
-				return errors.New("provider recovery repair rollout sanitation failed")
-			}
-			fingerprint, err = rollout.Fingerprint(path)
-			if err != nil {
-				return err
-			}
-			journal.SanitizedFingerprint = fingerprint
-			journal.Phase = "restoring"
-			if err := current.recoveries.Save(journal); err != nil {
-				return errors.New("record provider recovery repair sanitation")
-			}
+		journal.SanitizedFingerprint = fingerprint
+		journal.Phase = "restoring"
+		if err := current.recoveries.Save(journal); err != nil {
+			return errors.New("record provider recovery repair sanitation")
 		}
 	}
 	route, err := client.resume(ctx, threadID, wantedRoute)
@@ -1018,7 +1010,7 @@ func (current *session) internalResumeWithRoute(ctx context.Context, threadID st
 	return nil
 }
 
-func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, expectedProvider string) (string, error) {
+func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, expectedProvider string, targets ...modelroute.Route) (string, error) {
 	if current.codexHome == "" {
 		return "", nil
 	}
@@ -1049,7 +1041,14 @@ func (current *session) sanitizeThreadRollout(ctx context.Context, threadID, exp
 	if err != nil {
 		return "", err
 	}
-	_, err = rollout.SanitizeFile(path, lockPath, threadID)
+	if err := rollout.SanitizeAncestors(ctx, current.codexHome, threadID, path); err != nil {
+		return "", err
+	}
+	var policy rollout.ContextPolicy
+	if len(targets) > 0 {
+		policy = rollout.ContextPolicy{Model: targets[0].Model, Compatible: current.routes.Models(targets[0].Provider)}
+	}
+	_, err = rollout.SanitizeFile(path, lockPath, threadID, policy)
 	return path, err
 }
 

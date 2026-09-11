@@ -11,6 +11,7 @@ import (
 )
 
 type sanitationCertificate struct {
+	Policy        string `json:"policy,omitempty"`
 	Stamp         string `json:"stamp"`
 	Identity      string `json:"identity"`
 	Size          int64  `json:"size"`
@@ -87,7 +88,7 @@ func (tail *tailByte) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func inspectSanitation(file *os.File, path, threadID string, previous sanitationCertificate) (Result, sanitationCertificate, error) {
+func inspectSanitation(file *os.File, path, threadID string, previous sanitationCertificate, policies ...ContextPolicy) (Result, sanitationCertificate, error) {
 	// The path may have been replaced after the caller's stat. Only the opened
 	// descriptor can establish whether the saved cursor belongs to this file.
 	info, err := file.Stat()
@@ -112,8 +113,8 @@ func inspectSanitation(file *os.File, path, threadID string, previous sanitation
 	tail := &tailByte{}
 	// Do not chase a live writer beyond this inspection's initial file size.
 	input := io.TeeReader(io.LimitReader(file, info.Size()-cached), tail)
-	result, err := scanJSONLFrom(input, io.Discard, checkThread, true, cached == 0, cached > 0 && previous.Paginated)
+	result, err := scanJSONLFrom(input, io.Discard, checkThread, true, cached == 0, cached > 0 && previous.Paginated, policies...)
 	result.CachedPrefixBytes = cached
-	certificate := sanitationCertificate{Stamp: sanitationStamp(info, path, threadID), Identity: identity, Size: info.Size(), EndsInNewline: tail.last == '\n', Paginated: result.paginated}
+	certificate := sanitationCertificate{Policy: contextPolicy(policies).key(), Stamp: sanitationStamp(info, path, threadID), Identity: identity, Size: info.Size(), EndsInNewline: tail.last == '\n', Paginated: result.paginated}
 	return result, certificate, err
 }

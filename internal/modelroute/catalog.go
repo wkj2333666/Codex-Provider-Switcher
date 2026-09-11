@@ -220,3 +220,15 @@ func ValidModel(model string) bool {
 	}
 	return true
 }
+
+// Models returns the provider's explicit compatible model IDs.
+func (catalog *Catalog) Models(provider string) []string {
+	if catalog == nil {
+		return nil
+	}
+	var models []string
+	for model := range catalog.providers[provider].allowed {
+		models = append(models, model)
+	}
+	return models
+}

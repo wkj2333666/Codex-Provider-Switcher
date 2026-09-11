@@ -3233,3 +3233,48 @@ func assertRawString(t *testing.T, values map[string]json.RawMessage, key, want 
 		t.Fatalf("%s = %q, want %q", key, got, want)
 	}
 }
+
+func TestSessionSanitizesInheritedForkHistory(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "sessions", "2026", "09", "11")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(dir, "rollout-2026-09-11T00-00-00-parent.jsonl")
+	child := filepath.Join(dir, "rollout-2026-09-11T00-00-01-child.jsonl")
+	source := []byte(`{"ordinal":0,"type":"session_meta","payload":{"id":"parent","history_mode":"paginated"}}` + "\n" + `{"ordinal":1,"type":"response_item","payload":{"type":"reasoning","id":"item_inherited"}}` + "\n")
+	header := fmt.Sprintf(`{"ordinal":2,"type":"session_meta","payload":{"id":"child","history_mode":"paginated","history_base":{"thread_id":"parent","end_ordinal_exclusive":2,"end_byte_offset":%d}}}`+"\n", len(source))
+	if err := os.WriteFile(parent, source, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(child, []byte(header+`{"ordinal":3,"type":"turn_context","payload":{"model":"glm-5.3-flash","comp_hash":"3000"}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var current *session
+	current = newTestSession(t, func(ctx context.Context, _ websocket.MessageType, payload []byte) error {
+		m, err := parseRPCMessage(payload)
+		if err != nil {
+			return err
+		}
+		return current.handleUpstreamText(ctx, []byte(fmt.Sprintf(`{"id":%s,"result":{"data":[{"id":"child","path":%q,"modelProvider":"openai"}],"nextCursor":null}}`, m.idKey, child)))
+	}, nil)
+	current.codexHome = home
+	current.routes = testModelCatalog(t)
+	if _, err := current.sanitizeThreadRollout(context.Background(), "child", "openai", modelroute.Route{Provider: "openai", Model: "gpt-5.6-sol"}); err != nil {
+		t.Fatal(err)
+	}
+	actual, err := os.ReadFile(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(actual, []byte("item_inherited")) {
+		t.Fatal("fork ancestor was not sanitized")
+	}
+	if len(actual) != len(source) {
+		t.Fatal("ancestor byte offsets shifted")
+	}
+	actual, err = os.ReadFile(child)
+	if err != nil || !bytes.HasPrefix(actual, []byte(header)) || !bytes.Contains(actual, []byte(`"model":"gpt-5.6-sol"`)) || bytes.Contains(actual, []byte("comp_hash")) {
+		t.Fatal("child lineage changed")
+	}
+}

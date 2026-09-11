@@ -46,6 +46,7 @@ type Result struct {
 	Changed           bool
 	ReasoningRemoved  int
 	IDsStripped       int
+	ContextsReset     int
 }
 
 // ValidatePath accepts only a regular, non-symlink rollout below CODEX_HOME's
@@ -104,7 +105,7 @@ func validateDirectory(path string) error {
 // SanitizeFile removes provider-bound reasoning records with invalid IDs and
 // strips stale item_ IDs from other response items. It never edits the source
 // unless every input line is valid JSON and the writer lock is available.
-func SanitizeFile(path, lockPath, threadID string) (Result, error) {
+func SanitizeFile(path, lockPath, threadID string, policies ...ContextPolicy) (Result, error) {
 	if path == "" {
 		return Result{}, errors.New("invalid rollout path")
 	}
@@ -115,8 +116,16 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return Result{}, errors.New("invalid rollout file")
 	}
+	policy := contextPolicy(policies)
 	stamp := sanitationStamp(info, path, threadID)
-	certificate := cachedSanitation(lockPath)
+	certificatePath := lockPath
+	if key := policy.key(); key != "" && lockPath != "" {
+		certificatePath += ".policy-" + key
+	}
+	certificate := cachedSanitation(certificatePath)
+	if certificate.Policy != policy.key() {
+		certificate = sanitationCertificate{}
+	}
 	if stamp != "" && certificate.Stamp == stamp {
 		if after, err := os.Lstat(path); err == nil && sanitationStamp(after, path, threadID) == stamp {
 			return Result{Cached: true}, nil
@@ -126,7 +135,7 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 	if err != nil {
 		return Result{}, errors.New("open rollout")
 	}
-	preview, updatedCertificate, inspectErr := inspectSanitation(inspection, path, threadID, certificate)
+	preview, updatedCertificate, inspectErr := inspectSanitation(inspection, path, threadID, certificate, policy)
 	closeErr := inspection.Close()
 	if inspectErr != nil {
 		return Result{}, inspectErr
@@ -138,7 +147,7 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 		// Never certify bytes appended/replaced while the inspection was running.
 		after, statErr := os.Lstat(path)
 		if statErr == nil && stamp != "" && sanitationStamp(after, path, threadID) == stamp {
-			rememberSanitation(lockPath, updatedCertificate)
+			rememberSanitation(certificatePath, updatedCertificate)
 		}
 		return preview, nil
 	}
@@ -170,12 +179,42 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 		return Result{}, errors.New("secure rollout staging file")
 	}
 
-	result, err := rewriteJSONL(input, temporary, threadID)
+	var audit *os.File
+	auditUsed := false
+	if policy.Model != "" {
+		audit, err = os.CreateTemp(filepath.Dir(lockPath), filepath.Base(lockPath)+".context-*.jsonl")
+		if err != nil {
+			return Result{}, errors.New("create context repair audit")
+		}
+		defer func() {
+			audit.Close()
+			if !committed || !auditUsed {
+				_ = os.Remove(audit.Name())
+			}
+		}()
+		policy.audit = audit
+	}
+	result, err := scanJSONLFrom(input, temporary, threadID, false, true, false, policy)
 	if err != nil {
 		return Result{}, err
 	}
 	if !result.Changed {
 		return result, nil
+	}
+	auditUsed = result.ContextsReset > 0
+	if auditUsed {
+		if err := audit.Sync(); err != nil {
+			return Result{}, errors.New("sync context repair audit")
+		}
+		auditDirectory, err := os.Open(filepath.Dir(audit.Name()))
+		if err != nil {
+			return Result{}, errors.New("open context audit directory")
+		}
+		syncErr := auditDirectory.Sync()
+		closeErr := auditDirectory.Close()
+		if syncErr != nil || closeErr != nil {
+			return Result{}, errors.New("sync context audit directory")
+		}
 	}
 	if err := temporary.Sync(); err != nil {
 		return Result{}, errors.New("sync rollout staging file")
@@ -186,6 +225,7 @@ func SanitizeFile(path, lockPath, threadID string) (Result, error) {
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return Result{}, errors.New("replace rollout")
 	}
+	committed = true // Keep the original context audit even if directory fsync fails.
 	directory, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return Result{}, errors.New("open rollout directory")
@@ -207,7 +247,8 @@ func scanJSONL(input io.Reader, output io.Writer, threadID string, stopOnChange 
 	return scanJSONLFrom(input, output, threadID, stopOnChange, true, false)
 }
 
-func scanJSONLFrom(input io.Reader, output io.Writer, threadID string, stopOnChange, hasHeader, paginated bool) (Result, error) {
+func scanJSONLFrom(input io.Reader, output io.Writer, threadID string, stopOnChange, hasHeader, paginated bool, policies ...ContextPolicy) (Result, error) {
+	policy := contextPolicy(policies)
 	reader := bufio.NewReaderSize(input, 64*1024)
 	var spill []byte
 	result := Result{paginated: paginated}
@@ -237,13 +278,34 @@ func scanJSONLFrom(input io.Reader, output io.Writer, threadID string, stopOnCha
 				paginated = record.Payload.HistoryMode == "paginated" || record.Ordinal != nil
 				result.paginated = paginated
 			}
-			cleaned, keep, changed, removed, stripped, parseErr := sanitizeLine(line, paginated)
+			contextLine, contextChanged, contextErr := policy.clean(line)
+			if contextErr != nil {
+				return Result{}, contextErr
+			}
+			cleaned, keep, changed, removed, stripped, parseErr := sanitizeLine(contextLine, paginated)
+			if contextChanged {
+				result.ContextsReset++
+				changed = true
+			}
 			if parseErr != nil {
 				return Result{}, errors.New("invalid rollout JSONL")
 			}
 			if lineNumber == 1 && threadID != "" {
 				if err := validateSessionMeta(cleaned, threadID); err != nil {
 					return Result{}, err
+				}
+			}
+			if keep && changed && policy.PreserveOffsets {
+				if len(cleaned) > len(line) {
+					return Result{}, errors.New("sanitation would shift ancestor offsets")
+				}
+				if len(cleaned) < len(line) {
+					newline := bytes.HasSuffix(cleaned, []byte{'\n'})
+					trimmed := bytes.TrimSuffix(cleaned, []byte{'\n'})
+					cleaned = append(trimmed, bytes.Repeat([]byte{' '}, len(line)-len(cleaned))...)
+					if newline {
+						cleaned = append(cleaned, '\n')
+					}
 				}
 			}
 			if keep {

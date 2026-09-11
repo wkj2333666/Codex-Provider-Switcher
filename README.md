@@ -177,10 +177,24 @@ to repair contamination left by older switchers; other same-provider resumes pas
 Paginated rewrites preserve each record's byte length and ordinal, replacing invalid
 reasoning with model-ignored placeholders so UI history and SQLite offsets remain valid.
 A missing rollout for an existing task fails closed instead of being treated as clean.
-Recovery journals record the sanitized rollout fingerprint. Unchanged retries skip the
-completed history pass; changed rollouts are sanitized again. Successful clean scans
+Fork resumes also follow `history_base` to sanitize shared ancestors under each
+ancestor's own writer lock. Both legacy and paginated ancestor records retain their
+byte lengths, so existing fork cutoffs remain valid. Missing/cyclic ancestry and
+busy ancestors fail closed.
+
+The task's own `turn_context` records are also checked against the selected
+provider's model allowlist. Foreign model names are replaced with the selected
+model and their stale `comp_hash` is removed; this prevents native pre-turn
+compaction from sending an old provider's model through the new provider.
+Original changed context records are saved privately beside the writer lock as
+`.context-*.jsonl` audit files. Conversation/UI events and compatible model choices
+are preserved. Shared ancestor model contexts are never retargeted for a child;
+a fork with no surviving local context still depends on native inherited settings.
+Repairs that would expand a record fail without replacing the source.
+
+Recovery retries recheck lineage and the selected model policy. Successful clean scans
 also write a private `.sanitized` certificate beside the thread writer lock. Reopens and handoffs reuse it only when the path, thread ID,
-device, inode, size, mtime, ctime, and sanitation version still match. Appends,
+device, inode, size, mtime, ctime, sanitation version, and model policy still match. Appends,
 replacements, truncations, and edits invalidate the exact match. For a larger file
 with the same identity, history is treated as append-only: the switcher seeks
 directly to the saved newline boundary and scans only new records, preserving

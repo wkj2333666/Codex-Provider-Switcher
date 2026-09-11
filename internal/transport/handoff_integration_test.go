@@ -700,7 +700,7 @@ func TestRunRepairsPersistedRecoveryBeforeProviderSwitch(t *testing.T) {
 	waitProxyDone(t, done)
 }
 
-func TestRunRepairSkipsRecordedSanitationWhenRolloutUnchanged(t *testing.T) {
+func TestRunRepairInvalidatesOldSanitationWhenRolloutUnchanged(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	server := newHandoffAppServer(t, ctx, true)
@@ -754,8 +754,8 @@ func TestRunRepairSkipsRecordedSanitationWhenRolloutUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(cleaned, []byte("item_already_sanitized_marker")) {
-		t.Fatalf("recorded sanitation was repeated: %s", cleaned)
+	if bytes.Contains(cleaned, []byte("item_already_sanitized_marker")) {
+		t.Fatalf("old journal bypassed new sanitation: %s", cleaned)
 	}
 	if _, found, err := store.Load("thr-shared"); err != nil || found {
 		t.Fatalf("fingerprinted journal after repair = found %v, err %v", found, err)
