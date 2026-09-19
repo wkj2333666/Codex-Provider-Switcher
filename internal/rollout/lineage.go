@@ -24,12 +24,21 @@ func SanitizeAncestors(ctx context.Context, home, threadID, path string) error {
 		if depth >= 32 {
 			return errors.New("fork history exceeds lineage limit")
 		}
-		base, err := readHistoryBase(home, threadID, path)
+		base, paginatedHeader, err := readHistoryBase(home, threadID, path)
 		if err != nil {
 			return err
 		}
 		if base == nil {
 			break
+		}
+		if base.ThreadID == threadID {
+			// Native paginated migrations continue the same thread in a new
+			// rollout segment and record itself as the byte-offset base. That
+			// is a continuation, not a fork cycle.
+			if paginatedHeader {
+				break
+			}
+			return errors.New("invalid fork history base")
 		}
 		if !safeThreadID(base.ThreadID) || seen[base.ThreadID] || base.EndOrdinal == nil || base.EndByte == nil || *base.EndOrdinal < 0 || *base.EndByte < 0 {
 			return errors.New("invalid fork history base")
@@ -69,34 +78,35 @@ type historyBase struct {
 	EndByte    *int64 `json:"end_byte_offset"`
 }
 
-func readHistoryBase(home, threadID, path string) (*historyBase, error) {
+func readHistoryBase(home, threadID, path string) (*historyBase, bool, error) {
 	if err := ValidatePath(home, threadID, path); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer file.Close()
 	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
-		return nil, errors.New("invalid fork metadata file")
+		return nil, false, errors.New("invalid fork metadata file")
 	}
 	line, err := bufio.NewReaderSize(file, 1<<20).ReadSlice('\n')
 	if err != nil {
-		return nil, errors.New("invalid or oversized fork metadata")
+		return nil, false, errors.New("invalid or oversized fork metadata")
 	}
 	if err := validateSessionMeta(line, threadID); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var meta struct {
 		Payload struct {
-			Base *historyBase `json:"history_base"`
+			Base        *historyBase `json:"history_base"`
+			HistoryMode string       `json:"history_mode"`
 		} `json:"payload"`
 	}
 	if json.Unmarshal(line, &meta) != nil {
-		return nil, errors.New("invalid fork metadata")
+		return nil, false, errors.New("invalid fork metadata")
 	}
-	return meta.Payload.Base, nil
+	return meta.Payload.Base, meta.Payload.HistoryMode == "paginated", nil
 }
 
 func locateAncestor(home, threadID string) (string, error) {

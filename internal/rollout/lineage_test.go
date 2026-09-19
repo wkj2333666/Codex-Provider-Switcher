@@ -13,7 +13,7 @@ import (
 )
 
 func TestAncestorsPreserveLegacyOffsetsAndRejectUnsafeLineage(t *testing.T) {
-	for _, mode := range []string{"legacy", "writer", "cycle", "cutoff", "symlink"} {
+	for _, mode := range []string{"legacy", "writer", "cycle", "selfPaginated", "cutoff", "symlink"} {
 		t.Run(mode, func(t *testing.T) {
 			home := t.TempDir()
 			dir := filepath.Join(home, "sessions", "2026", "09", "11")
@@ -23,13 +23,18 @@ func TestAncestorsPreserveLegacyOffsetsAndRejectUnsafeLineage(t *testing.T) {
 			source := []byte(`{"type":"session_meta","payload":{"id":"parent"}}` + "\n" + `{"type":"response_item","payload":{"type":"reasoning","id":"item_bad"}}` + "\n")
 			baseID := "parent"
 			cutoff := len(source)
+			historyMode := ""
 			if mode == "cycle" {
 				baseID = "child"
+			}
+			if mode == "selfPaginated" {
+				baseID = "child"
+				historyMode = "paginated"
 			}
 			if mode == "cutoff" {
 				cutoff++
 			}
-			header := []byte(fmt.Sprintf(`{"ordinal":2,"type":"session_meta","payload":{"id":"child","history_base":{"thread_id":%q,"end_ordinal_exclusive":2,"end_byte_offset":%d}}}`+"\n", baseID, cutoff))
+			header := []byte(fmt.Sprintf(`{"ordinal":2,"type":"session_meta","payload":{"id":"child","history_mode":%q,"history_base":{"thread_id":%q,"end_ordinal_exclusive":2,"end_byte_offset":%d}}}`+"\n", historyMode, baseID, cutoff))
 			os.WriteFile(parent, source, 0600)
 			os.WriteFile(child, header, 0600)
 			if mode == "symlink" {
@@ -46,7 +51,7 @@ func TestAncestorsPreserveLegacyOffsetsAndRejectUnsafeLineage(t *testing.T) {
 				}
 			}
 			err := SanitizeAncestors(context.Background(), home, "child", child)
-			if mode != "legacy" {
+			if mode != "legacy" && mode != "selfPaginated" {
 				if err == nil {
 					t.Fatal("unsafe ancestor accepted")
 				}
@@ -61,6 +66,16 @@ func TestAncestorsPreserveLegacyOffsetsAndRejectUnsafeLineage(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			if mode == "selfPaginated" {
+				got, err := os.ReadFile(child)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(header, got) {
+					t.Fatal("self-paginated continuation changed")
+				}
+				return
 			}
 			got, _ := os.ReadFile(parent)
 			if len(got) != len(source) || bytes.Contains(got, []byte("item_bad")) {
