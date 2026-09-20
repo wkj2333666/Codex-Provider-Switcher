@@ -89,3 +89,23 @@ func TestAncestorsPreserveLegacyOffsetsAndRejectUnsafeLineage(t *testing.T) {
 		})
 	}
 }
+
+func TestLocateAncestorAcceptsCodexForkSuffixedRolloutName(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "sessions", "2026", "09", "20")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-2026-09-20T12-00-00-parent_01a0child.jsonl")
+	line := `{"type":"session_meta","payload":{"id":"parent"}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := locateAncestor(home, "parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != path {
+		t.Fatalf("path = %q, want %q", got, path)
+	}
+}

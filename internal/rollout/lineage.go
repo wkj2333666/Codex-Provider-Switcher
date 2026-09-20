@@ -112,7 +112,7 @@ func readHistoryBase(home, threadID, path string) (*historyBase, bool, error) {
 func locateAncestor(home, threadID string) (string, error) {
 	// history_base uses immutable rollout IDs. After revert, those may no longer
 	// be the current path of any state-DB row, so resolve the retained file itself.
-	patterns := []string{filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+threadID+".jsonl*"), filepath.Join(home, "archived_sessions", "rollout-*-"+threadID+".jsonl*")}
+	patterns := []string{filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+threadID+"*.jsonl*"), filepath.Join(home, "archived_sessions", "rollout-*-"+threadID+"*.jsonl*")}
 	found := map[string]bool{}
 	for _, pattern := range patterns {
 		paths, err := filepath.Glob(pattern)
