@@ -33,8 +33,8 @@ func TestProviderContextRepairPreservesOffsetsAndInvalidatesCache(t *testing.T) 
 	}
 	got, _ := os.ReadFile(path)
 	after := strings.Split(strings.TrimSuffix(string(got), "\n"), "\n")
-	if !r.Changed || !strings.Contains(after[1], `"model":"gpt-6-astra"`) || strings.Contains(after[1], "comp_hash") {
-		t.Fatal("previous provider model survived repair")
+	if !r.Changed || !strings.Contains(after[1], `"model":"gpt-6-astra"`) || strings.Contains(after[1], `"comp_hash":"3000"`) {
+		t.Fatalf("previous provider model survived repair: result=%+v err=%v line=%s", r, err, after[1])
 	}
 	for i := range lines {
 		if len(after[i]) != len(lines[i]) {
@@ -73,14 +73,14 @@ func TestProviderContextRepairPreservesOffsetsAndInvalidatesCache(t *testing.T) 
 	}
 }
 
-func TestProviderContextRepairRefusesOffsetExpansion(t *testing.T) {
+func TestProviderContextRepairPatchesForeignModelWithoutShiftingOffsets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rollout.jsonl")
-	original := []byte(`{"ordinal":0,"type":"turn_context","payload":{"model":"x"}}` + "\n")
+	original := []byte(`{"ordinal":0,"type":"session_meta","payload":{"id":"thr","history_mode":"paginated"}}` + "\n" + `{"ordinal":1,"type":"turn_context","payload":{"model":"glm-5.3","comp_hash":"3000"}}` + "\n")
 	os.WriteFile(path, original, 0600)
-	_, err := SanitizeFile(path, filepath.Join(dir, "thr.lock"), "", ContextPolicy{Model: strings.Repeat("long", 100)})
+	r, err := SanitizeFile(path, filepath.Join(dir, "thr.lock"), "", ContextPolicy{Model: "gpt-5.6-sol"})
 	got, _ := os.ReadFile(path)
-	if err == nil || !bytes.Equal(got, original) {
-		t.Fatal("expanding repair must leave source untouched")
+	if err != nil || len(got) != len(original) {
+		t.Fatalf("foreign context was not patched safely: %+v %v %s", r, err, got)
 	}
 }

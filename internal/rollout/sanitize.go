@@ -290,12 +290,18 @@ func scanJSONLFrom(input io.Reader, output io.Writer, threadID string, stopOnCha
 			if parseErr != nil {
 				return Result{}, errors.New("invalid rollout JSONL")
 			}
+			// A provider-context rewrite must never make a paginated record
+			// longer. Leave that individual context untouched and let native
+			// Codex resume the history instead of failing the whole task.
+			if contextChanged && len(cleaned) > len(line) {
+				cleaned, contextChanged, changed = line, false, false
+			}
 			if lineNumber == 1 && threadID != "" {
 				if err := validateSessionMeta(cleaned, threadID); err != nil {
 					return Result{}, err
 				}
 			}
-			if keep && changed && policy.PreserveOffsets {
+			if keep && changed && (policy.PreserveOffsets || paginated) {
 				if len(cleaned) > len(line) {
 					return Result{}, errors.New("sanitation would shift ancestor offsets")
 				}

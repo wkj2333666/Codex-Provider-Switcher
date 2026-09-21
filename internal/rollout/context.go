@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -43,7 +42,7 @@ func (p ContextPolicy) key() string {
 }
 
 func (p ContextPolicy) clean(line []byte) ([]byte, bool, error) {
-	if p.Model == "" || !bytes.Contains(line, []byte("turn_context")) && !bytes.Contains(line, []byte(`\u`)) {
+	if p.Model == "" || !bytes.Contains(line, []byte("turn_context")) {
 		return line, false, nil
 	}
 	var envelope map[string]json.RawMessage
@@ -67,30 +66,90 @@ func (p ContextPolicy) clean(line []byte) ([]byte, bool, error) {
 			return line, false, nil
 		}
 	}
-	payload["model"], _ = json.Marshal(p.Model)
-	delete(payload, "comp_hash")
-	var err error
-	envelope["payload"], err = marshalUnescaped(payload)
-	if err != nil {
-		return nil, false, err
+	// Patch only scalar fields in place. Re-encoding the whole envelope can
+	// reorder keys and expand a paginated record, invalidating byte cutoffs.
+	encoded := append([]byte(nil), line...)
+	var ok bool
+	encoded, ok = replaceJSONStringField(encoded, "model", p.Model)
+	if !ok {
+		return nil, false, fmt.Errorf("context model field missing")
 	}
-	encoded, err := marshalUnescaped(envelope)
-	if err != nil {
-		return nil, false, err
-	}
-	trimmed := bytes.TrimSuffix(line, []byte{'\n'})
-	// Preserve offsets for legacy files too: a paginated fork can refer to them.
-	if len(encoded) > len(trimmed) {
-		return nil, false, errors.New("context repair would shift rollout offsets")
-	}
-	encoded = append(encoded, bytes.Repeat([]byte{' '}, len(trimmed)-len(encoded))...)
-	if bytes.HasSuffix(line, []byte{'\n'}) {
-		encoded = append(encoded, '\n')
-	}
+	encoded, _ = replaceRawField(encoded, "comp_hash", []byte("null"))
 	if p.audit != nil {
 		if _, err := p.audit.Write(line); err != nil {
 			return nil, false, err
 		}
 	}
 	return encoded, true, nil
+}
+
+func replaceJSONStringField(line []byte, key, value string) ([]byte, bool) {
+	needle := []byte(`"` + key + `"`)
+	at := bytes.Index(line, needle)
+	if at < 0 {
+		return line, false
+	}
+	colon := bytes.IndexByte(line[at+len(needle):], ':')
+	if colon < 0 {
+		return line, false
+	}
+	start := at + len(needle) + colon + 1
+	for start < len(line) && (line[start] == ' ' || line[start] == '\t') {
+		start++
+	}
+	if start >= len(line) || line[start] != '"' {
+		return line, false
+	}
+	end := start + 1
+	for end < len(line) {
+		if line[end] == '"' && line[end-1] != '\\' {
+			break
+		}
+		end++
+	}
+	if end >= len(line) {
+		return line, false
+	}
+	encoded, _ := json.Marshal(value)
+	out := make([]byte, 0, len(line)+len(encoded)-(end-start+1))
+	out = append(out, line[:start]...)
+	out = append(out, encoded...)
+	out = append(out, line[end+1:]...)
+	return out, true
+}
+
+func replaceRawField(line []byte, key string, value []byte) ([]byte, bool) {
+	needle := []byte(`"` + key + `"`)
+	at := bytes.Index(line, needle)
+	if at < 0 {
+		return line, false
+	}
+	colon := bytes.IndexByte(line[at+len(needle):], ':')
+	if colon < 0 {
+		return line, false
+	}
+	start := at + len(needle) + colon + 1
+	for start < len(line) && (line[start] == ' ' || line[start] == '\t') {
+		start++
+	}
+	end := start
+	if end < len(line) && line[end] == '"' {
+		end++
+		for end < len(line) {
+			if line[end] == '"' && line[end-1] != '\\' {
+				end++
+				break
+			}
+			end++
+		}
+	} else {
+		for end < len(line) && line[end] != ',' && line[end] != '}' && line[end] != '\n' {
+			end++
+		}
+	}
+	out := make([]byte, 0, len(line)+len(value))
+	out = append(out, line[:start]...)
+	out = append(out, value...)
+	out = append(out, line[end:]...)
+	return out, true
 }
