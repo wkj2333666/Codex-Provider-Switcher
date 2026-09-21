@@ -553,17 +553,21 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 		return current.writeDownstream(ctx, websocket.MessageText, encoded)
 	}
 	if errors.Is(err, rollout.ErrActiveWriter) {
-		// App-server keeps an idle thread's writer lock while it is loaded. A
-		// rollout that needs sanitation must therefore go through the same
-		// coordinated unsubscribe/resume path as a provider handoff.
-		if err := current.handoff(ctx, threadID, targetRoute); err != nil {
-			return current.writeHandoffError(ctx, message.id)
+		if !current.hasEffectiveProvider(threadID) {
+			err = nil
+		} else {
+			// App-server keeps an idle thread's writer lock while it is loaded. A
+			// rollout that needs sanitation must therefore go through the same
+			// coordinated unsubscribe/resume path as a provider handoff.
+			if err := current.handoff(ctx, threadID, targetRoute); err != nil {
+				return current.writeHandoffError(ctx, message.id)
+			}
+			// Handoff already sanitized and verified the runtime. Recovery can
+			// move its rollout, so resolve by stable ID instead of scanning again
+			// or replaying the path from before the handoff.
+			rolloutPath = ""
+			payload, err = rewriteResumePath(payload, "")
 		}
-		// Handoff already sanitized and verified the runtime. Recovery can
-		// move its rollout, so resolve by stable ID instead of scanning again
-		// or replaying the path from before the handoff.
-		rolloutPath = ""
-		payload, err = rewriteResumePath(payload, "")
 	}
 	if err != nil {
 		return current.writeHandoffError(ctx, message.id)
@@ -593,6 +597,13 @@ func (current *session) handleThreadResume(ctx context.Context, message rpcMessa
 	case <-current.closed:
 		return nil
 	}
+}
+
+func (current *session) hasEffectiveProvider(threadID string) bool {
+	current.stateMu.Lock()
+	defer current.stateMu.Unlock()
+	_, ok := current.effective[threadID]
+	return ok
 }
 
 func (current *session) handoff(ctx context.Context, threadID string, targetRoute modelroute.Route) error {
@@ -1070,6 +1081,15 @@ func (current *session) findSanitationPath(ctx context.Context, threadID string)
 		return "", ctx.Err()
 	}
 	path, _, _, err = current.findRolloutPath(ctx, threadID)
+	if (err != nil || path == "") && current.codexHome != "" {
+		// Fresh forks with only session_meta are valid resumable tasks, but
+		// app-server may omit them from thread/list until their first user turn.
+		// Resolve their immutable rollout directly instead of treating the task
+		// as missing and reporting a provider handoff failure.
+		if found, findErr := rollout.FindPath(current.codexHome, threadID); findErr == nil {
+			return found, nil
+		}
+	}
 	return path, err
 }
 

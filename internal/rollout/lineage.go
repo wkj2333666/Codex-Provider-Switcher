@@ -46,7 +46,10 @@ func SanitizeAncestors(ctx context.Context, home, threadID, path string) error {
 		seen[base.ThreadID] = true
 		path, err = locateAncestor(home, base.ThreadID)
 		if err != nil {
-			return err
+			// A fork can legitimately point at a compacted or renamed ancestor.
+			// The child rollout remains independently resumable; let native
+			// Codex restore it instead of blocking the entire task.
+			return nil
 		}
 		lock := filepath.Join(home, "thread-writer-locks", base.ThreadID+".lock")
 		path, err = PreparePlain(ctx, home, base.ThreadID, path, lock)
@@ -128,10 +131,27 @@ func locateAncestor(home, threadID string) (string, error) {
 		}
 	}
 	if len(found) != 1 {
+		// Forked rollouts may carry both the original thread ID and the
+		// immutable child ID in one filename. Prefer a filename ending in the
+		// requested ID; broad substring matches are not distinct ancestors.
+		suffixes := []string{"-" + threadID + ".jsonl", "_" + threadID + ".jsonl"}
+		for path := range found {
+			for _, suffix := range suffixes {
+				if strings.HasSuffix(path, suffix) {
+					return ResolvePath(home, threadID, path)
+				}
+			}
+		}
 		return "", errors.New("missing or ambiguous fork ancestor")
 	}
 	for path := range found {
 		return ResolvePath(home, threadID, path)
 	}
 	return "", errors.New("missing fork ancestor")
+}
+
+// FindPath locates a rollout by its immutable thread ID when app-server's
+// thread/list omits a freshly forked, metadata-only task.
+func FindPath(home, threadID string) (string, error) {
+	return locateAncestor(home, threadID)
 }
